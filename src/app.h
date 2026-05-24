@@ -1,0 +1,386 @@
+#ifndef APP_H
+#define APP_H
+
+/******************************************************************************
+ * app.h — Central State Controller, Shared Types, and Callbacks
+ *
+ * This is the primary header for the Transcriber project. It defines:
+ *
+ *   1. The application finite-state machine (AppState enum).
+ *   2. The central configuration structure (AppConfig) shared by all modules.
+ *   3. Callback typedefs used to communicate between threads and modules.
+ *   4. The central state controller (AppStateController) that coordinates
+ *      thread-safe transitions between IDLE, LISTENING, and TRANSCRIBING.
+ *
+ * Threading Model
+ * ===============
+ * The application runs three concurrent threads:
+ *
+ *   • Presentation Thread (Main) — GTK main loop, UI rendering, D-Bus polling.
+ *   • Audio Thread               — Real-time PCM capture written to a WAV file.
+ *   • Network Thread             — Blocking libcurl HTTP POST to Whisper API.
+ *
+ * All state transitions flow through the AppStateController, which uses a
+ * mutex-protected state variable and an atomic sequence counter to prevent
+ * race conditions (e.g., watchdog timeout and user stop firing simultaneously).
+ *
+ * State Machine
+ * =============
+ *   STATE_IDLE ──► STATE_LISTENING ──► STATE_TRANSCRIBING ──► STATE_IDLE
+ *
+ *   • IDLE:           Mic icon is red. Audio thread suspended. Network idle.
+ *   • LISTENING:      Mic icon is green with sine wave animation. Audio thread
+ *                     actively capturing PCM into a temporary WAV file. A 30-second
+ *                     (configurable) watchdog timer auto-transitions to TRANSCRIBING.
+ *   • TRANSCRIBING:   Sine wave stops. Audio file closed. Network thread uploads
+ *                     WAV to Whisper API. On completion, text is displayed, clipboard
+ *                     is populated, temp file is deleted, and state returns to IDLE.
+ *
+ * SRS Traceability
+ * =================
+ *   Section 2.1 (Threading Model), Section 2.3 (State Machine),
+ *   FR-006 (Toggle Behavior), FR-007 (Recording Duration),
+ *   FR-034 (Manual Stop), NR-019 (Atomic Sequence Counter).
+ *****************************************************************************/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include "app_config.h"  /* For AppConfig definition */
+
+/******************************************************************************
+ * Forward Declarations
+ *
+ * These GTK types are used throughout the project but we avoid including
+ * <gtk/gtk.h> here to keep this header lightweight and prevent circular
+ * dependencies. Each module that needs GTK types includes <gtk/gtk.h> itself.
+ *****************************************************************************/
+typedef struct _GtkWindow GtkWindow;
+typedef struct _GtkTextView GtkTextView;
+
+/******************************************************************************
+ * AppState — Finite State Machine Enumerations
+ *
+ * Represents the current operational state of the application. Only three
+ * valid states exist, forming a unidirectional cycle:
+ *
+ *   IDLE → LISTENING → TRANSCRIBING → IDLE → ...
+ *
+ * The state is protected by a mutex in the AppStateController struct.
+ * Transitions are initiated by:
+ *   • User clicking the microphone icon (Presentation Thread)
+ *   • D-Bus Toggle method call (Presentation Thread, via g_unix_fd_add)
+ *   • Watchdog timer expiration (Presentation Thread, via g_timeout_add)
+ *
+ * SRS: Section 2.3, FR-006, FR-007, FR-034
+ *****************************************************************************/
+typedef enum {
+    STATE_IDLE,           /* Microphone idle — red icon, no recording */
+    STATE_LISTENING,      /* Actively capturing audio — green icon + sine wave */
+    STATE_TRANSCRIBING    /* Uploading to Whisper API — green icon, no animation */
+} AppState;
+
+/******************************************************************************
+ * ConnectionStatus — vLLM Server Connectivity Indicator
+ *
+ * Tracks the connectivity status of the Whisper API backend. Displayed as
+ * an 8x8 pixel circle in the MainWindow status bar (right side).
+ *
+ *   • CONNECTED (green)    — GET /v1/models returned HTTP 200
+ *   • DISCONNECTED (red)   — Connection failed or not yet attempted
+ *   • CHECKING (yellow)    — Connection check in progress (blinking)
+ *
+ * The indicator is clickable: clicking while DISCONNECTED triggers a manual
+ * connectivity ping (WHISPER-013). Clicking while CONNECTED is ignored.
+ *
+ * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037
+ *****************************************************************************/
+typedef enum {
+    CONNECTION_DISCONNECTED,  /* Red — no connection or check failed */
+    CONNECTION_CONNECTED,     /* Green — successful connection verified */
+    CONNECTION_CHECKING       /* Yellow/blinking — check in progress */
+} ConnectionStatus;
+
+/******************************************************************************
+ * AppConfig — Central Configuration Structure
+ *
+ * Holds all user-configurable settings loaded from
+ * ~/.config/transcriber/config.json on startup. This struct is the single
+ * source of truth for configuration and is shared read-only across all
+ * modules after initialization.
+ *
+ * Fields:
+ *   whisper_url    — Full URL of the Whisper API endpoint.
+ *                     Default: "http://localhost:8080/v1/audio/transcriptions"
+ *                     SRS: CFG-005, WHISPER-001
+ *
+ *   audio_device   — Named audio capture device or "system_default".
+ *                     Default: "system_default"
+ *                     SRS: CFG-006, CFG-010, AUD-002
+ *
+ *   language       — ISO 639-1 language code for transcription target.
+ *                     Default: "en"
+ *                     SRS: CFG-007, WHISPER-005
+ *
+ *   max_duration   — Maximum recording duration in seconds (5–30).
+ *                     Default: 30
+ *                     SRS: CFG-014, FR-024
+ *
+ *   window_x, window_y — Persisted MainWindow position.
+ *                     Default: (100, 100)
+ *                     SRS: CFG-004, FR-002
+ *
+ *   enable_notifications — Enable desktop notifications for errors.
+ *                     Default: true
+ *                     SRS: CFG-009, ERR-006
+ *
+ * Immutability:
+ *   After app_config_load() populates this struct, it is treated as
+ *   read-only by all worker threads. When the user saves new settings
+ *   via the Configuration Dialog, the struct is updated under a mutex
+ *   and the new values take effect on the next transcription session.
+ *
+ * SRS: Section 9 (Configuration Management)
+ *****************************************************************************/
+/* AppConfig is defined in app_config.h to avoid duplicate typedef.
+ * Include app_config.h for the full definition. */
+
+/******************************************************************************
+ * Callback Typedefs — Cross-Thread Communication
+ *
+ * Because the application runs multiple threads (Presentation, Audio, Network),
+ * direct function calls between threads are unsafe. Instead, we use callback
+ * function pointers that are invoked in the correct thread context.
+ *
+ * All callbacks are designed to be GTK-main-thread-safe, meaning they may
+ * safely manipulate GTK widgets.
+ *
+ * SRS: Section 2.1 (Threading Model)
+ *****************************************************************************/
+
+/* transcription_result_callback — Invoked by the Network Thread when the
+ * Whisper API returns a response (success or failure).
+ *
+ * Parameters:
+ *   text       — NULL-terminated UTF-8 transcribed text on success,
+ *                or an error message string on failure.
+ *   success    — true if transcription succeeded, false on error.
+ *   user_data  — Opaque pointer (typically the MainWindow pointer).
+ *
+ * This callback is marshaled to the Presentation Thread so it can safely
+ * update the TextWindow, populate the clipboard, and change the mic icon.
+ *
+ * SRS: FR-012, FR-014, WHISPER-006, WHISPER-007 */
+typedef void (*transcription_result_callback)(const char *text,
+                                              bool success,
+                                              void *user_data);
+
+/* connection_status_callback — Invoked when the connectivity check to the
+ * Whisper API completes (either automatic on startup or manual via clicking
+ * the status indicator).
+ *
+ * Parameters:
+ *   status     — The new ConnectionStatus value.
+ *   user_data  — Opaque pointer (typically the MainWindow pointer).
+ *
+ * Marshaled to the Presentation Thread to update the status bar indicator.
+ *
+ * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037 */
+typedef void (*connection_status_callback)(ConnectionStatus status,
+                                           void *user_data);
+
+/* recording_stop_callback — Invoked by the Audio Thread when recording
+ * naturally stops (watchdog timeout or user-initiated stop). Signals the
+ * state controller to transition to TRANSCRIBING.
+ *
+ * Parameters:
+ *   wav_path   — Path to the completed WAV file for upload.
+ *   user_data  — Opaque pointer.
+ *
+ * Marshaled to the Presentation Thread.
+ *
+ * SRS: FR-006, FR-034, AUD-011 */
+typedef void (*recording_stop_callback)(const char *wav_path,
+                                        void *user_data);
+
+/******************************************************************************
+ * AppStateController — Thread-Safe State Machine
+ *
+ * This struct is the central coordinator for all state transitions. It
+ * contains:
+ *
+ *   • A mutex protecting the current state variable.
+ *   • An atomic sequence counter to prevent duplicate transitions
+ *     (e.g., watchdog and user stop both firing at the same time).
+ *   • The current AppState and ConnectionStatus.
+ *   • A pointer to the shared AppConfig.
+ *   • Callback function pointers for cross-thread communication.
+ *
+ * Usage:
+ *   1. On startup, call app_state_controller_init() to initialize the
+ *      mutex, set state to IDLE, and register callbacks.
+ *   2. To transition state, call app_transition_to() with the target state.
+ *      The controller checks sequence validity and updates atomically.
+ *   3. To read the current state, call app_get_state() (thread-safe).
+ *   4. On shutdown, call app_state_controller_cleanup() to destroy the mutex.
+ *
+ * Atomic Sequence Counter:
+ *   Each transition increments a monotonically increasing sequence number.
+ *   If two threads attempt to transition simultaneously (e.g., watchdog
+ *   timeout and user click), only the first increment succeeds. The loser
+ *   detects a stale sequence and aborts its transition. This eliminates
+ *   the race condition described in SRS Section 2.3.
+ *
+ * SRS: Section 2.1, Section 2.3, NR-019
+ *****************************************************************************/
+typedef struct {
+    /* Current application state, protected by state_mutex. */
+    AppState state;
+
+    /* Current connection status to Whisper API, protected by state_mutex. */
+    ConnectionStatus connection_status;
+
+    /* Mutex for all state transitions. Every read or write of state or
+     * connection_status must hold this mutex. */
+    pthread_mutex_t state_mutex;
+
+    /* Atomic sequence counter for preventing duplicate transitions.
+     * Incremented on each successful state change. If a thread reads
+     * a sequence number, performs work, and then attempts to transition
+     * but finds the sequence has advanced, it knows another thread won
+     * the race and aborts. */
+    volatile int64_t sequence_counter;
+
+    /* Pointer to the shared, read-only configuration.
+     * All modules read from this; only app_config.c writes to it. */
+    AppConfig *config;
+
+    /* Callback invoked when transcription completes (success or failure).
+     * Called from the Network Thread but marshaled to the Presentation Thread. */
+    transcription_result_callback on_transcription_result;
+
+    /* Callback invoked when connection status changes.
+     * Called from the Network Thread but marshaled to the Presentation Thread. */
+    connection_status_callback on_connection_status;
+
+    /* Callback invoked when audio recording stops.
+     * Called from the Audio Thread but marshaled to the Presentation Thread. */
+    recording_stop_callback on_recording_stop;
+
+    /* Opaque user data passed to all callbacks.
+     * Typically set to the MainWindow GtkWindow pointer. */
+    void *callback_user_data;
+} AppStateController;
+
+/******************************************************************************
+ * Public API — State Controller Lifecycle
+ *****************************************************************************/
+
+/* app_state_controller_init — Initialize the state controller.
+ *
+ * Sets the initial state to STATE_IDLE, connection status to
+ * CONNECTION_DISCONNECTED, initializes the mutex and sequence counter,
+ * and stores the provided config and callback pointers.
+ *
+ * Parameters:
+ *   controller — Pointer to an uninitialized AppStateController struct.
+ *   config     — Pointer to the shared AppConfig (read-only after init).
+ *   on_transcription_result — Callback for transcription results.
+ *   on_connection_status    — Callback for connection status changes.
+ *   on_recording_stop       — Callback for recording stop events.
+ *   user_data               — Opaque pointer passed to all callbacks.
+ *
+ * Returns: 0 on success, -1 if mutex initialization fails.
+ *
+ * SRS: Section 2.1, Section 2.3 */
+int app_state_controller_init(AppStateController *controller,
+                              AppConfig *config,
+                              transcription_result_callback on_transcription_result,
+                              connection_status_callback on_connection_status,
+                              recording_stop_callback on_recording_stop,
+                              void *user_data);
+
+/* app_state_controller_cleanup — Destroy the state controller's mutex.
+ *
+ * Call this during application shutdown to free the mutex resource.
+ * After this call, the controller struct is invalid.
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *
+ * SRS: Section 2.3 */
+void app_state_controller_cleanup(AppStateController *controller);
+
+/* app_get_state — Thread-safe read of the current application state.
+ *
+ * Acquires the mutex, reads the state, releases the mutex.
+ * Safe to call from any thread.
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *
+ * Returns: The current AppState enum value.
+ *
+ * SRS: Section 2.3 */
+AppState app_get_state(AppStateController *controller);
+
+/* app_get_connection_status — Thread-safe read of connection status.
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *
+ * Returns: The current ConnectionStatus enum value.
+ *
+ * SRS: UI-021, UI-022 */
+ConnectionStatus app_get_connection_status(AppStateController *controller);
+
+/* app_transition_to — Request a state transition.
+ *
+ * Attempts to transition the state machine to the target state. The
+ * transition is only allowed if:
+ *   1. The target state is a valid next state from the current state.
+ *   2. No other thread has already advanced the sequence counter.
+ *
+ * Valid transitions:
+ *   IDLE → LISTENING
+ *   LISTENING → TRANSCRIBING
+ *   TRANSCRIBING → IDLE
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *   target     — The desired target state.
+ *
+ * Returns: true if the transition was accepted, false if rejected
+ *          (invalid transition or lost race condition).
+ *
+ * SRS: Section 2.3, NR-019 */
+bool app_transition_to(AppStateController *controller, AppState target);
+
+/* app_set_connection_status — Thread-safe update of connection status.
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *   status     — The new ConnectionStatus value.
+ *
+ * SRS: UI-021, UI-022, WHISPER-013 */
+void app_set_connection_status(AppStateController *controller,
+                               ConnectionStatus status);
+
+/* app_toggle_state — Convenience function to toggle between IDLE and
+ * LISTENING, or from LISTENING/TRANSCRIBING back to IDLE.
+ *
+ * This is the primary entry point for the microphone click handler and
+ * the D-Bus Toggle method. Behavior:
+ *   • If current state is IDLE → transition to LISTENING.
+ *   • If current state is LISTENING → transition to TRANSCRIBING.
+ *   • If current state is TRANSCRIBING → no-op (wait for completion).
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *
+ * Returns: true if a transition was initiated, false if no-op.
+ *
+ * SRS: FR-006, FR-036, HK-002 */
+bool app_toggle_state(AppStateController *controller);
+
+#endif /* APP_H */
