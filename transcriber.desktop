@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Transcriber
+Comment=Voice-to-text transcription application using Whisper
+Exec=transcriber
+Icon=redmic
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=voice;transcription;speech;whisper;dictation;
