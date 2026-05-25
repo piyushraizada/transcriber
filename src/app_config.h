@@ -11,7 +11,7 @@
  * TRANSCRIBER_CONFIG environment variable for testing).
  *
  * The configuration file stores all user-configurable settings including:
- *   - Whisper API server URL
+ *   - Whisper model path (local GGML model file)
  *   - Audio device selection
  *   - Language preferences
  *   - Maximum recording duration
@@ -52,21 +52,23 @@ extern "C" {
  * @see SRS Section 9.2: Configurable Settings
  */
 typedef struct _AppConfig {
-    /* Whisper API Settings */
-    char whisper_url[512];       ///< Whisper API base URL (e.g., "http://localhost:8000")
-                                 ///< @see CFG-005: Whisper URL
-                                 ///< @see WHISPER-001: Endpoint Configuration
-
-    char language[16];           ///< Language code (ISO 639-1, e.g., "en", "es", "")
-                                 ///< Empty string means auto-detect.
-                                 ///< @see CFG-007: Language
+    /* Local Whisper Model Settings */
+    char model_path[512];        ///< Path to GGML model file (e.g., "~/.cache/whisper/ggml-base.bin")
+                                  ///< Can be absolute path, relative path, or just filename
+                                  ///< (will search default model directories).
+                                  ///< @see CFG-005: Model Path
 
     /* Audio Settings */
-    char audio_device[256];      ///< Audio device name (backend-specific)
-                                 ///< Examples: "default" (ALSA), "alsa_input.pci-..." (PulseAudio)
+    char audio_device[256];      ///< Audio device identifier (backend-specific)
+                                 ///< Examples: "hw:2,0" (ALSA), "default" (ALSA default)
                                  ///< Empty string means system default.
                                  ///< @see CFG-006: Audio Device
                                  ///< @see AUD-008a: Microphone Selection
+
+    char audio_device_display_name[256];  ///< User-friendly display name for the audio device
+                                          ///< Examples: "Built-in Microphone", "BlueSnowball"
+                                          ///< Stored for readability in config file; not used for device opening.
+                                          ///< @see CFG-006: Audio Device
 
     int max_duration;            ///< Maximum recording duration in seconds (5-30)
                                  ///< @see CFG-014: Max Recording Duration
@@ -81,8 +83,9 @@ typedef struct _AppConfig {
 
     /* UI Settings */
     bool enable_notifications;   ///< Enable desktop notifications for critical errors
-                                 ///< @see CFG-009: Notification
-                                 ///< @see ERR-006: Desktop Notifications
+                                  ///< @see CFG-009: Notification
+                                  ///< @see ERR-006: Desktop Notifications
+
 } AppConfig;
 
 /*---------------------------------------------------------------------------
@@ -161,7 +164,7 @@ char* config_get_path(void);
  *
  * This function sets all fields in the AppConfig struct to their
  * default values as specified in the SRS. The defaults are:
- *   - whisper_url: "http://localhost:8080/v1/audio/transcriptions"
+ *   - model_path: "models/ggml-base.bin"
  *   - language: "en" (English)
  *   - audio_device: "system_default" (system default microphone)
  *   - max_duration: 30 (30 seconds)
@@ -291,7 +294,7 @@ bool config_save_to_path(const AppConfig* config, const char* path);
  *
  * This function checks each field in the AppConfig struct for validity
  * and reports any issues. Validation rules:
- *   - whisper_url: Must be a valid URL (starts with http:// or https://)
+ *   - model_path: Must be a non-empty path to a .bin model file
  *   - language: Must be empty (auto) or valid ISO 639-1 code (2 letters)
  *   - audio_device: Any non-empty string is valid (backend validates at runtime)
  *   - max_duration: Must be in range [5, 30]
@@ -313,35 +316,19 @@ bool config_validate(const AppConfig* config);
  */
 
 /**
- * Set the Whisper API URL.
+ * Set the Whisper model path.
  * @param config Pointer to AppConfig. Must not be NULL.
- * @param url    URL string. Copied internally. Must not be NULL.
- * @return true if valid, false if URL is too long or invalid format.
+ * @param path   Model path string. Copied internally. Must not be NULL.
+ * @return true if valid, false if path is too long.
  */
-bool config_set_whisper_url(AppConfig* config, const char* url);
+bool config_set_model_path(AppConfig* config, const char* path);
 
 /**
- * Get the Whisper API URL.
+ * Get the Whisper model path.
  * @param config Pointer to AppConfig. Must not be NULL.
- * @return The whisper_url string (internal, must NOT be freed or modified).
+ * @return The model_path string (internal, must NOT be freed or modified).
  */
-const char* config_get_whisper_url(const AppConfig* config);
-
-/**
- * Set the language code.
- * @param config  Pointer to AppConfig. Must not be NULL.
- * @param language Language code (ISO 639-1) or empty string for auto-detect.
- *                 Copied internally. Must not be NULL.
- * @return true if valid, false if language code is invalid.
- */
-bool config_set_language(AppConfig* config, const char* language);
-
-/**
- * Get the language code.
- * @param config Pointer to AppConfig. Must not be NULL.
- * @return The language string (internal, must NOT be freed or modified).
- */
-const char* config_get_language(const AppConfig* config);
+const char* config_get_model_path(const AppConfig* config);
 
 /**
  * Set the audio device name.
@@ -358,6 +345,22 @@ bool config_set_audio_device(AppConfig* config, const char* device);
  * @return The audio_device string (internal, must NOT be freed or modified).
  */
 const char* config_get_audio_device(const AppConfig* config);
+
+/**
+ * Set the user-friendly display name for the audio device.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param name    Display name (e.g., "Built-in Microphone"). Copied internally.
+ *                May be NULL or empty to clear.
+ * @return true if valid, false if name is too long.
+ */
+bool config_set_audio_device_display_name(AppConfig* config, const char* name);
+
+/**
+ * Get the user-friendly display name for the audio device.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return The display name string (internal, must NOT be freed or modified).
+ */
+const char* config_get_audio_device_display_name(const AppConfig* config);
 
 /**
  * Set the maximum recording duration.

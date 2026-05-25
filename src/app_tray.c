@@ -57,9 +57,10 @@
 
 /** Tooltip strings per state. */
 #define TOOLTIP_IDLE_CONNECTED    "Transcriber — Ready"
-#define TOOLTIP_IDLE_DISCONNECTED "Transcriber — Server disconnected"
+#define TOOLTIP_IDLE_DISCONNECTED "Transcriber — Model unavailable"
 #define TOOLTIP_LISTENING         "Transcriber — Recording..."
 #define TOOLTIP_TRANSCRIBING      "Transcriber — Transcribing..."
+#define TOOLTIP_LOADING           "Transcriber — Loading model..."
 
 /** Temp file base names (combined with g_get_tmp_dir() at runtime). */
 #define TRAY_ICON_IDLE_NAME     "transcriber_tray_idle"
@@ -154,7 +155,9 @@ static gboolean save_pixbuf_as_png(GdkPixbuf *pixbuf, const char *path) {
     GError *error = NULL;
     gboolean ok = gdk_pixbuf_save(pixbuf, path, "png", &error, NULL);
     if (!ok) {
-        fprintf(stderr, "[tray] Failed to save icon to %s: %s\n", path, error->message);
+        /* CR-02 fix: 'error' may be NULL if gdk_pixbuf_save fails without setting GError */
+        g_warning("[tray] Failed to save icon to %s: %s",
+                  path, error ? error->message : "unknown error");
         g_error_free(error);
     }
     return ok;
@@ -304,7 +307,9 @@ static void update_tray_tooltip(SystemTray *tray) {
             break;
         case STATE_IDLE:
         default:
-            if (tray->conn_status == CONNECTION_CONNECTED) {
+            if (tray->conn_status == CONNECTION_LOADING) {
+                tooltip = TOOLTIP_LOADING;
+            } else if (tray->conn_status == CONNECTION_CONNECTED) {
                 tooltip = TOOLTIP_IDLE_CONNECTED;
             } else {
                 tooltip = TOOLTIP_IDLE_DISCONNECTED;
@@ -355,10 +360,17 @@ SystemTray *tray_create(void) {
     snprintf(tray->icon_idle_name, sizeof(tray->icon_idle_name), "%s", TRAY_ICON_IDLE_NAME);
     snprintf(tray->icon_listening_name, sizeof(tray->icon_listening_name), "%s", TRAY_ICON_LISTENING_NAME);
 
+    /* Create the icon PNG files BEFORE app_indicator_new_with_path().
+     * The AppIndicator constructor attempts to load the initial icon
+     * immediately. If the file doesn't exist, internal GTK widgets end up
+     * in an invalid (NULL) state, causing a cascade of G_IS_OBJECT and
+     * GTK_IS_CELL_RENDERER assertion failures followed by a segfault. */
+    ensure_icon_files(tray);
+
     /* Create the AppIndicator with custom icon theme path */
     tray->indicator = app_indicator_new_with_path(TRAY_ID, tray->icon_idle_name,
-                                          APP_INDICATOR_CATEGORY_APPLICATION_STATUS,
-                                          tray->icon_dir);
+                                           APP_INDICATOR_CATEGORY_APPLICATION_STATUS,
+                                           tray->icon_dir);
     if (!tray->indicator) {
         fprintf(stderr, "[tray] Failed to create AppIndicator\n");
         rmdir(tray->icon_dir);

@@ -9,7 +9,7 @@
  * and FR-019 of the SRS. The dialog is a modal GTK3 window that allows the
  * user to modify all configurable application settings:
  *
- *   - Whisper API server URL (text entry)
+ *   - Whisper model path (text entry)
  *   - Audio device selection (combo box dropdown)
  *   - Language selection (combo box dropdown — ISO 639-1 codes)
  *   - Maximum recording duration (spin button — 5 to 30 seconds)
@@ -148,46 +148,7 @@ bool config_dialog_show(GtkWindow* parent_window, struct _AppConfig* config,
  */
 GtkListStore* config_dialog_get_audio_devices(AudioBackend backend);
 
-/*---------------------------------------------------------------------------
- * Section 4: Language List
- *---------------------------------------------------------------------------
- * Functions for the language selection dropdown.
- *
- * The language list is a fixed set of common languages with their ISO 639-1
- * codes. The list includes an "Auto-detect" option at the top.
- */
-
-/**
- * Get the list of supported languages for the config dialog dropdown.
- *
- * This function returns a static GtkListStore containing the supported
- * languages. The list includes:
- *   - "Auto-detect" (value: "")
- *   - "English" (value: "en")
- *   - "Spanish" (value: "es")
- *   - "French" (value: "fr")
- *   - "German" (value: "de")
- *   - "Italian" (value: "it")
- *   - "Portuguese" (value: "pt")
- *   - "Russian" (value: "ru")
- *   - "Japanese" (value: "ja")
- *   - "Chinese" (value: "zh")
- *   - "Korean" (value: "ko")
- *   - "Dutch" (value: "nl")
- *   - "Polish" (value: "pl")
- *   - "Turkish" (value: "tr")
- *   - "Vietnamese" (value: "vi")
- *
- * HI-02 fix: The returned GtkListStore is dynamically allocated.
- * The caller MUST call g_object_unref() when done to avoid memory leaks.
- *
- * @return A newly allocated GtkListStore* containing language display names and codes.
- *         The caller MUST call g_object_unref() on the returned value.
- *
- * @see FR-022: Language Selection
- * @see CFG-007: Language Configuration
- */
-GtkListStore* config_dialog_get_language_list(void);
+/* MIN-002 fix: Removed Section 4 (Language List) — language selection removed. */
 
 /*---------------------------------------------------------------------------
  * Section 5: D-Bus Hotkey Display
@@ -225,13 +186,44 @@ const char* config_dialog_get_hotkey_command(void);
  */
 
 /**
- * Validate the Whisper URL field.
+ * Validate the Whisper model path field.
  *
- * @param url The URL string to validate.
- * @return true if valid (starts with http:// or https://, length < 512),
+ * @param path The model path string to validate.
+ * @return true if valid (non-empty, length < 512),
  *         false otherwise.
  */
-bool config_dialog_validate_url(const char* url);
+bool config_dialog_validate_model_path(const char* path);
+
+/**
+ * Validate that a path points to a valid Whisper GGUF model file.
+ *
+ * This function checks that the file exists, is a regular file, and
+ * can be loaded as a valid Whisper GGUF model by attempting to read
+ * its metadata.
+ *
+ * @param path The full path to the model file to validate.
+ * @return true if the file exists and is a valid Whisper GGUF model,
+ *         false otherwise.
+ *
+ * @note This function performs a synchronous model metadata load and
+ *       should NOT be called from the GTK main thread for large models.
+ *       Use this for quick validation (e.g., before starting recording).
+ */
+bool config_dialog_validate_gguf_model(const char* path);
+
+/**
+ * Get the default model file path (~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin).
+ *
+ * @return A statically allocated string (do NOT free).
+ */
+const char* config_dialog_get_default_model_path(void);
+
+/**
+ * Check if the default model file exists.
+ *
+ * @return true if the default model file exists and is a regular file.
+ */
+bool config_dialog_default_model_exists(void);
 
 /**
  * Validate the max duration field.

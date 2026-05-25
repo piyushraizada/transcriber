@@ -1,10 +1,17 @@
 # Software Requirements Specification (SRS)
 ## X-Windows Voice-to-Text Application
 
-**Document Version:** 1.0  
-**Date:** 2026-05-17  
-**Author:** System Architecture Team  
+**Document Version:** 2.0
+**Date:** 2026-05-25
+**Author:** System Architecture Team
 **Status:** Production-Ready
+
+### Revision History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 2.0 | 2026-05-25 | Major update: Replaced VLLM server with local whisper.cpp, added Auto-Type feature, added System Tray Icon, added GPU (CUDA) support, added Model Info module, updated configuration parameters |
+| 1.0 | 2026-05-17 | Initial SRS with VLLM server integration |
 
 ---
 
@@ -15,7 +22,7 @@
 3. [Functional Requirements](#3-functional-requirements)
 4. [Non-Functional Requirements](#4-non-functional-requirements)
 5. [Audio Capture Pipeline](#5-audio-capture-pipeline)
-6. [Whisper API Integration](#6-whisper-api-integration)
+6. [Local Whisper Integration (whisper.cpp)](#6-local-whisper-integration-whispercpp)
 7. [X-Windows UI Components](#7-x-windows-ui-components)
 8. [Hotkey Integration](#8-hotkey-integration)
 9. [Configuration Management](#9-configuration-management)
@@ -31,19 +38,25 @@
 
 ### 1.1 Purpose
 
-This document specifies the Software Requirements Specification (SRS) for a GTK3-based voice-to-text application. The application provides a graphical interface with a microphone icon that, when clicked, captures audio from a configured microphone (system default or user-selected), transcribes it using a locally hosted Whisper LLM via VLLM server, and displays the transcribed text in a persistent, lightweight text area attached to the application window. The text area allows users to view, edit, and copy the transcribed text to the system clipboard for use in other applications.
+This document specifies the Software Requirements Specification (SRS) for a GTK3-based voice-to-text application. The application provides a graphical interface with a microphone icon that, when clicked, captures audio from a configured microphone (system default or user-selected), transcribes it using a local Whisper model via the whisper.cpp library (fully offline, no network required), and displays the transcribed text in a persistent, lightweight text area attached to the application window. The text area allows users to view, edit, and copy the transcribed text to the system clipboard for use in other applications. The application also supports auto-typing transcribed text directly into the currently focused external window.
 
 ### 1.2 Scope
 
 The X-Windows voice-to-text application provides:
 - Normal application window with redmic.xpm icon as initial presentation (mic not listening)
+- System tray icon (notification area) via libappindicator with state-aware icon and context menu
 - Click-to-start listening functionality, changing to greenmic.xpm icon
 - Animated sine wave visualization over the microphone icon during recording
 - Persistent, lightweight text area attached to the application window for displaying transcribed text
-- 30-second maximum transcription sessions with user-initiated stop capability
-- VLLM server integration for Whisper LLM
+- Configurable maximum transcription sessions (default: 30 seconds, range: 5-120) with user-initiated stop capability
+- Local Whisper model integration via whisper.cpp (fully offline, no network required)
+- GPU (CUDA) acceleration support with automatic CPU fallback
+- GGML model file management with metadata extraction (model name, quantization, multilingual support)
+- Auto-Type feature for typing transcribed text into the currently focused external window
+  - X11: xdotool (primary), clipboard+Ctrl+V (fallback)
+  - Wayland: wtype (primary), ydotool (secondary), clipboard+Ctrl+V (fallback)
 - System clipboard integration (via GTK3) for copied text that can be pasted into other applications
-- Configuration UI for LLM service URL and microphone selection
+- Configuration UI for model path, microphone selection, language, auto-type settings, and more
 - Manual stop with final transcription of remaining audio
 - In-place editing of transcribed text before copying
 - Automatic return to redmic.xpm icon after transcription completes or session ends
@@ -55,13 +68,20 @@ The X-Windows voice-to-text application provides:
 |------|------------|
 | SRS | Software Requirements Specification |
 | GTK3 | GTK+ 3 — GIMP Toolkit version 3, cross-platform GUI toolkit |
-| VLLM | Vectorized Large Language Model server |
 | Whisper | OpenAI's speech-to-text model |
+| whisper.cpp | Local, offline C/C++ implementation of Whisper inference (ggml-org/whisper.cpp) |
+| GGML | Tensor library with machine learning primitives used by whisper.cpp for model storage and inference |
+| GPU (CUDA) | NVIDIA GPU acceleration via CUDA backend in whisper.cpp, with automatic CPU fallback |
 | WAV | Waveform Audio File Format |
 | Text Area | Lightweight, persistent text display window attached to the application window that displays transcribed text, allows in-place editing, and supports copying to the system clipboard |
 | Clipboard | System clipboard (PRIMARY and CLIPBOARD selections on X11, primary clipboard on Wayland) managed via GTK3 clipboard APIs |
 | Hotkey | A global keyboard shortcut configured in the OS or window manager that triggers a command or action in the application |
 | D-Bus | Desktop Bus — an inter-process communication system used on Linux desktops |
+| Auto-Type | Feature that automatically types transcribed text into the currently focused external window using display-server-specific input injection tools |
+| System Tray | Notification area icon provided via libappindicator (Ayatana fork) with state-aware icon and context menu |
+| xdotool | X11 utility for simulating keyboard input and mouse activity |
+| wtype | Wayland-native virtual keyboard tool for simulating keystrokes |
+| ydotool | Wayland input injection tool using /dev/uinput interface |
 
 ### 1.4 Document Conventions
 
@@ -106,15 +126,16 @@ The application is built on a multi-threaded architecture managed by a **Central
 
 | Thread | Responsibility | Key Operations |
 |--------|---------------|----------------|
-| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC polling via `g_unix_fd_add()` on the D-Bus file descriptor integrated into the GTK main loop |
+| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC polling via `g_unix_fd_add()` on the D-Bus file descriptor integrated into the GTK main loop, system tray icon updates via libappindicator |
 | **Audio Thread** | Real-time PCM capture | Captures audio from ALSA using real-time priority scheduling. Writes raw PCM frames to a temporary WAV file. Suspended in `STATE_IDLE`, active in `STATE_LISTENING`. |
-| **Network Thread** | HTTP multipart uploads | Executes blocking `libcurl` HTTP POST requests to the local vLLM Whisper server. Parses JSON response. Active only in `STATE_TRANSCRIBING`. |
+| **Transcription Thread** | Local whisper.cpp model processing | Loads GGML model file, reads WAV samples, runs `whisper_full()` for local transcription. Supports GPU (CUDA) acceleration with CPU fallback. Active only in `STATE_TRANSCRIBING`. |
 
 **Design Rationale:**
-- The Audio Thread runs independently to guarantee real-time capture without being blocked by GTK rendering or network I/O.
-- The Network Thread isolates blocking HTTP operations from the Presentation Thread, preventing UI freezes during upload.
-- The Presentation Thread concurrently polls the D-Bus file descriptor using `select()`, enabling responsive hotkey toggling without a dedicated D-Bus thread.
+- The Audio Thread runs independently to guarantee real-time capture without being blocked by GTK rendering or transcription processing.
+- The Transcription Thread isolates blocking whisper.cpp model processing from the Presentation Thread, preventing UI freezes during local transcription.
+- The Presentation Thread concurrently polls the D-Bus file descriptor using `g_unix_fd_add()`, enabling responsive hotkey toggling without a dedicated D-Bus thread.
 - The Central State Controller ensures thread-safe state transitions using mutex-protected state variables.
+- No network thread is required since all transcription is performed locally via whisper.cpp.
 
 ### 2.2 High-Level Component Diagram
 
@@ -177,30 +198,31 @@ STATE_IDLE --> STATE_LISTENING --> STATE_TRANSCRIBING --> STATE_IDLE
 **State Descriptions:**
 
 - **`STATE_IDLE`**:
-  - **Presentation Thread**: Main window displays `redmic.xpm`. Status bar indicator reflects vLLM connectivity (green/red).
+  - **Presentation Thread**: Main window displays `redmic.xpm`. Status bar indicator reflects local model availability (green/red). System tray icon shows red mic.
   - **Audio Thread**: Suspended. No audio capture active.
-  - **Network Thread**: Idle.
+  - **Transcription Thread**: Idle.
   - **Entry Trigger**: Application launch, or completion of transcription cycle.
 
 - **`STATE_LISTENING`**:
-  - **Presentation Thread**: Main window displays `greenmic.xpm` with active sine wave overlay animation.
-  - **Audio Thread**: Active. Capturing real-time PCM from OS sound server, writing to `/tmp/transcriber_capture.wav` (created via `mkstemp()`).
-  - **Network Thread**: Idle.
-  - **Watchdog Timer**: A 30-second watchdog timer limits maximum capture duration. On timeout, automatic transition to `STATE_TRANSCRIBING`.
+  - **Presentation Thread**: Main window displays `greenmic.xpm` with active sine wave overlay animation. System tray icon shows green mic with "Recording..." tooltip.
+  - **Audio Thread**: Active. Capturing real-time PCM from ALSA, writing to temporary WAV file (created via `mkstemp()` in `$XDG_RUNTIME_DIR` or `/tmp/`).
+  - **Transcription Thread**: Idle.
+  - **Watchdog Timer**: A configurable watchdog timer (default: 30 seconds, range: 5-120 seconds) limits maximum capture duration. On timeout, automatic transition to `STATE_TRANSCRIBING`.
   - **Atomic Sequence Counter**: The Central State Controller must implement an atomic sequence counter or cancellation token for state transitions. When the user initiates a stop (manual or via hotkey), the watchdog timer must be cleanly invalidated before the WAV file handle is closed, preventing race conditions where both threads attempt to transition to `STATE_TRANSCRIBING` simultaneously.
-  - **Entry Trigger**: Mouse click on microphone icon in `STATE_IDLE`, or D-Bus `Toggle` method call.
-  - **Exit Trigger**: User click to stop, D-Bus `Toggle` call, or 30-second watchdog timeout.
+  - **Entry Trigger**: Mouse click on microphone icon in `STATE_IDLE`, D-Bus `Toggle` method call, or system tray context menu "Toggle Recording".
+  - **Exit Trigger**: User click to stop, D-Bus `Toggle` call, or watchdog timeout.
 
 - **`STATE_TRANSCRIBING`**:
-  - **Presentation Thread**: Main window displays `greenmic.xpm` (sine wave animation stopped).
+  - **Presentation Thread**: Main window displays `greenmic.xpm` (sine wave animation stopped). System tray icon shows green mic with "Transcribing..." tooltip.
   - **Audio Thread**: WAV file closed. No further writes.
-  - **Network Thread**: Active. Executes blocking `libcurl` HTTP POST multipart upload to local vLLM Whisper server. On successful return, parses JSON response to extract `response.text` string.
+  - **Transcription Thread**: Active. Loads GGML model (if not already loaded), reads WAV samples, runs `whisper_full()` for local transcription via whisper.cpp. Supports GPU (CUDA) acceleration with automatic CPU fallback.
   - **Post-Transcription Actions**:
-    1. Parsed text sent to `TextWindow` for display.
+    1. Transcribed text sent to `TextWindow` for display.
     2. Clipboard selections (PRIMARY and CLIPBOARD) populated with transcribed text via GTK3 clipboard APIs.
-    3. Temporary WAV file in `/tmp/` unlinked and deleted.
-    4. Raw PCM memory buffers overwritten with `explicit_bzero()` (glibc-native) or volatile pointer loop prior to `free()` to prevent swap-space leakage.
-    5. Reverts to `STATE_IDLE`.
+    3. If auto-type is enabled, text is typed into the currently focused external window via the appropriate strategy (xdotool/wtype/ydotool/clipboard+Ctrl+V).
+    4. Temporary WAV file unlinked and deleted.
+    5. Raw PCM memory buffers freed prior to returning to `STATE_IDLE`.
+    6. Reverts to `STATE_IDLE`.
   - **Entry Trigger**: Exit from `STATE_LISTENING` (user stop or watchdog timeout).
 
 State transitions may be triggered by mouse click on the microphone icon **or** by the OS hotkey toggle interface (D-Bus `Toggle` method).
@@ -211,25 +233,31 @@ State transitions may be triggered by mouse click on the microphone icon **or** 
 sequenceDiagram
     participant User
     participant WIN as Main Window
+    participant TRAY as System Tray
     participant AUD as Audio Manager
-    participant WH as Whisper Client
+    participant WH as Whisper Client (whisper.cpp)
+    participant TYPER as Auto-Type Module
     participant CLIP as Clipboard Manager
-    participant VLLM as VLLM Server
+    participant FOCUS as Focused Window
     
-    User->>WIN: Click redmic.xpm icon (or OS hotkey)
+    User->>WIN: Click redmic.xpm icon (or OS hotkey/tray menu)
     WIN->>WIN: Change to greenmic.xpm icon
+    WIN->>TRAY: Update icon to green mic
     WIN->>AUD: Start recording
-    AUD->>AUD: Record up to 30 seconds audio
+    AUD->>AUD: Record up to max_duration audio
     AUD->>AUD: Write WAV file
-    AUD->>WH: Upload audio file
-    WH->>VLLM: POST /v1/audio/transcriptions
-    VLLM-->>WH: JSON response
-    WH->>WH: Parse transcription
-    WH->>WIN: Update text area
+    AUD->>WH: Pass WAV path for transcription
+    WH->>WH: Load GGML model (GPU/CPU)
+    WH->>WH: Run whisper_full() locally
+    WH->>WIN: Return transcribed text
+    WIN->>WIN: Update text area
+    WIN->>CLIP: Populate clipboard
+    opt auto-type enabled
+        WIN->>TYPER: Type text into focused window
+        TYPER->>FOCUS: Simulate keystrokes (xdotool/wtype/clipboard)
+    end
     WIN->>WIN: Change back to redmic.xpm icon
-    User->>TEXTAREA: Copy text
-    TEXTAREA->>CLIP: Copy to clipboard
-    CLIP->>CLIPBOARD: Set PRIMARY selection via GTK
+    WIN->>TRAY: Update icon to red mic
 ```
 
 ### 2.4 GTK3 Integration
@@ -252,10 +280,10 @@ The MainWindow is the primary application window hosting the microphone icon, si
   - 16-pixel dark-gray `GtkBox` rendered at the bottom of the window.
   - **Left side**: Gear/cog icon (settings button) as a `GtkButton` with `GtkImage` loaded from `assets/gear.xpm` via `gdk_pixbuf_new_from_xpm_array()`. Opens the Configuration Dialog when clicked.
   - **Right side**: 8x8 pixel indicator circle rendered via Cairo on a small `GtkDrawingArea`.
-    - **Green** = vLLM server connected and responsive.
-    - **Red** = vLLM server connection failed or unavailable.
-    - **Yellow/Blinking** = Connection check in progress (manual or automatic).
-    - The indicator is clickable: clicking while in Red state triggers a connectivity ping (WHISPER-013); clicking while in Green state is ignored or silently re-verifies without visual disruption.
+    - **Green** = Local Whisper model file verified and accessible.
+    - **Red** = Local Whisper model file not found or not yet checked.
+    - **Yellow/Blinking** = Model verification check in progress (manual or automatic).
+    - The indicator is clickable: clicking while in Red state triggers a manual model file verification; clicking while in Green state is ignored or silently re-verifies without visual disruption.
 
 #### 2.4.2 TextWindow — GTK3 Design
 
@@ -565,6 +593,69 @@ The application shall stop sine wave animation when transcription begins. The ic
 The application shall support toggling recording/transcription via a global hotkey configured in the operating system or window manager. The application shall expose a D-Bus method (`org.xvoice.Actions.Toggle`) on the session bus for this purpose. All UI state transitions triggered by hotkey shall be identical to those triggered by mouse click.
 
 **Traceability**: FR-036 → HK-002
+
+### 3.10 Auto-Type Output
+
+#### FR-043: Auto-Type Output
+The application shall support automatically typing transcribed text into the currently focused external window. When enabled, after transcription completes, the text shall be injected as keystrokes into the focused window using the appropriate display-server-specific strategy.
+
+**Configuration**: Enabled/disabled via `auto_type_output` setting in configuration dialog. Default: `false`.
+
+**Traceability**: FR-043 → Auto-Type Module
+
+#### FR-044: Typing Delay
+The application shall allow configuring an inter-character delay (in milliseconds) for simulated typing. The delay controls how fast characters are typed, allowing natural-looking input. Range: 0-100ms. Default: 10ms.
+
+**Configuration**: `type_delay_ms` setting in configuration file.
+
+**Traceability**: FR-044 → Auto-Type Module
+
+#### FR-045: Typing Strategy Selection
+The application shall automatically detect the display server (X11 or Wayland) and select the appropriate typing strategy:
+- **X11**: xdotool (primary), clipboard+Ctrl+V (fallback)
+- **Wayland**: wtype (primary), ydotool (secondary), clipboard+Ctrl+V (fallback)
+
+The strategy can be overridden via the `type_strategy` configuration setting.
+
+**Traceability**: FR-045 → Auto-Type Module
+
+### 3.11 System Tray Icon
+
+#### FR-046: System Tray Presence
+The application shall display a system tray (notification area) icon using libappindicator. The icon shall reflect the current application state:
+- Red microphone icon when in IDLE state
+- Green microphone icon when in LISTENING or TRANSCRIBING state
+
+**Traceability**: FR-046 → System Tray Module
+
+#### FR-047: System Tray Tooltip
+The system tray icon shall display a dynamic tooltip reflecting the current state:
+- "Transcriber — Ready" when IDLE and model available
+- "Transcriber — Model unavailable" when IDLE and model not found
+- "Transcriber — Recording..." when LISTENING
+- "Transcriber — Transcribing..." when TRANSCRIBING
+
+**Traceability**: FR-047 → System Tray Module
+
+#### FR-048: System Tray Context Menu
+Right-clicking the system tray icon shall display a context menu with the following items:
+- **Toggle Recording** — Toggles recording state (equivalent to clicking the microphone icon)
+- **Show Window** — Presents the main application window
+- **Quit** — Exits the application
+
+**Traceability**: FR-048 → System Tray Module
+
+### 3.12 GPU Acceleration
+
+#### FR-049: GPU (CUDA) Support
+The application shall attempt to load the Whisper model on GPU (CUDA) when available. If GPU loading fails, the application shall automatically fall back to CPU processing. The backend used (GPU or CPU) shall be reported to stderr on model load.
+
+**Traceability**: FR-049 → whisper.cpp GPU support
+
+#### FR-050: Backend Status Display
+The application shall expose the current backend status (GPU/CPU/Not loaded) via the WhisperClient API for display in the UI.
+
+**Traceability**: FR-050 → whisper.cpp GPU support
 
 ---
 
@@ -924,85 +1015,113 @@ Your C/C++ application uses ALSA (`libasound`) directly for audio capture:
 
 ---
 
-## 6. Whisper API Integration
+## 6. Local Whisper Integration (whisper.cpp)
 
-### 6.1 HTTP POST Specification
+> **Note**: This section has been updated in v2.0 to reflect the transition from VLLM server integration to local whisper.cpp-based transcription. All transcription is now performed offline on the local machine with no network dependency.
 
-#### WHISPER-001: Endpoint Configuration
-The Whisper API endpoint shall be configurable via configuration file and shall use the OpenAI-compliant route `/v1/audio/transcriptions` for speech-to-text transcription requests. The endpoint accepts `multipart/form-data` with form fields `file` (audio file), `model` (auto-discovered from the server via GET /v1/models), and `language` (target language code). The Whisper model must be served on an isolated port (e.g., 8081) or via a dedicated lightweight inference engine like whisper.cpp running its own server binary. This keeps the heavy text-generation vLLM pipeline unobstructed for agentic coding tasks while dedicating a separate process strictly for the audio transcription API.
+### 6.1 Model Management
 
-**Traceability**: WHISPER-001 → CFG-002
+#### WHISPER-001: Model Path Configuration
+The application shall use a local GGML model file for Whisper inference. The model path is configurable via the `model_path` configuration parameter. The path can be:
+- An absolute path (e.g., `/usr/share/transcriber/models/ggml-base.bin`)
+- A path with tilde expansion (e.g., `~/.cache/whisper/ggml-base.bin`)
+- A bare filename (e.g., `ggml-base.bin`), which will be searched in default directories
 
-#### WHISPER-002: Content-Type
-The application shall set `Content-Type: multipart/form-data` for audio uploads.
+**Default Search Directories** (in order of preference):
+1. `~/.cache/whisper/`
+2. `/usr/share/transcriber/models/`
 
-**Traceability**: WHISPER-002 → FR-012
+**Traceability**: WHISPER-001 → CFG-005
 
-#### WHISPER-003: File Field Name
-The audio file shall be sent in the `file` form field.
+#### WHISPER-002: Model Loading
+The application shall load the GGML model lazily on the first transcription request. The model context (`struct whisper_context`) is created via `whisper_init_from_file_with_params()` and maintained for the lifetime of the WhisperClient. The model is freed via `whisper_free()` when the client is destroyed.
 
-**Traceability**: WHISPER-003 → FR-012
+**Traceability**: WHISPER-002 → FR-030
 
-#### WHISPER-005: Language Parameter
-The application shall send the `language` parameter if configured.
+#### WHISPER-003: GPU (CUDA) Acceleration
+The application shall attempt to load the model on GPU (CUDA) when the whisper.cpp library was compiled with CUDA support (`HAVE_CUDA` defined). If GPU loading fails, the application shall automatically fall back to CPU processing. The backend used (GPU or CPU) is tracked and reported.
 
-**Traceability**: WHISPER-005 → CFG-007
+**Traceability**: WHISPER-003 → FR-049
 
-#### WHISPER-013: Connection Check and Model Discovery via GET /v1/models
-To verify connectivity and discover the available model, the application shall send a lightweight GET request to the OpenAI-compatible `/v1/models` endpoint on the configured Whisper URL host. A 200 OK response shall constitute a successful connection verification. The application shall extract the first model ID from the response and use it for all subsequent transcription requests. This ensures the correct model identifier is always used regardless of server configuration.
+#### WHISPER-004: Language Parameter
+The application shall accept a language parameter (ISO 639-1 two-letter code, e.g., "en", "es") for transcription. If the language is empty or NULL, the Whisper model will auto-detect the spoken language. The language code is validated to ensure it is exactly 2 characters.
 
-**Traceability**: WHISPER-013 → FR-037
+**Traceability**: WHISPER-004 → CFG-007
 
-### 6.2 Response Handling
+### 6.2 Transcription Pipeline
 
-#### WHISPER-006: JSON Parsing
-The application shall parse the JSON response using `cJSON` (C library). The parser must handle nested JSON structures, extract the `text` field from the response body, and gracefully handle malformed JSON by returning an error status to the state machine.
+#### WHISPER-005: WAV File Reading
+The application shall read WAV files and extract PCM samples for transcription. The WAV parser:
+- Validates RIFF/WAVE headers
+- Parses `fmt ` and `data` chunks
+- Supports 16-bit PCM (primary), with warnings for other formats
+- Handles multi-channel audio by extracting only the first channel
+- Converts int16 PCM samples to float32 normalized to [-1, 1]
+- Uses portable little-endian byte extraction for cross-platform compatibility
 
-**Traceability**: WHISPER-006 → FR-012
+**Expected Format**: 16kHz, mono, 16-bit PCM
+**Tolerated Formats**: Other sample rates, bit depths, and multi-channel (with warnings)
+
+**Traceability**: WHISPER-005 → AUD-005
+
+#### WHISPER-006: Transcription Execution
+The application shall execute transcription using `whisper_full()` with the following parameters:
+- Sampling strategy: `WHISPER_SAMPLING_GREEDY`
+- Thread count: Auto-detected (all available CPU cores) or user-configured
+- Progress output: Disabled (no console output during transcription)
+- Timestamps: Disabled
+- Translation: Disabled
+
+**Traceability**: WHISPER-006 → FR-032
 
 #### WHISPER-007: Text Extraction
-The application shall extract transcribed text from the `text` field in the JSON response, conforming to the OpenAI-compatible API specification where the response body contains `{"text": "transcribed content"}` directly at the top level.
+The application shall extract transcribed text from whisper.cpp segments by iterating over `whisper_full_n_segments()` and concatenating the text from each segment via `whisper_full_get_segment_text()`. Trailing whitespace/newlines are trimmed from the final result.
 
 **Traceability**: WHISPER-007 → FR-012
 
-#### WHISPER-008: Error Response Handling
-The application shall handle API error responses gracefully.
+#### WHISPER-008: Cancellation Support
+The application shall support cancelling in-progress transcription via `whisper_client_cancel()`. This sets an atomic flag (`atomic_int`) that is checked periodically by whisper.cpp's `abort_callback` mechanism during `whisper_full()` execution. When the callback returns true, whisper.cpp aborts the transcription and returns control.
 
-**Traceability**: WHISPER-008 → ERR-003
+**Traceability**: WHISPER-008 → FR-034
 
 ### 6.3 Error Handling
 
-#### WHISPER-009: Timeout Configuration
-The HTTP request shall timeout after 30 seconds.
+#### WHISPER-009: Error Codes
+The application shall return specific error codes for transcription failures:
 
-**Traceability**: WHISPER-009 → NR-002
+| Error Code | Meaning |
+|------------|---------|
+| 1 | Invalid parameters (NULL client or wav_path) |
+| 2 | Model file not found |
+| 3 | Failed to load whisper model |
+| 4 | Failed to read WAV file |
+| 5 | Transcription failed (whisper_full() error) |
+| 6 | No transcription segments produced |
+| 7 | Memory allocation failed |
+
+**Traceability**: WHISPER-009 → ERR-003
 
 #### WHISPER-010: Retry Logic
-The application shall retry failed uploads up to 3 times with exponential backoff.
+The application shall retry failed transcription up to `max_retries` times. Only retryable errors (error codes 4=read error, 5=decode error, 7=memory) trigger retries. Non-retryable errors (model not found, invalid parameters) return immediately. Retry delays use progressive backoff (100ms, 200ms, ...).
 
 **Traceability**: WHISPER-010 → ERR-003
 
-#### WHISPER-011: Connection Error Handling
-The application shall handle connection refused errors.
+#### WHISPER-011: Thread Safety
+The WhisperClient uses a mutex (`pthread_mutex_t`) to protect shared state (model context, configuration). The mutex is held only briefly to access shared state, then released before the actual transcription runs, preventing blocking of `whisper_check_connection()`, `whisper_client_set_model_path()`, and `whisper_client_destroy()` during long transcription operations.
 
-**Traceability**: WHISPER-011 → ERR-004
+**Traceability**: WHISPER-011 → Section 2.1
 
-### 6.4 Performance
+### 6.4 Model Verification
 
-#### WHISPER-012: Upload Efficiency
-The application shall use libcurl's multipart upload for efficient file transfer.
+#### WHISPER-012: Model File Verification (Connection Check)
+The "connection check" is repurposed as model file verification. `whisper_check_connection()` verifies the configured model file exists and is a regular file via `stat()`. A successful check returns true and reports the file size. A failed check returns false with an appropriate error message.
 
-**Traceability**: WHISPER-012 → FR-012
+**Traceability**: WHISPER-012 → FR-037
 
-### 6.5 vLLM OpenAPI Compatibility Validation
+#### WHISPER-013: Model Metadata Extraction
+The application provides a ModelInfo module (`app_model_info.c`) that temporarily loads a Whisper model to extract metadata (model name, quantization type, multilingual support) and immediately frees the context. This allows the configuration dialog to display model information without permanently loading the model.
 
-**Objective**: Validate compatibility between the custom application code and the vLLM server OpenAPI specification (WHISPER-001, WHISPER-007).
-
-#### Research & Findings
-
-**API Payload Mismatch**: In standard vLLM configurations, the native endpoint for speech models uses the OpenAI-compliant `/v1/audio/transcriptions` layout, which accepts form fields `file`, `model`, and `language`. The previous specification documented a custom route (`/inference`) with a parsed return dictionary using `data.text` as the response structure.
-
-**The Fix**: When the backend is a standard vLLM instance or an OpenAI-compatible proxy, the JSON extraction logic must target `response.text` rather than `response.data.text`. WHISPER-001 and WHISPER-007 have been updated to reflect the exact OpenAI specification, ensuring out-of-the-box compatibility without requiring custom server wrappers.
+**Traceability**: WHISPER-013 → Model Info Module
 
 ---
 
@@ -1313,10 +1432,14 @@ The `window_position` parameter shall define the window coordinates.
 
 **Traceability**: CFG-004 → FR-002
 
-#### CFG-005: Whisper URL
-The `whisper_url` parameter shall define the VLLM API endpoint.
+#### CFG-005: Model Path
+The `model_path` parameter shall define the path to the local GGML Whisper model file. The path can be absolute, relative, or a bare filename (which will be searched in default model directories).
 
-**Format**: `"whisper_url": "http://localhost:8080/v1/audio/transcriptions"`
+**Format**: `"model_path": "~/.cache/whisper/ggml-base.bin"`
+
+**Default Search Directories**:
+1. `~/.cache/whisper/`
+2. `/usr/share/transcriber/models/`
 
 **Traceability**: CFG-005 → WHISPER-001
 
@@ -1352,7 +1475,7 @@ The `audio_device` parameter shall specify the user's microphone preference. Whe
 **Traceability**: CFG-010 → FR-020, FR-008a
 
 #### CFG-014: Max Recording Duration
-The `max_duration` parameter shall specify the maximum recording duration in seconds for each transcription session. The value must be an integer between 5 and 30 (inclusive). Values outside this range shall be clamped to the nearest boundary on save.
+The `max_duration` parameter shall specify the maximum recording duration in seconds for each transcription session. The value must be an integer between 5 and 120 (inclusive). Values outside this range shall be clamped to the nearest boundary on save.
 
 **Format**: `"max_duration": 30`
 
@@ -1361,6 +1484,32 @@ The `max_duration` parameter shall specify the maximum recording duration in sec
 **Validation**: Integer, min=5, max=120
 
 **Traceability**: CFG-014 → FR-024, FR-007, FR-007a
+
+#### CFG-015: Auto-Type Output
+The `auto_type_output` parameter shall enable or disable the auto-type feature. When enabled, transcribed text will be automatically typed into the currently focused external window after transcription completes.
+
+**Format**: `"auto_type_output": false`
+**Default Value**: `false`
+**Widget**: Checkbox in Configuration Dialog.
+
+**Traceability**: CFG-015 → FR-043
+
+#### CFG-016: Typing Delay
+The `type_delay_ms` parameter shall specify the inter-character delay in milliseconds for simulated typing. Range: 0-100ms.
+
+**Format**: `"type_delay_ms": 10`
+**Default Value**: `10`
+**Validation**: Integer, min=0, max=100
+
+**Traceability**: CFG-016 → FR-044
+
+#### CFG-017: Typing Strategy
+The `type_strategy` parameter shall specify the preferred typing strategy. Values: `"auto"` (auto-detect based on display server), `"xdotool"` (force xdotool), `"clipboard"` (force clipboard+Ctrl+V).
+
+**Format**: `"type_strategy": "auto"`
+**Default Value**: `"auto"`
+
+**Traceability**: CFG-017 → FR-045
 
 ### 9.3 Configuration Loading
 
@@ -1958,40 +2107,117 @@ Configuration files shall have permissions `600` (rw-------).
 ```json
 {
   "window_position": {"x": 100, "y": 100},
-  "whisper_url": "http://localhost:8080/v1/audio/transcriptions",
-  "audio_device": "system_default",
+  "model_path": "~/.cache/whisper/ggml-base.bin",
+  "audio_device": "default",
   "language": "en",
   "notification": true,
-  "max_duration": 30
+  "max_duration": 30,
+  "auto_type_output": false,
+  "type_delay_ms": 10,
+  "type_strategy": "auto"
 }
 ```
 
-### 14.3 Whisper API Request/Response
+### 14.3 Local Whisper Transcription (whisper.cpp)
 
-#### Request
-```
-POST /v1/audio/transcriptions HTTP/1.1
-Host: localhost:8080
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+The application uses whisper.cpp for local, offline transcription. No network requests are made.
 
-------WebKitFormBoundary
-Content-Disposition: form-data; name="file"; filename="audio.wav"
-Content-Type: audio/wav
+#### Model Files
 
-[binary audio data]
-------WebKitFormBoundary
-Content-Disposition: form-data; name="model"
+Supported GGML model files (downloaded from https://huggingface.co/ggml-org/models):
+- `ggml-tiny.bin` (~75 MB, fast, lower accuracy)
+- `ggml-base.bin` (~140 MB, good balance)
+- `ggml-small.bin` (~465 MB, better accuracy)
+- `ggml-medium.bin` (~1.5 GB, high accuracy)
+- `ggml-large-v3.bin` (~3 GB, best accuracy)
 
-openai/whisper-large-v3
-------WebKitFormBoundary--
-```
+#### Model Path Resolution
 
-#### Response
-```json
-{
-  "text": "This is the transcribed text."
-}
-```
+The application resolves model paths in the following order:
+1. Direct file path (absolute or relative)
+2. Tilde expansion (`~/.cache/whisper/ggml-base.bin` → `$HOME/.cache/whisper/ggml-base.bin`)
+3. Bare filename search in default directories:
+   - `~/.cache/whisper/`
+   - `/usr/share/transcriber/models/`
+
+#### Transcription Parameters
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Sample Rate | 16000 Hz | Fixed |
+| Channels | 1 (mono) | Fixed |
+| Bit Depth | 16-bit PCM | Fixed |
+| Sampling Strategy | WHISPER_SAMPLING_GREEDY | Fixed |
+| Threads | Auto (all available) | Configurable (0 = auto) |
+| Language | User-configured or auto-detect | Config |
+| Timestamps | Disabled | Fixed |
+| GPU | CUDA with CPU fallback | Auto-detected |
+
+#### Cancellation Support
+
+Transcription can be cancelled via `whisper_client_cancel()`, which sets an atomic flag checked periodically by whisper.cpp's `abort_callback` mechanism during `whisper_full()` execution.
+
+### 14.4 Auto-Type Feature
+
+The Auto-Type module (`app_typer.c`) automatically types transcribed text into the currently focused external window.
+
+#### Strategy Selection (X11)
+
+| Priority | Strategy | Command | Requirements |
+|----------|----------|---------|--------------|
+| 1 (Primary) | xdotool | `xdotool type --clearmodifiers --delay N "text"` | xdotool installed |
+| 2 (Fallback) | Clipboard + Ctrl+V | Copy to clipboard, then `xdotool key --clearmodifiers ctrl+v` | Any key simulation tool |
+
+#### Strategy Selection (Wayland)
+
+| Priority | Strategy | Command | Requirements |
+|----------|----------|---------|--------------|
+| 1 (Primary) | wtype | `wtype -d N "text"` | wtype installed |
+| 2 (Secondary) | ydotool | `ydotool text "text"` | ydotool installed, uinput group |
+| 3 (Fallback) | Clipboard + Ctrl+V | Copy to clipboard, then simulate Ctrl+V | Any key simulation tool |
+
+#### Display Server Detection
+
+At initialization, the module detects the display server by checking environment variables:
+- `WAYLAND_DISPLAY` set → Wayland session
+- `DISPLAY` set → X11 session
+- Neither set → No display server (clipboard fallback only)
+
+#### Configuration
+
+| Setting | Type | Default | Range |
+|---------|------|---------|-------|
+| `auto_type_output` | Boolean | `false` | - |
+| `type_delay_ms` | Integer | `10` | 0-100 |
+| `type_strategy` | String | `"auto"` | `"auto"`, `"xdotool"`, `"clipboard"` |
+
+### 14.5 System Tray Icon
+
+The System Tray module (`app_tray.c`) provides notification area presence via libappindicator (Ayatana fork preferred).
+
+#### Icon States
+
+| State | Icon | Tooltip |
+|-------|------|---------|
+| IDLE (connected) | Red mic | "Transcriber — Ready" |
+| IDLE (disconnected) | Red mic | "Transcriber — Model unavailable" |
+| LISTENING | Green mic | "Transcriber — Recording..." |
+| TRANSCRIBING | Green mic | "Transcriber — Transcribing..." |
+
+#### Context Menu
+
+Right-click context menu items:
+- **Toggle Recording** — Toggles recording state (equivalent to clicking mic icon)
+- **Show Window** — Presents the main GtkWindow
+- **Quit** — Calls `gtk_main_quit()`
+
+#### Icon Handling
+
+Embedded XPM arrays (from CMake build) are converted to GdkPixbuf, then saved as temporary PNG files in the system temp directory for AppIndicator consumption. Temp files are cleaned up on destroy.
+
+#### Dependencies
+
+- `libayatana-appindicator` (preferred) or `libappindicator` (fallback)
 
 ---
 

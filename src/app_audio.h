@@ -40,7 +40,7 @@ typedef enum {
  * Defines the fixed audio capture parameters.
  *
  * These values are NOT configurable by the user — they are fixed to ensure
- * compatibility with the Whisper API, which expects 16kHz mono PCM input.
+ * compatibility with whisper.cpp, which expects 16kHz mono PCM input.
  */
 typedef struct {
     uint32_t sample_rate;      ///< Sample rate in Hz — fixed at 16000
@@ -134,6 +134,10 @@ gboolean audio_recorder_stop(AudioRecorder *recorder);
 /**
  * Check if the recorder is currently active (recording).
  *
+ * @deprecated Unused public function — no external callers.
+ *             The `is_recording` field is accessed directly inside the module.
+ *             Keep for potential debugging/monitoring.
+ *
  * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
  * @return true if recording is active, false otherwise.
  */
@@ -156,6 +160,9 @@ const char *audio_recorder_get_wav_path(const AudioRecorder *recorder);
 
 /**
  * Get the size of recorded PCM data in bytes.
+ *
+ * @deprecated Unused public function — no external callers.
+ *             Could be useful for debugging/monitoring but currently unused.
  *
  * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
  * @return The PCM data size in bytes, or 0 if no recording is active.
@@ -217,25 +224,40 @@ void audio_recorder_reset_error(void);
  */
 
 /**
+ * Holds a list of audio capture devices with both user-friendly display names
+ * and internal ALSA device names.
+ *
+ * Each entry has:
+ *   - display_names[i]: Human-readable name (e.g., "Built-in Microphone (hw:0,0)")
+ *   - device_names[i]:  ALSA device identifier (e.g., "hw:0,0")
+ */
+typedef struct {
+    gchar **display_names;  ///< User-friendly names (NULL-terminated, caller owns)
+    gchar **device_names;   ///< ALSA device names (NULL-terminated, caller owns)
+    gint count;             ///< Number of devices
+} AudioDeviceList;
+
+/**
  * Get the list of available ALSA capture devices.
  *
  * @param recorder Pointer to a valid AudioRecorder (used for backend info).
- * @param count Output: number of devices returned.
- * @return A NULL-terminated array of device name strings, or NULL on error.
- *         The caller must free the array using audio_device_list_free().
+ * @return A newly allocated AudioDeviceList*, or NULL on error.
+ *         The caller must free the result using audio_device_list_free().
  */
-gchar **audio_recorder_get_device_list(const AudioRecorder *recorder, gint *count);
+AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder);
 
 /**
  * Free a device list returned by audio_recorder_get_device_list().
  *
- * @param devices Pointer to the device list array. May be NULL (no-op).
- * @count Number of devices in the list.
+ * @param list Pointer to the AudioDeviceList struct. May be NULL (no-op).
  */
-void audio_device_list_free(gchar **devices, gint count);
+void audio_device_list_free(AudioDeviceList *list);
 
 /**
  * Clear the current recording state and clean up WAV file.
+ *
+ * @deprecated Unused public function — no external callers.
+ *             Comment says "caller manages lifecycle" but no caller invokes this.
  *
  * @param recorder AudioRecorder handle
  * @return TRUE on success, FALSE on failure

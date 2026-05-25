@@ -208,6 +208,9 @@ bool dbus_service_stop(DBusService* service);
 /**
  * Check if the D-Bus service is currently active.
  *
+ * @deprecated Unused public function — no external callers.
+ *             Diagnostic function with no call sites.
+ *
  * @param service Pointer to a valid DBusService. Must not be NULL.
  * @return true if the service is active (bus name acquired and listening),
  *         false otherwise.
@@ -216,6 +219,9 @@ bool dbus_service_is_active(const DBusService* service);
 
 /**
  * Check if the D-Bus session bus is available.
+ *
+ * @deprecated Unused public function — no external callers.
+ *             Could be used for pre-flight checks but has no call sites.
  *
  * This function attempts to connect to the D-Bus session bus to verify
  * that it is available. This is a lightweight check that does NOT request
@@ -290,50 +296,8 @@ bool dbus_service_process_messages(DBusService* service);
  */
 const char* dbus_get_toggle_command(void);
 
-/**
- * Get a multi-line formatted version of the dbus-send command.
- *
- * This function returns the dbus-send command formatted across multiple
- * lines with backslash continuations, suitable for display in the
- * configuration dialog or documentation.
- *
- * Example output:
- *   dbus-send --session \
- *     --dest=org.xvoice.Controller \
- *     --type=method_call \
- *     /org/xvoice/App \
- *     org.xvoice.Actions.Toggle
- *
- * @return A statically allocated string containing the formatted command.
- *         The caller must NOT free the returned string.
- */
-const char* dbus_get_toggle_command_formatted(void);
-
-/*---------------------------------------------------------------------------
- * Section 8: Single-Instance Enforcement
- *---------------------------------------------------------------------------
- * Functions for enforcing single-instance behavior via D-Bus bus name.
- */
-
-/**
- * Check if another instance of the application is already running.
- *
- * This function attempts to connect to the D-Bus session bus and check
- * if the bus name "org.xvoice.Controller" is already owned by another
- * process. This is used at application startup to enforce single-instance
- * behavior.
- *
- * @return true if another instance is already running (bus name is owned),
- *         false if no instance is running (bus name is available).
- *
- * @note This function should be called BEFORE dbus_service_start().
- *       If another instance is running, the application should exit
- *       (or bring the existing instance to focus).
- *
- * @see HK-003: Documentation (single-instance via bus name)
- * @see SRS Section 8.3: Application Behavior (The Listener)
- */
-bool dbus_another_instance_running(void);
+/* MAJ-002/MIN-001 fix: Removed unused dbus_get_toggle_command_formatted()
+ * and dbus_another_instance_running() declarations. */
 
 #ifdef __cplusplus
 }

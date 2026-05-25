@@ -103,7 +103,7 @@ void tray_set_state(SystemTray *tray, AppState state);
  * Update the tray tooltip to reflect connection status.
  *
  * When in IDLE state and the connection is disconnected, the tooltip
- * is updated to "Transcriber — Server disconnected" to alert the user.
+ * is updated to "Transcriber — Model unavailable" to alert the user.
  * When connected, the tooltip shows "Transcriber — Ready".
  *
  * This function only modifies the tooltip — it does not change the icon.

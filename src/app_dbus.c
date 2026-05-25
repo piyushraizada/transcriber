@@ -366,6 +366,7 @@ bool dbus_service_stop(DBusService *service) {
 /**
  * Check if the D-Bus service is currently active.
  * Matches header declaration: bool dbus_service_is_active(const DBusService* service);
+ * TODO: Unused public function — considered for removal. Diagnostic function with no callers.
  */
 bool dbus_service_is_active(const DBusService *service) {
     if (!service) return false;
@@ -374,6 +375,7 @@ bool dbus_service_is_active(const DBusService *service) {
 
 /**
  * Check if the D-Bus session bus is available.
+ * TODO: Unused public function — considered for removal. Could be used for pre-flight checks but has no callers.
  */
 bool dbus_session_bus_available(void) {
     DBusError err;
@@ -406,58 +408,6 @@ const char *dbus_get_toggle_command(void) {
            "org.xvoice.Actions.Toggle";
 }
 
-/**
- * Get a multi-line formatted version of the dbus-send command.
- */
-const char *dbus_get_toggle_command_formatted(void) {
-    return "dbus-send --session "
-           "--dest=org.xvoice.Controller "
-           "--type=method_call "
-           "/org/xvoice/App "
-           "org.xvoice.Actions.Toggle";
-}
-
-/* ------------------------------------------------------------------ */
-/* Public API - Single-Instance Enforcement                            */
-/* ------------------------------------------------------------------ */
-
-/**
- * Check if another instance of the application is already running.
- */
-bool dbus_another_instance_running(void) {
-    DBusError err;
-    dbus_error_init(&err);
-
-    DBusConnection *conn = dbus_bus_get(DBUS_BUS_SESSION, &err);
-    if (dbus_error_is_set(&err)) {
-        dbus_error_free(&err);
-        return false;
-    }
-
-    /* Try to request the bus name */
-    int reply = dbus_bus_request_name(
-        conn,
-        DBUS_BUS_NAME,
-        DBUS_NAME_FLAG_DO_NOT_QUEUE,
-        &err
-    );
-
-    if (dbus_error_is_set(&err)) {
-        dbus_error_free(&err);
-        /* Do NOT close shared connection */
-        (void)conn;
-        return false;
-    }
-
-    bool another_running = (reply == DBUS_REQUEST_NAME_REPLY_EXISTS ||
-                            reply == DBUS_REQUEST_NAME_REPLY_IN_QUEUE);
-
-    /* Release the name if we got it - use dbus_bus_release_name */
-    if (!another_running) {
-        dbus_bus_release_name(conn, DBUS_BUS_NAME, NULL);
-    }
-
-    /* Do NOT close shared connection */
-    (void)conn;
-    return another_running;
-}
+/* MAJ-002/MIN-001 fix: Removed unused dbus_get_toggle_command_formatted()
+ * and dbus_another_instance_running(). Single-instance check is done
+ * inline in dbus_service_start(). */

@@ -223,7 +223,7 @@ GtkWindow *app_window_get_gtk_window(MainWindow *win);
  * Public API — MainWindow State Updates
  *
  * These functions are called by the state controller (or callbacks from
- * the Audio/Network threads) to update the UI in response to state changes.
+ * the Audio/Transcription threads) to update the UI in response to state changes.
  * All functions are designed to be called from the Presentation Thread
  * (GTK main context).
  *****************************************************************************/
@@ -431,20 +431,7 @@ void app_text_window_append_text(TextWindow *tw, const char *text);
  */
 void app_text_window_set_error(TextWindow *tw, const char *error);
 
-/* app_text_window_get_text — Retrieve the full text content of the TextWindow.
- *
- * Returns a newly allocated string containing the entire text buffer
- * content. The caller is responsible for freeing the returned string.
- *
- * Returns: A newly allocated UTF-8 string, or NULL if the buffer is empty.
- */
-char *app_text_window_get_text(TextWindow *tw);
-
-/* app_text_window_is_visible — Check if the TextWindow is currently shown.
- *
- * Returns: true if the window is visible, false if hidden.
- */
-bool app_text_window_is_visible(TextWindow *tw);
+/* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
 
 /* app_window_set_volume_level — Update the volume level bar.
  *

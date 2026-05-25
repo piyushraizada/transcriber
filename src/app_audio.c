@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -176,7 +177,8 @@ struct _AudioRecorder {
 
     pthread_t capture_thread;
     pthread_mutex_t mutex;
-    volatile gboolean stop_flag;
+    /* HI-02 + SG-01 fix: Use atomic_int for portable thread-safe stop flag */
+    atomic_int stop_flag;
 
     /* ALSA context */
     snd_pcm_t *alsa_pcm;
@@ -225,6 +227,16 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
     err = snd_pcm_hw_params_set_rate_near(pcm, params, &actual_rate, 0);
     if (err < 0) { snd_pcm_close(pcm); return false; }
 
+    /* MIN-004 fix: Validate that the actual rate matches requested 16kHz.
+     * If the device cannot provide 16kHz, the WAV header would claim 16kHz
+     * but contain audio at a different rate, producing distorted playback. */
+    if (actual_rate != 16000) {
+        fprintf(stderr, "[audio] Device '%s' provides %u Hz instead of 16000 Hz — skipping\n",
+                device_name, actual_rate);
+        snd_pcm_close(pcm);
+        return false;
+    }
+
     snd_pcm_uframes_t actual_buffer = buffer_size;
     err = snd_pcm_hw_params_set_period_size_near(pcm, params, &actual_buffer, 0);
     if (err < 0) { snd_pcm_close(pcm); return false; }
@@ -272,7 +284,7 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
     recorder->wav_file = NULL;
     recorder->wav_data_size = 0;
     recorder->is_recording = FALSE;
-    recorder->stop_flag = FALSE;
+    atomic_store(&recorder->stop_flag, FALSE);
     recorder->alsa_pcm = NULL;
     recorder->rms_volume = 0.0;
     pthread_mutex_init(&recorder->volume_mutex, NULL);
@@ -394,7 +406,8 @@ static void *capture_thread_func(void *arg) {
     int read_error_count = 0;
     gsize total_frames = 0;
 
-    while (!recorder->stop_flag) {
+    /* HI-02 fix: Use atomic load for the stop flag check */
+    while (!atomic_load(&recorder->stop_flag)) {
         err = snd_pcm_readi(recorder->alsa_pcm, buffer, recorder->format.buffer_size);
         if (err == -EPIPE) {
             snd_pcm_prepare(recorder->alsa_pcm);
@@ -520,7 +533,7 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
     }
 
     recorder->wav_data_size = 0;
-    recorder->stop_flag = FALSE;
+    atomic_store(&recorder->stop_flag, FALSE);
 
     int err = pthread_create(&recorder->capture_thread, NULL, capture_thread_func, recorder);
     if (err != 0) {
@@ -548,7 +561,8 @@ gboolean audio_recorder_stop(AudioRecorder *recorder) {
 
     pthread_mutex_lock(&recorder->mutex);
 
-    __atomic_store_n(&recorder->stop_flag, TRUE, __ATOMIC_RELEASE);
+    /* HI-02 + SG-01 fix: Use atomic store for portable thread safety */
+    atomic_store(&recorder->stop_flag, TRUE);
 
     pthread_mutex_unlock(&recorder->mutex);
 
@@ -575,6 +589,9 @@ gboolean audio_recorder_stop(AudioRecorder *recorder) {
     return TRUE;
 }
 
+/* TODO: Unused public function — considered for removal.
+ * The `is_recording` field is accessed directly inside the module.
+ * No external caller uses this getter. Keep for potential debugging/monitoring. */
 gboolean audio_recorder_is_recording(const AudioRecorder *recorder) {
     if (!recorder) return FALSE;
     return recorder->is_recording;
@@ -605,6 +622,8 @@ AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder) {
     return recorder->backend;
 }
 
+/* TODO: Unused public function — considered for removal.
+ * Could be useful for debugging/monitoring but currently has no callers. */
 gsize audio_recorder_get_bytes_recorded(const AudioRecorder *recorder) {
     if (!recorder) return 0;
     return recorder->wav_data_size;
@@ -616,6 +635,8 @@ void audio_recorder_reset_error(void) {
     pthread_mutex_unlock(&g_audio_error_mutex);
 }
 
+/* TODO: Unused public function — considered for removal.
+ * Comment says "caller manages lifecycle" but no caller invokes this. */
 gboolean audio_recorder_clear(AudioRecorder *recorder) {
     if (!recorder) return FALSE;
 
@@ -660,9 +681,8 @@ static gboolean test_capture_device(const char *device_name) {
     return TRUE;
 }
 
-gchar **audio_recorder_get_device_list(const AudioRecorder *recorder, gint *count) {
+AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
     (void)recorder;
-    *count = 0;
 
     void **hints = NULL;
     int err = snd_device_name_hint(-1, "pcm", &hints);
@@ -708,7 +728,7 @@ gchar **audio_recorder_get_device_list(const AudioRecorder *recorder, gint *coun
             continue;
         }
 
-        /* Build display: "Description (name)" or just "name" */
+        /* Build display name from description only (no device identifier) */
         gchar *display;
         if (desc && desc[0] != '\0') {
             /* Clean up description — remove newlines */
@@ -717,50 +737,76 @@ gchar **audio_recorder_get_device_list(const AudioRecorder *recorder, gint *coun
                 if (*d == '\n') *d = ' ';
                 d++;
             }
-            display = g_strdup_printf("%s (%s)", desc, name);
+            /* Truncate at first comma to keep name short and readable */
+            char *comma = strchr(desc, ',');
+            if (comma) {
+                *comma = '\0';
+            }
+            /* Trim trailing whitespace */
+            d = desc + strlen(desc) - 1;
+            while (d >= desc && *d == ' ') {
+                *d = '\0';
+                d--;
+            }
+            display = g_strdup(desc);
         } else {
             display = g_strdup(name);
         }
 
         if (n_entries < max_entries) {
             entries[n_entries].display = display;
-            entries[n_entries].name = name;  /* transfer ownership */
+            entries[n_entries].name = g_strdup(name);  /* duplicate for return */
             n_entries++;
         } else {
             g_free(display);
-            free(name);
         }
+        free(name);
         free(desc);
     }
 
     snd_device_name_free_hint(hints);
 
     if (n_entries > 0) {
-        gchar **devices = g_new0(gchar *, n_entries + 1);
+        AudioDeviceList *list = g_new0(AudioDeviceList, 1);
+        list->display_names = g_new0(gchar *, n_entries + 1);
+        list->device_names = g_new0(gchar *, n_entries + 1);
+        list->count = n_entries;
         for (gint i = 0; i < n_entries; i++) {
-            devices[i] = entries[i].name;
-            g_free(entries[i].display);
+            list->display_names[i] = entries[i].display;
+            list->device_names[i] = entries[i].name;
         }
-        devices[n_entries] = NULL;
-        *count = n_entries;
         free(entries);
-        return devices;
+        return list;
     }
     free(entries);
 
 fallback:
-    gchar **devices = g_new0(gchar *, 2);
-    devices[0] = g_strdup("default");
-    *count = 1;
-    return devices;
+    {
+        AudioDeviceList *list = g_new0(AudioDeviceList, 1);
+        list->display_names = g_new0(gchar *, 2);
+        list->device_names = g_new0(gchar *, 2);
+        list->count = 1;
+        list->display_names[0] = g_strdup("Default");
+        list->device_names[0] = g_strdup("default");
+        return list;
+    }
 }
 
-void audio_device_list_free(gchar **devices, gint count) {
-    if (!devices) return;
-    for (gint i = 0; i < count; i++) {
-        g_free(devices[i]);
+void audio_device_list_free(AudioDeviceList *list) {
+    if (!list) return;
+    if (list->display_names) {
+        for (gint i = 0; i < list->count; i++) {
+            g_free(list->display_names[i]);
+        }
+        g_free(list->display_names);
     }
-    g_free(devices);
+    if (list->device_names) {
+        for (gint i = 0; i < list->count; i++) {
+            g_free(list->device_names[i]);
+        }
+        g_free(list->device_names);
+    }
+    g_free(list);
 }
 
 /* ===================================================================

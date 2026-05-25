@@ -119,7 +119,6 @@ static char* expand_tilde(const char* path)
 char* config_get_default_directory(void)
 {
     const char* xdg = getenv("XDG_CONFIG_HOME");
-    const char* base = xdg ? xdg : NULL;
 
     /* We need HOME for the fallback path */
     const char* home = getenv("HOME");
@@ -190,14 +189,13 @@ void config_set_defaults(AppConfig* config)
     }
 
     /* CFG-003: Default Configuration */
-    strncpy(config->whisper_url, "http://localhost:8080/v1/audio/transcriptions", sizeof(config->whisper_url) - 1);
-    config->whisper_url[sizeof(config->whisper_url) - 1] = '\0';
-
-    strncpy(config->language, "en", sizeof(config->language) - 1);
-    config->language[sizeof(config->language) - 1] = '\0';
+    strncpy(config->model_path, "ggml-large-v3-turbo-q8_0.bin", sizeof(config->model_path) - 1);
+    config->model_path[sizeof(config->model_path) - 1] = '\0';
 
     strncpy(config->audio_device, "system_default", sizeof(config->audio_device) - 1);
     config->audio_device[sizeof(config->audio_device) - 1] = '\0';
+
+    config->audio_device_display_name[0] = '\0';  /* No display name by default */
 
     config->max_duration = 30;  /* 30 seconds (SRS default) */
 
@@ -291,22 +289,25 @@ bool config_load_from_path(AppConfig* config, const char* path)
     /* Extract fields with validation */
     cJSON* item;
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "whisper_url");
+    /* Read "model_path" from config.
+     * Legacy "whisper_url" key from pre-migration config files is no longer
+     * supported — users must update their config.json to use "model_path". */
+    item = cJSON_GetObjectItemCaseSensitive(root, "model_path");
     if (item && cJSON_IsString(item) && item->valuestring) {
-        strncpy(config->whisper_url, item->valuestring, sizeof(config->whisper_url) - 1);
-        config->whisper_url[sizeof(config->whisper_url) - 1] = '\0';
-    }
-
-    item = cJSON_GetObjectItemCaseSensitive(root, "language");
-    if (item && cJSON_IsString(item) && item->valuestring) {
-        strncpy(config->language, item->valuestring, sizeof(config->language) - 1);
-        config->language[sizeof(config->language) - 1] = '\0';
+        strncpy(config->model_path, item->valuestring, sizeof(config->model_path) - 1);
+        config->model_path[sizeof(config->model_path) - 1] = '\0';
     }
 
     item = cJSON_GetObjectItemCaseSensitive(root, "audio_device");
     if (item && cJSON_IsString(item) && item->valuestring) {
         strncpy(config->audio_device, item->valuestring, sizeof(config->audio_device) - 1);
         config->audio_device[sizeof(config->audio_device) - 1] = '\0';
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "audio_device_display_name");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        strncpy(config->audio_device_display_name, item->valuestring, sizeof(config->audio_device_display_name) - 1);
+        config->audio_device_display_name[sizeof(config->audio_device_display_name) - 1] = '\0';
     }
 
     item = cJSON_GetObjectItemCaseSensitive(root, "max_duration");
@@ -391,9 +392,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
         return false;
     }
 
-    cJSON_AddStringToObject(root, "whisper_url", config->whisper_url);
-    cJSON_AddStringToObject(root, "language", config->language);
+    cJSON_AddStringToObject(root, "model_path", config->model_path);
     cJSON_AddStringToObject(root, "audio_device", config->audio_device);
+    cJSON_AddStringToObject(root, "audio_device_display_name", config->audio_device_display_name);
     cJSON_AddNumberToObject(root, "max_duration", config->max_duration);
 
     cJSON *window_pos = cJSON_CreateObject();
@@ -466,21 +467,9 @@ bool config_validate(const AppConfig* config)
         return false;
     }
 
-    /* Validate whisper_url — must start with http:// or https:// */
-    if (config->whisper_url[0] == '\0') {
-        set_error("whisper_url is empty");
-        return false;
-    }
-    if (strncmp(config->whisper_url, "http://", 7) != 0 &&
-        strncmp(config->whisper_url, "https://", 8) != 0) {
-        set_error("whisper_url must start with http:// or https://");
-        return false;
-    }
-
-    /* Validate language — must be empty or 2-letter ISO 639-1 */
-    size_t lang_len = strlen(config->language);
-    if (lang_len > 0 && lang_len != 2) {
-        set_error("language must be empty or a 2-letter ISO 639-1 code");
+    /* Validate model_path — must not be empty */
+    if (config->model_path[0] == '\0') {
+        set_error("model_path is empty");
         return false;
     }
 
@@ -504,47 +493,25 @@ bool config_validate(const AppConfig* config)
  * Section 6: Field Accessors
  *---------------------------------------------------------------------------*/
 
-bool config_set_whisper_url(AppConfig* config, const char* url)
+bool config_set_model_path(AppConfig* config, const char* path)
 {
-    if (!config || !url) {
+    if (!config || !path) {
         set_error("NULL parameter");
         return false;
     }
-    if (strlen(url) >= sizeof(config->whisper_url)) {
-        set_error("URL too long");
+    if (strlen(path) >= sizeof(config->model_path)) {
+        set_error("Model path too long");
         return false;
     }
-    strncpy(config->whisper_url, url, sizeof(config->whisper_url) - 1);
-    config->whisper_url[sizeof(config->whisper_url) - 1] = '\0';
+    strncpy(config->model_path, path, sizeof(config->model_path) - 1);
+    config->model_path[sizeof(config->model_path) - 1] = '\0';
     return true;
 }
 
-const char* config_get_whisper_url(const AppConfig* config)
+const char* config_get_model_path(const AppConfig* config)
 {
     if (!config) return "";
-    return config->whisper_url;
-}
-
-bool config_set_language(AppConfig* config, const char* language)
-{
-    if (!config || !language) {
-        set_error("NULL parameter");
-        return false;
-    }
-    size_t len = strlen(language);
-    if (len > 0 && len != 2) {
-        set_error("language must be empty or 2-letter code");
-        return false;
-    }
-    strncpy(config->language, language, sizeof(config->language) - 1);
-    config->language[sizeof(config->language) - 1] = '\0';
-    return true;
-}
-
-const char* config_get_language(const AppConfig* config)
-{
-    if (!config) return "";
-    return config->language;
+    return config->model_path;
 }
 
 bool config_set_audio_device(AppConfig* config, const char* device)
@@ -570,6 +537,31 @@ const char* config_get_audio_device(const AppConfig* config)
 {
     if (!config) return "";
     return config->audio_device;
+}
+
+bool config_set_audio_device_display_name(AppConfig* config, const char* name)
+{
+    if (!config) {
+        set_error("NULL config");
+        return false;
+    }
+    if (name) {
+        if (strlen(name) >= sizeof(config->audio_device_display_name)) {
+            set_error("display name too long");
+            return false;
+        }
+        strncpy(config->audio_device_display_name, name, sizeof(config->audio_device_display_name) - 1);
+        config->audio_device_display_name[sizeof(config->audio_device_display_name) - 1] = '\0';
+    } else {
+        config->audio_device_display_name[0] = '\0';
+    }
+    return true;
+}
+
+const char* config_get_audio_device_display_name(const AppConfig* config)
+{
+    if (!config) return "";
+    return config->audio_device_display_name;
 }
 
 bool config_set_max_duration(AppConfig* config, int duration)
@@ -620,3 +612,4 @@ bool config_get_notifications(const AppConfig* config)
     if (!config) return true;
     return config->enable_notifications;
 }
+

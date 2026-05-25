@@ -95,40 +95,7 @@ bool clipboard_copy_text(GdkDisplay* display, const char* text);
  */
 bool clipboard_copy_text_both(GdkDisplay* display, const char* text);
 
-/**
- * Copy the transcription text from a GtkTextView to the clipboard.
- *
- * This convenience function retrieves the text content from a GtkTextView
- * widget and copies it to the clipboard. This is the primary function
- * used when the user triggers the "Copy" action.
- *
- * The function performs the following steps:
- *   1. Get the GtkTextBuffer from the GtkTextView
- *   2. Get the full text range from the buffer
- *   3. Copy the text to both CLIPBOARD and PRIMARY selections
- *   4. Return the result
- *
- * @param text_view Pointer to a GtkTextView containing the transcription text.
- *                  Must not be NULL.
- * @return true if the text was copied successfully, false on error.
- *
- * @see FR-015: Copy to Clipboard
- * @see FR-017: Text Area Persistence on Copy (text remains in view after copy)
- */
-bool clipboard_copy_from_text_view(GtkTextView* text_view);
-
-/**
- * Clear the clipboard content.
- *
- * This function clears the clipboard content by setting an empty string.
- * This is useful for cleaning up sensitive data before application exit.
- *
- * @param display A GdkDisplay* for the clipboard. Pass NULL for default.
- * @return true if the clipboard was cleared, false on error.
- *
- * @see NR-010: Memory Buffer Scrubbing (clipboard cleanup on exit)
- */
-bool clipboard_clear(GdkDisplay* display);
+/* MIN-001 fix: Removed unused clipboard_copy_from_text_view() and clipboard_clear(). */
 
 /*---------------------------------------------------------------------------
  * Section 3: Clipboard Utilities
@@ -148,34 +115,7 @@ bool clipboard_clear(GdkDisplay* display);
  */
 bool clipboard_is_available(GdkDisplay* display);
 
-/**
- * Get the GtkClipboard object for the CLIPBOARD selection.
- *
- * This function returns a GtkClipboard* for the standard clipboard.
- * The caller takes a reference to the clipboard and is responsible for
- * calling g_object_unref() when done.
- *
- * @param display A GdkDisplay* for the clipboard. Pass NULL for default.
- * @return A newly referenced GtkClipboard*, or NULL on error.
- *         The caller must call g_object_unref() when done.
- */
-GtkClipboard* clipboard_get_clipboard(GdkDisplay* display);
-
-/**
- * Get the GtkClipboard object for the PRIMARY selection.
- *
- * This function returns a GtkClipboard* for the primary selection.
- * The caller takes a reference to the clipboard and is responsible for
- * calling g_object_unref() when done.
- *
- * On Wayland, this function may return NULL or a non-functional clipboard,
- * as the PRIMARY selection is not supported by the Wayland protocol.
- *
- * @param display A GdkDisplay* for the clipboard. Pass NULL for default.
- * @return A newly referenced GtkClipboard*, or NULL on error / Wayland.
- *         The caller must call g_object_unref() when done.
- */
-GtkClipboard* clipboard_get_primary(GdkDisplay* display);
+/* MIN-001 fix: Removed unused clipboard_get_clipboard() and clipboard_get_primary(). */
 
 /*---------------------------------------------------------------------------
  * Section 4: Error Handling

@@ -12,6 +12,7 @@
 
 #include "app_clipboard.h"
 
+#include <pthread.h>
 #include <string.h>
 
 /*---------------------------------------------------------------------------
@@ -119,45 +120,8 @@ bool clipboard_copy_text_both(GdkDisplay* display, const char* text)
     return clipboard_ok;
 }
 
-bool clipboard_copy_from_text_view(GtkTextView* text_view)
-{
-    if (!text_view) {
-        set_error("NULL text_view parameter");
-        return false;
-    }
-
-    GtkTextBuffer* buffer = gtk_text_view_get_buffer(text_view);
-    if (!buffer) {
-        set_error("Failed to get text buffer from TextView");
-        return false;
-    }
-
-    GtkTextIter start, end;
-    gtk_text_buffer_get_start_iter(buffer, &start);
-    gtk_text_buffer_get_end_iter(buffer, &end);
-
-    gchar* text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
-    if (!text) {
-        set_error("Failed to extract text from buffer");
-        return false;
-    }
-
-    GdkDisplay* display = gdk_display_get_default();
-    bool result = clipboard_copy_text_both(display, text);
-    g_free(text);
-
-    return result;
-}
-
-/*---------------------------------------------------------------------------
- * Section 2: Clipboard Ownership and Monitoring
- *---------------------------------------------------------------------------*/
-
-
-bool clipboard_clear(GdkDisplay* display)
-{
-    return clipboard_copy_text(display, "");
-}
+/* MIN-001 fix: Removed unused clipboard_copy_from_text_view(), clipboard_clear(),
+ * clipboard_get_clipboard(), and clipboard_get_primary(). */
 
 /*---------------------------------------------------------------------------
  * Section 3: Clipboard Utilities
@@ -165,6 +129,7 @@ bool clipboard_clear(GdkDisplay* display)
 
 bool clipboard_is_available(GdkDisplay* display)
 {
+    (void)display; /* Reserved for future display-specific clipboard logic */
     GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     if (!clipboard) {
         set_error("Clipboard is unavailable");
@@ -174,28 +139,4 @@ bool clipboard_is_available(GdkDisplay* display)
     /* Do NOT unref: shared singleton from gtk_clipboard_get() */
     set_error(NULL);
     return true;
-}
-
-GtkClipboard* clipboard_get_clipboard(GdkDisplay* display)
-{
-    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    if (!clipboard) {
-        set_error("Failed to get CLIPBOARD selection");
-    }
-    return clipboard;
-}
-
-GtkClipboard* clipboard_get_primary(GdkDisplay* display)
-{
-    /* PRIMARY selection not supported on Wayland */
-    if (is_wayland()) {
-        set_error("PRIMARY selection not available on Wayland");
-        return NULL;
-    }
-
-    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
-    if (!clipboard) {
-        set_error("Failed to get PRIMARY selection");
-    }
-    return clipboard;
 }

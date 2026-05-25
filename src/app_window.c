@@ -80,6 +80,9 @@
 #define COLOR_CHECKING_R 1.0
 #define COLOR_CHECKING_G 1.0
 #define COLOR_CHECKING_B 0.0
+#define COLOR_LOADING_R 1.0
+#define COLOR_LOADING_G 0.65
+#define COLOR_LOADING_B 0.0
 
 /* Default window position */
 #define DEFAULT_WINDOW_X 100
@@ -215,6 +218,7 @@ static void get_asset_dir(MainWindow *win) {
  * Returns a new GdkPixbuf on success, NULL on failure.
  */
 static GdkPixbuf *load_xpm(MainWindow *win, const char *filename) {
+    (void)win;
 #ifdef XPM_STATICALLY_EMBEDDED
     /* Use embedded XPM arrays */
     if (strcmp(filename, "gear.xpm") == 0) {
@@ -448,6 +452,11 @@ static void on_indicator_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
 
     double r, g, b;
     switch (status) {
+        case CONNECTION_LOADING:
+            r = COLOR_LOADING_R;
+            g = COLOR_LOADING_G;
+            b = COLOR_LOADING_B;
+            break;
         case CONNECTION_CHECKING:
             r = COLOR_CHECKING_R;
             g = COLOR_CHECKING_G;
@@ -498,42 +507,12 @@ static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, g
  * Opens the configuration dialog.
  */
 static void on_gear_button_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
     MainWindow *win = (MainWindow *)user_data;
     bool saved = config_dialog_show(win->window, win->config, win->whisper_client);
     if (saved && win->on_config_changed) {
         win->on_config_changed(win->config_changed_user_data);
     }
-}
-
-/**
- * Idle callback to update UI after manual connection check completes.
- */
-static gboolean on_manual_connection_check_complete(gpointer user_data) {
-    ConnectionStatus status = (ConnectionStatus)GPOINTER_TO_INT(user_data);
-    /* The main application will handle the UI update via the controller callback */
-    (void)status;
-    return FALSE; /* One-shot */
-}
-
-/**
- * Background thread function for manual connection check.
- */
-static gpointer manual_connection_check_thread_func(gpointer data) {
-    MainWindow *win = (MainWindow *)data;
-
-    if (win->whisper_client) {
-        bool connected = whisper_check_connection(win->whisper_client);
-        ConnectionStatus status = connected ? CONNECTION_CONNECTED : CONNECTION_DISCONNECTED;
-
-        /* Update the controller state */
-        app_set_connection_status(win->controller, status);
-
-        /* Marshal UI update to the GTK main thread */
-        g_idle_add(on_manual_connection_check_complete,
-                   GINT_TO_POINTER((int)status));
-    }
-
-    return NULL;
 }
 
 /**
@@ -572,10 +551,11 @@ static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *eve
  * main() handles cleanup after gtk_main() returns.
  */
 static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
+    (void)widget;
+    (void)event;
     MainWindow *win = (MainWindow *)user_data;
     app_window_save_position(win);
     gtk_main_quit();
-    (void)event;
     return TRUE; /* Prevent GTK from destroying the window */
 }
 
@@ -584,6 +564,7 @@ static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpoin
  * Hides the window instead of destroying it.
  */
 static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
+    fprintf(stderr, "[text-window] delete_event: hiding window\n");
     gtk_widget_hide(widget);
     (void)user_data;
     (void)event;
@@ -711,8 +692,6 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     GdkPixbuf *gear_pixbuf = load_xpm(win, "gear.xpm");
     if (gear_pixbuf) {
         /* Scale the gear icon to 16x16 per GNOME HIG for status bar icons */
-        int src_width = gdk_pixbuf_get_width(gear_pixbuf);
-        int src_height = gdk_pixbuf_get_height(gear_pixbuf);
         int dest_size = 16;
         GdkPixbuf *scaled = gdk_pixbuf_scale_simple(gear_pixbuf, dest_size, dest_size, GDK_INTERP_BILINEAR);
         GtkImage *gear_image = GTK_IMAGE(gtk_image_new_from_pixbuf(scaled));
@@ -954,6 +933,7 @@ void app_window_save_position(MainWindow *win) {
     int x, y;
     gtk_window_get_position(win->window, &x, &y);
     config_set_window_position(win->config, x, y);
+    config_save(win->config);  /* Persist to disk */
 }
 
 void app_window_set_toggle_callback(MainWindow *win,
@@ -993,8 +973,9 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
     gtk_window_set_title(tw->window, "Transcription");
     gtk_window_set_resizable(tw->window, TRUE);
     gtk_window_set_type_hint(tw->window, GDK_WINDOW_TYPE_HINT_UTILITY);
-    gtk_window_set_transient_for(tw->window, main_window_gtk);
-    gtk_window_set_destroy_with_parent(tw->window, TRUE);
+    /* Note: Not setting transient_for or destroy_with_parent because the main
+     * window is hidden (tray app). Setting these causes the window manager to
+     * send a delete-event to the TextWindow immediately after showing it. */
 
     /* Position below MainWindow, with screen boundary check */
     if (main_window_gtk && gtk_widget_get_visible(GTK_WIDGET(main_window_gtk))) {
@@ -1074,6 +1055,8 @@ void app_text_window_destroy(TextWindow *tw) {
 void app_text_window_append_text(TextWindow *tw, const char *text) {
     if (!tw || !text) return;
 
+    fprintf(stderr, "[text-window] append_text: showing window with %zu chars\n", strlen(text));
+
     /* Append text to the buffer */
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
@@ -1084,6 +1067,8 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
     gtk_widget_show_all(GTK_WIDGET(tw->window));
     gtk_window_present(tw->window);
 
+    fprintf(stderr, "[text-window] append_text: window shown and presented\n");
+
     /* Scroll to the end */
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
     gtk_text_view_scroll_to_iter(tw->text_view, &end, 0, FALSE, 0, 0);
@@ -1091,6 +1076,8 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
 
 void app_text_window_set_error(TextWindow *tw, const char *error) {
     if (!tw || !error) return;
+
+    fprintf(stderr, "[text-window] set_error: showing window with error: %s\n", error);
 
     /* Prefix with "ERROR: " */
     GtkTextIter end;
@@ -1102,23 +1089,11 @@ void app_text_window_set_error(TextWindow *tw, const char *error) {
     /* Show and raise the window */
     gtk_widget_show_all(GTK_WIDGET(tw->window));
     gtk_window_present(tw->window);
+
+    fprintf(stderr, "[text-window] set_error: window shown and presented\n");
 }
 
-char *app_text_window_get_text(TextWindow *tw) {
-    if (!tw) return NULL;
-
-    GtkTextIter start, end;
-    gtk_text_buffer_get_start_iter(tw->buffer, &start);
-    gtk_text_buffer_get_end_iter(tw->buffer, &end);
-
-    char *text = gtk_text_buffer_get_text(tw->buffer, &start, &end, FALSE);
-    return text;
-}
-
-bool app_text_window_is_visible(TextWindow *tw) {
-    if (!tw || !tw->window) return FALSE;
-    return gtk_widget_get_visible(GTK_WIDGET(tw->window));
-}
+/* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
 
 void app_window_set_volume_level(MainWindow *win, double level) {
     if (!win || !win->volume_level_bar) return;

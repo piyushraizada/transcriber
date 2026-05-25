@@ -1,7 +1,0 @@
-/home/pr/test/build/CMakeFiles/transcriber.dir
-/home/pr/test/build/CMakeFiles/edit_cache.dir
-/home/pr/test/build/CMakeFiles/rebuild_cache.dir
-/home/pr/test/build/CMakeFiles/list_install_components.dir
-/home/pr/test/build/CMakeFiles/install.dir
-/home/pr/test/build/CMakeFiles/install/local.dir
-/home/pr/test/build/CMakeFiles/install/strip.dir

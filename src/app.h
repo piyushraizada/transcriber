@@ -16,9 +16,9 @@
  * ===============
  * The application runs three concurrent threads:
  *
- *   • Presentation Thread (Main) — GTK main loop, UI rendering, D-Bus polling.
- *   • Audio Thread               — Real-time PCM capture written to a WAV file.
- *   • Network Thread             — Blocking libcurl HTTP POST to Whisper API.
+ *   • Presentation Thread  — GTK main loop, UI rendering, D-Bus polling.
+ *   • Audio Thread         — Real-time PCM capture written to a WAV file.
+ *   • Transcription Thread — Local whisper.cpp model processing (offline, no network).
  *
  * All state transitions flow through the AppStateController, which uses a
  * mutex-protected state variable and an atomic sequence counter to prevent
@@ -28,13 +28,13 @@
  * =============
  *   STATE_IDLE ──► STATE_LISTENING ──► STATE_TRANSCRIBING ──► STATE_IDLE
  *
- *   • IDLE:           Mic icon is red. Audio thread suspended. Network idle.
+ *   • IDLE:           Mic icon is red. Audio thread suspended. Transcription idle.
  *   • LISTENING:      Mic icon is green with sine wave animation. Audio thread
  *                     actively capturing PCM into a temporary WAV file. A 30-second
  *                     (configurable) watchdog timer auto-transitions to TRANSCRIBING.
- *   • TRANSCRIBING:   Sine wave stops. Audio file closed. Network thread uploads
- *                     WAV to Whisper API. On completion, text is displayed, clipboard
- *                     is populated, temp file is deleted, and state returns to IDLE.
+ *   • TRANSCRIBING:   Sine wave stops. Audio file closed. Transcription thread
+ *                     runs local whisper.cpp model. On completion, text is displayed,
+ *                     clipboard is populated, temp file is deleted, and state returns to IDLE.
  *
  * SRS Traceability
  * =================
@@ -46,6 +46,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include "app_config.h"  /* For AppConfig definition */
 
 /******************************************************************************
@@ -77,28 +78,30 @@ typedef struct _GtkTextView GtkTextView;
 typedef enum {
     STATE_IDLE,           /* Microphone idle — red icon, no recording */
     STATE_LISTENING,      /* Actively capturing audio — green icon + sine wave */
-    STATE_TRANSCRIBING    /* Uploading to Whisper API — green icon, no animation */
+    STATE_TRANSCRIBING    /* Running local whisper.cpp model — green icon, no animation */
 } AppState;
 
 /******************************************************************************
- * ConnectionStatus — vLLM Server Connectivity Indicator
+ * ConnectionStatus — Local Whisper Model Availability Indicator
  *
- * Tracks the connectivity status of the Whisper API backend. Displayed as
+ * Tracks the availability of the local Whisper model. Displayed as
  * an 8x8 pixel circle in the MainWindow status bar (right side).
  *
- *   • CONNECTED (green)    — GET /v1/models returned HTTP 200
- *   • DISCONNECTED (red)   — Connection failed or not yet attempted
- *   • CHECKING (yellow)    — Connection check in progress (blinking)
+ *   • CONNECTED (green)    — Model file verified and accessible
+ *   • DISCONNECTED (red)   — Model file not found or not yet checked
+ *   • CHECKING (yellow)    — Model check in progress (blinking)
+ *   • LOADING (amber)      — Model is being loaded into GPU/CPU memory
  *
  * The indicator is clickable: clicking while DISCONNECTED triggers a manual
- * connectivity ping (WHISPER-013). Clicking while CONNECTED is ignored.
+ * model verification check (WHISPER-013). Clicking while CONNECTED is ignored.
  *
  * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037
  *****************************************************************************/
 typedef enum {
     CONNECTION_DISCONNECTED,  /* Red — no connection or check failed */
     CONNECTION_CONNECTED,     /* Green — successful connection verified */
-    CONNECTION_CHECKING       /* Yellow/blinking — check in progress */
+    CONNECTION_CHECKING,      /* Yellow/blinking — check in progress */
+    CONNECTION_LOADING        /* Amber/orange — model being loaded */
 } ConnectionStatus;
 
 /******************************************************************************
@@ -110,8 +113,8 @@ typedef enum {
  * modules after initialization.
  *
  * Fields:
- *   whisper_url    — Full URL of the Whisper API endpoint.
- *                     Default: "http://localhost:8080/v1/audio/transcriptions"
+ *   model_path     — Path to the local whisper.cpp model file (.bin).
+ *                     Default: "models/ggml-base.bin"
  *                     SRS: CFG-005, WHISPER-001
  *
  *   audio_device   — Named audio capture device or "system_default".
@@ -148,7 +151,7 @@ typedef enum {
 /******************************************************************************
  * Callback Typedefs — Cross-Thread Communication
  *
- * Because the application runs multiple threads (Presentation, Audio, Network),
+ * Because the application runs multiple threads (Presentation, Audio, Transcription),
  * direct function calls between threads are unsafe. Instead, we use callback
  * function pointers that are invoked in the correct thread context.
  *
@@ -158,8 +161,8 @@ typedef enum {
  * SRS: Section 2.1 (Threading Model)
  *****************************************************************************/
 
-/* transcription_result_callback — Invoked by the Network Thread when the
- * Whisper API returns a response (success or failure).
+/* transcription_result_callback — Invoked by the Transcription Thread when
+ * the local whisper.cpp model completes transcription (success or failure).
  *
  * Parameters:
  *   text       — NULL-terminated UTF-8 transcribed text on success,
@@ -175,8 +178,8 @@ typedef void (*transcription_result_callback)(const char *text,
                                               bool success,
                                               void *user_data);
 
-/* connection_status_callback — Invoked when the connectivity check to the
- * Whisper API completes (either automatic on startup or manual via clicking
+/* connection_status_callback — Invoked when the model availability check
+ * completes (either automatic on startup or manual via clicking
  * the status indicator).
  *
  * Parameters:
@@ -237,7 +240,7 @@ typedef struct {
     /* Current application state, protected by state_mutex. */
     AppState state;
 
-    /* Current connection status to Whisper API, protected by state_mutex. */
+    /* Current model availability status, protected by state_mutex. */
     ConnectionStatus connection_status;
 
     /* Mutex for all state transitions. Every read or write of state or
@@ -249,18 +252,18 @@ typedef struct {
      * a sequence number, performs work, and then attempts to transition
      * but finds the sequence has advanced, it knows another thread won
      * the race and aborts. */
-    volatile int64_t sequence_counter;
+    _Atomic int64_t sequence_counter;
 
     /* Pointer to the shared, read-only configuration.
      * All modules read from this; only app_config.c writes to it. */
     AppConfig *config;
 
     /* Callback invoked when transcription completes (success or failure).
-     * Called from the Network Thread but marshaled to the Presentation Thread. */
+     * Called from the Transcription Thread but marshaled to the Presentation Thread. */
     transcription_result_callback on_transcription_result;
 
     /* Callback invoked when connection status changes.
-     * Called from the Network Thread but marshaled to the Presentation Thread. */
+     * Called from the Transcription Thread but marshaled to the Presentation Thread. */
     connection_status_callback on_connection_status;
 
     /* Callback invoked when audio recording stops.
