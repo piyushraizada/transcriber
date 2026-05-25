@@ -48,6 +48,23 @@ set(WHISPER_SILERO_VAD OFF CACHE BOOL "Disable Silero VAD" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Static libs only" FORCE)
 FetchContent_MakeAvailable(whisper)
 
+# Download default GGML whisper model (large-v3-turbo-q8_0) to ~/.cache/whisper/
+# The application expects the default model at ~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin
+# (see DEFAULT_MODEL_DIR and DEFAULT_MODEL_FILE in src/app_config_dialog.c).
+# The download script from whisper.cpp handles caching — it skips if the file exists.
+option(DOWNLOAD_DEFAULT_MODEL "Download the default Whisper model (large-v3-turbo-q8_0, 1.1 GiB)" ON)
+if(DOWNLOAD_DEFAULT_MODEL AND whisper_SOURCE_DIR)
+    set(DEFAULT_MODEL_DIR "$ENV{HOME}/.cache/whisper")
+    file(MAKE_DIRECTORY "${DEFAULT_MODEL_DIR}")
+    add_custom_target(download-default-model ALL
+        COMMAND "${whisper_SOURCE_DIR}/models/download-ggml-model.sh"
+            "large-v3-turbo-q8_0"
+            "${DEFAULT_MODEL_DIR}"
+        COMMENT "Downloading default Whisper model (large-v3-turbo-q8_0, 1.1 GiB) to ${DEFAULT_MODEL_DIR}..."
+        USES_TERMINAL
+    )
+endif()
+
 # System Tray Icon (libappindicator for StatusNotifierItem support)
 # Try Ayatana fork first (modern, actively maintained), then fall back to original
 # Note: pkg-config name is "ayatana-appindicator3-0.1" not "libayatana-appindicator3-1"
