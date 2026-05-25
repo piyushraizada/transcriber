@@ -1,4 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
+ *
+ * This file is part of the Transcriber project.
+ * See the LICENSE file for full license text.
+ */
+
+/*
  * main.c — Application Entry Point, State Controller, Recording Lifecycle,
  *          Runtime Config Updates, Recording Completion Beep
  *

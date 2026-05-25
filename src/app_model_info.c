@@ -1,4 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
+ *
+ * This file is part of the Transcriber project.
+ * See the LICENSE file for full license text.
+ */
+
+/*
  * app_model_info.c - GGUF Whisper model metadata extraction
  *
  * Parses the GGUF file header directly to extract metadata (model name,

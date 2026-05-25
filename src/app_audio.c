@@ -1,4 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
+ *
+ * This file is part of the Transcriber project.
+ * See the LICENSE file for full license text.
+ */
+
+/*
  * app_audio.c — Audio capture implementation using ALSA
  *
  * Records 16kHz mono 16-bit PCM to a temporary WAV file.

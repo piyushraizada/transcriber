@@ -1,4 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
+ *
+ * This file is part of the Transcriber project.
+ * See the LICENSE file for full license text.
+ */
+
+/*
  * app_whisper.c — Local Whisper transcription via whisper.cpp
  *
  * Uses the whisper.cpp library (ggml-org/whisper.cpp) for offline,
