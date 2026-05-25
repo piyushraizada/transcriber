@@ -50,6 +50,13 @@
 #include "app_config.h"  /* For AppConfig definition */
 
 /******************************************************************************
+ * Centralized Error Messages
+ *
+ * L-002 fix: Shared error strings to avoid duplication across modules.
+ *****************************************************************************/
+#define APP_ERROR_NO_VALID_MODEL  "No valid whisper ggml file found"
+
+/******************************************************************************
  * Forward Declarations
  *
  * These GTK types are used throughout the project but we avoid including
@@ -113,17 +120,13 @@ typedef enum {
  * modules after initialization.
  *
  * Fields:
- *   model_path     — Path to the local whisper.cpp model file (.bin).
- *                     Default: "models/ggml-base.bin"
+ *   model_path     — Path to the local whisper.cpp model file (.bin/.gguf).
+ *                     Default: "ggml-large-v3-turbo-q8_0.bin"
  *                     SRS: CFG-005, WHISPER-001
  *
- *   audio_device   — Named audio capture device or "system_default".
- *                     Default: "system_default"
+ *   audio_device   — Named audio capture device or "default".
+ *                     Default: "default"
  *                     SRS: CFG-006, CFG-010, AUD-002
- *
- *   language       — ISO 639-1 language code for transcription target.
- *                     Default: "en"
- *                     SRS: CFG-007, WHISPER-005
  *
  *   max_duration   — Maximum recording duration in seconds (5–30).
  *                     Default: 30
@@ -132,10 +135,6 @@ typedef enum {
  *   window_x, window_y — Persisted MainWindow position.
  *                     Default: (100, 100)
  *                     SRS: CFG-004, FR-002
- *
- *   enable_notifications — Enable desktop notifications for errors.
- *                     Default: true
- *                     SRS: CFG-009, ERR-006
  *
  * Immutability:
  *   After app_config_load() populates this struct, it is treated as
@@ -204,7 +203,25 @@ typedef void (*connection_status_callback)(ConnectionStatus status,
  *
  * SRS: FR-006, FR-034, AUD-011 */
 typedef void (*recording_stop_callback)(const char *wav_path,
-                                        void *user_data);
+                                         void *user_data);
+
+/* state_change_callback — Invoked directly by the state controller when
+ * a state transition completes (inside app_transition_to / app_toggle_state).
+ *
+ * Replaces the polling-based state_monitor_callback pattern with direct
+ * callback invocation on transition, eliminating latency and CPU overhead.
+ *
+ * Parameters:
+ *   new_state  — The AppState value after the transition.
+ *   user_data  — Opaque pointer passed through from controller init.
+ *
+ * IMPORTANT: This callback is invoked from whichever thread called
+ * app_transition_to() or app_toggle_state(). For GTK-main-thread safety,
+ * callers on non-GTK threads should marshal via g_idle_add().
+ *
+ * SRS: Section 2.1 (Threading Model), Section 2.3 (State Machine) */
+typedef void (*state_change_callback)(AppState new_state,
+                                       void *user_data);
 
 /******************************************************************************
  * AppStateController — Thread-Safe State Machine
@@ -270,6 +287,11 @@ typedef struct {
      * Called from the Audio Thread but marshaled to the Presentation Thread. */
     recording_stop_callback on_recording_stop;
 
+    /* Callback invoked directly on state transition.
+     * Replaces the polling-based state_monitor_callback pattern.
+     * Called from whichever thread invoked app_transition_to/app_toggle_state. */
+    state_change_callback on_state_change;
+
     /* Opaque user data passed to all callbacks.
      * Typically set to the MainWindow GtkWindow pointer. */
     void *callback_user_data;
@@ -289,19 +311,21 @@ typedef struct {
  *   controller — Pointer to an uninitialized AppStateController struct.
  *   config     — Pointer to the shared AppConfig (read-only after init).
  *   on_transcription_result — Callback for transcription results.
- *   on_connection_status    — Callback for connection status changes.
- *   on_recording_stop       — Callback for recording stop events.
- *   user_data               — Opaque pointer passed to all callbacks.
- *
- * Returns: 0 on success, -1 if mutex initialization fails.
- *
- * SRS: Section 2.1, Section 2.3 */
-int app_state_controller_init(AppStateController *controller,
-                              AppConfig *config,
-                              transcription_result_callback on_transcription_result,
-                              connection_status_callback on_connection_status,
-                              recording_stop_callback on_recording_stop,
-                              void *user_data);
+  *   on_connection_status    — Callback for connection status changes.
+  *   on_recording_stop       — Callback for recording stop events.
+  *   on_state_change         — Callback invoked on each state transition.
+  *   user_data               — Opaque pointer passed to all callbacks.
+  *
+  * Returns: 0 on success, -1 if mutex initialization fails.
+  *
+  * SRS: Section 2.1, Section 2.3 */
+ int app_state_controller_init(AppStateController *controller,
+                            AppConfig *config,
+                            transcription_result_callback on_transcription_result,
+                            connection_status_callback on_connection_status,
+                            recording_stop_callback on_recording_stop,
+                            state_change_callback on_state_change,
+                            void *user_data);
 
 /* app_state_controller_cleanup — Destroy the state controller's mutex.
  *
@@ -369,8 +393,7 @@ bool app_transition_to(AppStateController *controller, AppState target);
 void app_set_connection_status(AppStateController *controller,
                                ConnectionStatus status);
 
-/* app_toggle_state — Convenience function to toggle between IDLE and
- * LISTENING, or from LISTENING/TRANSCRIBING back to IDLE.
+/* app_toggle_state — Convenience function to advance the state machine.
  *
  * This is the primary entry point for the microphone click handler and
  * the D-Bus Toggle method. Behavior:

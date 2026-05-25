@@ -88,9 +88,9 @@ void audio_recorder_destroy(AudioRecorder *recorder);
  *
  * @param recorder AudioRecorder handle
  * @param device Device name (e.g., "default", "hw:0,0")
- * @return TRUE on success, FALSE on failure
+ * @return true on success, false on failure
  */
-gboolean audio_recorder_set_device(AudioRecorder *recorder, const char *device);
+bool audio_recorder_set_device(AudioRecorder *recorder, const char *device);
 
 /**
  * Get the current audio device name.
@@ -121,7 +121,7 @@ AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder);
  * @param max_duration  Maximum recording duration in seconds (0 = unlimited)
  * @return true if recording started successfully, false on failure.
  */
-gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration);
+bool audio_recorder_start(AudioRecorder *recorder, int max_duration);
 
 /**
  * Stop the current audio recording and finalize the WAV file.
@@ -129,19 +129,7 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration);
  * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
  * @return true if recording stopped successfully, false if not recording.
  */
-gboolean audio_recorder_stop(AudioRecorder *recorder);
-
-/**
- * Check if the recorder is currently active (recording).
- *
- * @deprecated Unused public function — no external callers.
- *             The `is_recording` field is accessed directly inside the module.
- *             Keep for potential debugging/monitoring.
- *
- * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
- * @return true if recording is active, false otherwise.
- */
-gboolean audio_recorder_is_recording(const AudioRecorder *recorder);
+bool audio_recorder_stop(AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
  * Section 7: WAV File Management
@@ -157,17 +145,6 @@ gboolean audio_recorder_is_recording(const AudioRecorder *recorder);
  *         string if no recording is active.
  */
 const char *audio_recorder_get_wav_path(const AudioRecorder *recorder);
-
-/**
- * Get the size of recorded PCM data in bytes.
- *
- * @deprecated Unused public function — no external callers.
- *             Could be useful for debugging/monitoring but currently unused.
- *
- * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
- * @return The PCM data size in bytes, or 0 if no recording is active.
- */
-gsize audio_recorder_get_bytes_recorded(const AudioRecorder *recorder);
 
 /**
  * Get the current RMS volume level (0.0 to 1.0).
@@ -254,21 +231,9 @@ AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder);
 void audio_device_list_free(AudioDeviceList *list);
 
 /**
- * Clear the current recording state and clean up WAV file.
- *
- * @deprecated Unused public function — no external callers.
- *             Comment says "caller manages lifecycle" but no caller invokes this.
- *
- * @param recorder AudioRecorder handle
- * @return TRUE on success, FALSE on failure
- */
-gboolean audio_recorder_clear(AudioRecorder *recorder);
-
-/**
  * Delete the WAV file from disk. Call this AFTER transcription is done.
- * audio_recorder_clear() no longer deletes the file — it only closes handles.
  */
-gboolean audio_recorder_delete_wav(AudioRecorder *recorder);
+bool audio_recorder_delete_wav(AudioRecorder *recorder);
 
 #ifdef __cplusplus
 }

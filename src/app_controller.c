@@ -28,6 +28,7 @@ int app_state_controller_init(AppStateController *controller,
                               transcription_result_callback on_transcription_result,
                               connection_status_callback on_connection_status,
                               recording_stop_callback on_recording_stop,
+                              state_change_callback on_state_change,
                               void *user_data) {
     if (!controller || !config) {
         return -1;
@@ -47,6 +48,7 @@ int app_state_controller_init(AppStateController *controller,
     controller->on_transcription_result = on_transcription_result;
     controller->on_connection_status = on_connection_status;
     controller->on_recording_stop = on_recording_stop;
+    controller->on_state_change = on_state_change;
     controller->callback_user_data = user_data;
 
     return 0;
@@ -107,6 +109,13 @@ bool app_transition_to(AppStateController *controller, AppState target) {
 
     pthread_mutex_unlock(&controller->state_mutex);
 
+    /* Invoke state change callback directly on successful transition.
+     * Callback is invoked outside the mutex to prevent deadlocks.
+     * Note: Called from whichever thread invoked this function. */
+    if (allowed && controller->on_state_change) {
+        controller->on_state_change(target, controller->callback_user_data);
+    }
+
     return allowed;
 }
 
@@ -151,6 +160,13 @@ bool app_toggle_state(AppStateController *controller) {
     }
 
     pthread_mutex_unlock(&controller->state_mutex);
+
+    /* Invoke state change callback directly on successful transition.
+     * Callback is invoked outside the mutex to prevent deadlocks.
+     * Note: Called from whichever thread invoked this function. */
+    if (should_transition && controller->on_state_change) {
+        controller->on_state_change(target, controller->callback_user_data);
+    }
 
     return should_transition;
 }

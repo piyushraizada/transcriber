@@ -16,7 +16,7 @@
  *   - Interface: org.xvoice.Actions
  *   - Method: Toggle (no parameters, no return value)
  *
- * When the ToggleMicrophone method is called, the application performs
+ * When the Toggle method is called, the application performs
  * the same action as clicking the microphone icon:
  *   - If IDLE: Start recording (transition to LISTENING state)
  *   - If LISTENING: Stop recording and start transcription (transition to TRANSCRIBING)
@@ -26,7 +26,7 @@
  *   1. On startup: Request the bus name "org.xvoice.Controller" on the
  *      session bus. If another instance already owns the name, the new
  *      instance exits (single-instance enforcement).
- *   2. Register the ToggleMicrophone method handler.
+ *   2. Register the Toggle method handler.
  *   3. Monitor the D-Bus connection for incoming method calls.
  *   4. On method call: Invoke the toggle callback in the GTK main thread.
  *   5. On shutdown: Release the bus name and close the connection.
@@ -95,16 +95,16 @@ typedef struct _DBusService DBusService;
 /*---------------------------------------------------------------------------
  * Section 3: Toggle Callback Typedef
  *---------------------------------------------------------------------------
- * Callback function type invoked when the ToggleMicrophone D-Bus method
+ * Callback function type invoked when the Toggle D-Bus method
  * is called by an external client.
  */
 
 /**
- * Callback function invoked when the ToggleMicrophone D-Bus method is called.
+ * Callback function invoked when the Toggle D-Bus method is called.
  *
  * This callback is invoked in the GTK main thread when an external client
  * (e.g., dbus-send command triggered by a desktop environment hotkey) calls
- * the ToggleMicrophone method. The callback should perform the same action
+ * the Toggle method. The callback should perform the same action
  * as clicking the microphone icon in the UI.
  *
  * @param user_data User-provided data pointer (set during dbus_service_start()).
@@ -155,13 +155,13 @@ void dbus_service_destroy(DBusService* service);
  *           (enforces single-instance behavior)
  *   3. If name acquisition fails (another instance owns it):
  *      Log a warning and return false (the application should exit)
- *   4. Register the ToggleMicrophone method handler
+ *   4. Register the Toggle method handler
  *   5. Create a GSource for the D-Bus file descriptor and attach it
  *      to the GTK main context
  *   6. Set the toggle callback function
  *
  * @param service    Pointer to a valid DBusService. Must not be NULL.
- * @param callback   The callback function to invoke on ToggleMicrophone calls.
+ * @param callback   The callback function to invoke on Toggle calls.
  * @param user_data  User data pointer passed to the callback.
  *
  * @return true if the service started successfully (bus name acquired),
@@ -204,34 +204,6 @@ bool dbus_service_stop(DBusService* service);
  * Functions for checking the D-Bus service status and retrieving
  * diagnostic information.
  */
-
-/**
- * Check if the D-Bus service is currently active.
- *
- * @deprecated Unused public function — no external callers.
- *             Diagnostic function with no call sites.
- *
- * @param service Pointer to a valid DBusService. Must not be NULL.
- * @return true if the service is active (bus name acquired and listening),
- *         false otherwise.
- */
-bool dbus_service_is_active(const DBusService* service);
-
-/**
- * Check if the D-Bus session bus is available.
- *
- * @deprecated Unused public function — no external callers.
- *             Could be used for pre-flight checks but has no call sites.
- *
- * This function attempts to connect to the D-Bus session bus to verify
- * that it is available. This is a lightweight check that does NOT request
- * a bus name or register any handlers.
- *
- * @return true if the session bus is available, false if unavailable.
- *
- * @see HK-005: D-Bus Session Bus Unavailable
- */
-bool dbus_session_bus_available(void);
 
 /**
  * Get the last error message from the D-Bus service.

@@ -5,10 +5,12 @@
  */
 
 #include "app_config_dialog.h"
+#include "app.h"
 #include "app_config.h"
 #include "app_audio.h"
 #include "app_whisper.h"
 #include "app_model_info.h"
+#include "app_gpu.h"
 
 #include <gtk/gtk.h>
 #include <stdio.h>
@@ -20,10 +22,6 @@
 #define DEFAULT_MODEL_DIR  "~/.cache/whisper"
 #define DEFAULT_MODEL_FILE "ggml-large-v3-turbo-q8_0.bin"
 
-/* Forward declaration for WhisperClient */
-struct _WhisperClient;
-typedef struct _WhisperClient WhisperClient;
-
 /* ===================================================================
  * Internal dialog state
  * =================================================================== */
@@ -31,21 +29,17 @@ typedef struct _WhisperClient WhisperClient;
 struct _ConfigDialog {
     GtkDialog *dialog;
     AppConfig *config;
-    WhisperClient *whisper_client;
-
     /* Widgets */
     GtkEntry *model_path_entry;
     GtkButton *model_browse_button;
     GtkLabel *model_info_label;
     GtkComboBox *device_combo;
+    GtkComboBox *gpu_mode_combo;
     /* MIN-002 fix: Removed language_combo - multilingual models only */
     GtkSpinButton *duration_spin;
-    GtkCheckButton *notifications_check;
     GtkLabel *model_path_error;
     GtkLabel *duration_error;
     GtkLabel *hotkey_label;
-    GtkLabel *test_status_label;
-
     /* Async model info loading */
     guint model_info_idle_id;  /* Track idle source so we can cancel on dialog close */
 };
@@ -175,6 +169,20 @@ GtkListStore * config_dialog_get_audio_devices(AudioBackend backend) {
     /* Two-column store: col 0 = display name, col 1 = device name */
     GtkListStore *store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
 
+    /* Always add "Default (system microphone)" as the first option.
+     * This maps to ALSA's virtual "default" device, which resolves through
+     * the ALSA plugin chain (plug → dsnoop → actual hw:* device).
+     * It is the config default value and is always valid at runtime
+     * (validated at main.c toggle handler and used as fallback in capture thread). */
+    {
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+            0, "Default (system microphone)",
+            1, "default",
+            -1);
+    }
+
     /* Use the audio module's device enumeration instead of duplicating ALSA logic.
      * audio_recorder_get_device_list() handles all ALSA hint enumeration, capture
      * device filtering, and open-testing internally.
@@ -244,20 +252,20 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     const char *model_path = gtk_entry_get_text(dlg->model_path_entry);
     
     if (!config_dialog_validate_model_path(model_path)) {
-        config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+        config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
         valid = FALSE;
     } else {
         /* Check file exists */
         struct stat st;
         if (stat(model_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-            config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+            config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
             valid = FALSE;
         } else {
             /* Validate GGUF/GGML format by attempting to load metadata */
             ModelInfo info;
             model_info_init(&info);
             if (!model_info_load(model_path, &info) || !info.valid) {
-                config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+                config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
                 valid = FALSE;
             } else {
                 config_dialog_clear_error(dlg->model_path_error);
@@ -305,9 +313,19 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     /* Set duration */
     config_set_max_duration(dlg->config, duration);
 
-    /* Set notifications */
-    gboolean notifications = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->notifications_check));
-    config_set_notifications(dlg->config, notifications);
+    /* Set GPU mode — column 0 = display name, column 1 = mode value */
+    if (dlg->gpu_mode_combo) {
+        GtkTreeIter gpu_iter;
+        GtkTreeModel *gpu_model = GTK_TREE_MODEL(gtk_combo_box_get_model(dlg->gpu_mode_combo));
+        if (gtk_combo_box_get_active_iter(dlg->gpu_mode_combo, &gpu_iter)) {
+            gchar *mode_val = NULL;
+            gtk_tree_model_get(gpu_model, &gpu_iter, 1, &mode_val, -1);
+            if (mode_val) {
+                config_set_gpu_mode(dlg->config, mode_val);
+                g_free(mode_val);
+            }
+        }
+    }
 
     /* Save config to file */
     config_save(dlg->config);
@@ -418,7 +436,7 @@ static void on_model_path_changed(GtkEntry *entry, ConfigDialog *dlg) {
     } else {
         gtk_label_set_markup(dlg->model_info_label, "");
         gtk_widget_set_visible(GTK_WIDGET(dlg->model_info_label), FALSE);
-        config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+        config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
     }
 }
 
@@ -468,7 +486,7 @@ static void on_browse_model_clicked(GtkButton *button, ConfigDialog *dlg) {
                 update_model_info_label(dlg, filename);
             } else {
                 /* Invalid model — show error, do NOT set the entry */
-                config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+                config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
                 g_free(filename);
                 filename = NULL;
             }
@@ -485,65 +503,6 @@ static void on_duration_changed(GtkSpinButton *spin, ConfigDialog *dlg) {
 /* MAJ-001 fix: Async model metadata loading to avoid blocking GTK main loop.
  * Previously, model_info_load() blocked the GTK thread for 5-15 seconds
  * on large models. Now uses g_idle_add() callback pattern. */
-typedef struct {
-    ConfigDialog *dlg;
-    char *model_path;
-    WhisperClient *whisper_client;
-} TestModelData;
-
-static gboolean test_model_callback(gpointer user_data) {
-    TestModelData *data = (TestModelData *)user_data;
-    ConfigDialog *dlg = data->dlg;
-    char *model_path = data->model_path;
-    WhisperClient *whisper_client = data->whisper_client;
-
-    /* Load model metadata */
-    ModelInfo info;
-    model_info_init(&info);
-    if (model_info_load(model_path, &info) && info.valid) {
-        char status[512];
-        snprintf(status, sizeof(status),
-            "OK: %s (%s) — %s",
-            info.model_name, info.quantization,
-            info.multilingual ? "Multilingual" : "EN-only");
-        gtk_label_set_text(dlg->test_status_label, status);
-    } else {
-        /* Fallback: just check if file exists */
-        bool available = whisper_check_connection(whisper_client);
-        if (available) {
-            gtk_label_set_text(dlg->test_status_label, "Model file found but metadata unreadable");
-        } else {
-            gtk_label_set_text(dlg->test_status_label, "Model file not found");
-        }
-    }
-
-    g_free(model_path);
-    g_free(data);
-    return FALSE;  /* One-shot */
-}
-
-static void on_test_model_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
-
-    if (!dlg->whisper_client || !dlg->test_status_label) return;
-
-    const char *model_path = gtk_entry_get_text(dlg->model_path_entry);
-    if (!model_path || model_path[0] == '\0') {
-        gtk_label_set_text(dlg->test_status_label, "Enter a model path first");
-        return;
-    }
-
-    whisper_client_set_model_path(dlg->whisper_client, model_path);
-    gtk_label_set_text(dlg->test_status_label, "Loading model...");
-
-    /* MAJ-001 fix: Schedule async metadata loading instead of blocking */
-    TestModelData *data = g_new0(TestModelData, 1);
-    data->dlg = dlg;
-    data->model_path = g_strdup(model_path);
-    data->whisper_client = dlg->whisper_client;
-    g_idle_add(test_model_callback, data);
-}
-
 /* HI-01/HI-04 fix: Proper callback struct for timeout to reset button label.
  * Avoids type mismatch with GSourceFunc and memory leak from g_strdup. */
 typedef struct {
@@ -585,16 +544,13 @@ static void on_copy_hotkey_clicked(GtkButton *button, ConfigDialog *dlg) {
  * @param config AppConfig struct to edit
  * @return true if user clicked Save, false if Cancel
  */
-bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config,
-                           WhisperClient *whisper_client) {
+bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     if (!parent_window || !config) return false;
 
 
     /* MIN-004 fix: Allocate ConfigDialog on heap to avoid stack overflow */
     ConfigDialog *dlg = g_new0(ConfigDialog, 1);
     dlg->config = config;
-    dlg->whisper_client = whisper_client;
-
     dlg->dialog = GTK_DIALOG(gtk_dialog_new_with_buttons(
         "Transcriber Settings",
         parent_window,
@@ -731,7 +687,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config,
         if (current_path && current_path[0] != '\0') {
             gtk_entry_set_text(dlg->model_path_entry, current_path);
         }
-        config_dialog_show_error(dlg->model_path_error, "No valid whisper ggml file found");
+        config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
     }
 
     /* Connect 'changed' signal AFTER setting initial text to avoid spurious callbacks */
@@ -808,11 +764,80 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config,
 
     gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
 
-    /* ---- Notifications ---- */
-    dlg->notifications_check = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Enable Desktop Notifications"));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->notifications_check),
-                                 config_get_notifications(config));
-    gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->notifications_check), FALSE, FALSE, 0);
+    /* ---- GPU Acceleration ---- */
+    {
+        GtkWidget *gpu_label = gtk_label_new("GPU Acceleration:");
+        gtk_label_set_xalign(GTK_LABEL(gpu_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), gpu_label, FALSE, FALSE, 0);
+
+        /* Build GPU mode options dynamically */
+        GtkListStore *gpu_store = GTK_LIST_STORE(gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING));
+
+        /* Option 0: Auto (select best GPU by free memory) */
+        GtkTreeIter iter;
+        gtk_list_store_append(gpu_store, &iter);
+        gtk_list_store_set(gpu_store, &iter,
+            0, "Auto (select best GPU by free memory)",
+            1, "auto",
+            -1);
+
+        /* Option 1: CPU Only */
+        gtk_list_store_append(gpu_store, &iter);
+        gtk_list_store_set(gpu_store, &iter,
+            0, "CPU Only",
+            1, "cpu",
+            -1);
+
+        /* Options 2+: Individual GPUs (if CUDA available) */
+        int gpu_count = 0;
+        gpu_get_device_count(&gpu_count);
+        for (int i = 0; i < gpu_count; i++) {
+            char display[256];
+            char mode[32];
+            char name[128] = {"Unknown"};
+            gpu_get_device_name(i, name, sizeof(name));
+            snprintf(display, sizeof(display), "GPU %d: %s", i, name);
+            snprintf(mode, sizeof(mode), "gpu:%d", i);
+            gtk_list_store_append(gpu_store, &iter);
+            gtk_list_store_set(gpu_store, &iter,
+                0, display,
+                1, mode,
+                -1);
+        }
+
+        dlg->gpu_mode_combo = GTK_COMBO_BOX(gtk_combo_box_new_with_model(GTK_TREE_MODEL(gpu_store)));
+        g_object_unref(gpu_store);
+
+        GtkCellRenderer *gpu_renderer = gtk_cell_renderer_text_new();
+        gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(dlg->gpu_mode_combo), gpu_renderer, TRUE);
+        gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(dlg->gpu_mode_combo), gpu_renderer,
+                                       "text", 0, NULL);
+
+        /* Select current GPU mode from config */
+        const char *current_gpu_mode = config_get_gpu_mode(config);
+        GtkTreeModel *gpu_model = GTK_TREE_MODEL(gtk_combo_box_get_model(dlg->gpu_mode_combo));
+        if (gtk_tree_model_get_iter_first(gpu_model, &iter)) {
+            do {
+                gchar *mode_val = NULL;
+                gtk_tree_model_get(gpu_model, &iter, 1, &mode_val, -1);
+                if (mode_val && current_gpu_mode && g_strcmp0(mode_val, current_gpu_mode) == 0) {
+                    gtk_combo_box_set_active_iter(dlg->gpu_mode_combo, &iter);
+                    g_free(mode_val);
+                    break;
+                }
+                g_free(mode_val);
+            } while (gtk_tree_model_iter_next(gpu_model, &iter));
+        }
+
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->gpu_mode_combo), FALSE, TRUE, 0);
+
+        GtkWidget *gpu_restart_label = gtk_label_new("Restart the application for GPU changes to take effect.");
+        gtk_label_set_xalign(GTK_LABEL(gpu_restart_label), 0);
+        gtk_widget_set_opacity(gpu_restart_label, 0.6);
+        gtk_box_pack_start(GTK_BOX(vbox), gpu_restart_label, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+    }
 
     gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
 
@@ -858,16 +883,6 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config,
     /* Spacer to push buttons to bottom */
     GtkWidget *spacer = gtk_label_new(NULL);
     gtk_box_pack_start(GTK_BOX(vbox), spacer, TRUE, TRUE, 0);
-
-    /* ---- Test Model Button and Status ---- */
-    GtkWidget *test_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *test_btn = gtk_button_new_with_label("Test Model");
-    gtk_widget_set_sensitive(test_btn, whisper_client != NULL);
-    dlg->test_status_label = GTK_LABEL(gtk_label_new(""));
-    g_signal_connect(test_btn, "clicked", G_CALLBACK(on_test_model_clicked), dlg);
-    gtk_box_pack_start(GTK_BOX(test_box), test_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(test_box), GTK_WIDGET(dlg->test_status_label), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), test_box, FALSE, FALSE, 6);
 
     /* ---- Connect Save/Cancel buttons ---- */
     GtkWidget *save_btn = gtk_dialog_get_widget_for_response(dlg->dialog, GTK_RESPONSE_OK);

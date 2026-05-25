@@ -164,15 +164,10 @@ static void dbus_handle_method_call(DBusService *service, DBusMessage *msg) {
     const char *member = dbus_message_get_member(msg);
     if (!member) return;
 
-    fprintf(stderr, "[dbus] Method call received: %s\n", member);
-
     if (strcmp(member, DBUS_METHOD_TOGGLE) == 0) {
-        fprintf(stderr, "[dbus] ToggleMicrophone invoked — calling callback\n");
         /* Invoke the toggle callback if registered */
         if (service->callback) {
             service->callback(service->user_data);
-        } else {
-            fprintf(stderr, "[dbus] WARNING: No toggle callback registered!\n");
         }
 
         /* Send a success reply */
@@ -182,7 +177,6 @@ static void dbus_handle_method_call(DBusService *service, DBusMessage *msg) {
             dbus_message_unref(reply);
         }
     } else {
-        fprintf(stderr, "[dbus] Unknown method: %s — sending error reply\n", member);
         /* Unknown method - send error */
         dbus_send_error_reply(service, msg,
                               "org.xvoice.Actions.Error.UnknownMethod",
@@ -362,37 +356,6 @@ bool dbus_service_stop(DBusService *service) {
 /* ------------------------------------------------------------------ */
 /* Public API - Status Checks                                          */
 /* ------------------------------------------------------------------ */
-
-/**
- * Check if the D-Bus service is currently active.
- * Matches header declaration: bool dbus_service_is_active(const DBusService* service);
- * TODO: Unused public function — considered for removal. Diagnostic function with no callers.
- */
-bool dbus_service_is_active(const DBusService *service) {
-    if (!service) return false;
-    return (service->connection != NULL && service->owner_id != -1);
-}
-
-/**
- * Check if the D-Bus session bus is available.
- * TODO: Unused public function — considered for removal. Could be used for pre-flight checks but has no callers.
- */
-bool dbus_session_bus_available(void) {
-    DBusError err;
-    dbus_error_init(&err);
-
-    DBusConnection *conn = dbus_bus_get(DBUS_BUS_SESSION, &err);
-    if (dbus_error_is_set(&err)) {
-        dbus_error_free(&err);
-        return false;
-    }
-
-    /* Do NOT close shared connection — conn was obtained via dbus_bus_get()
-     * which returns a shared connection owned by libdbus. Closing it would
-     * affect other users and may cause crashes. See also dbus_service_start(). */
-    (void)conn;
-    return true;
-}
 
 /* ------------------------------------------------------------------ */
 /* Public API - Command String Generation                              */

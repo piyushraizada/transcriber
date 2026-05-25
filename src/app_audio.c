@@ -8,7 +8,7 @@
  *   - Device selection: Configurable via audio_recorder_set_device().
  *     Falls back to ALSA "default" if configured device fails to open.
  *   - Device logging: Before starting recording, logs the device name
- *     to stderr in the format: [audio] Using recording device: <name>
+ *     via g_log() with domain "app-audio".
  *   - Secure memory scrubbing: PCM buffers are overwritten with zeros
  *     (via scrub_memory()) before being freed to prevent swap leakage.
  *   - Thread-safe: Uses pthread_mutex for concurrent access protection.
@@ -78,8 +78,8 @@ AudioFormat audio_format_get_default(void) {
     return fmt;
 }
 
-static gboolean audio_format_write_wav_header(FILE *file, const AudioFormat *format) {
-    if (!file || !format) return FALSE;
+static bool audio_format_write_wav_header(FILE *file, const AudioFormat *format) {
+    if (!file || !format) return false;
 
     uint32_t sample_rate = (uint32_t)format->sample_rate;
     uint16_t channels = (uint16_t)format->channels;
@@ -122,7 +122,7 @@ static gboolean audio_format_write_wav_header(FILE *file, const AudioFormat *for
     return (written == WAV_HEADER_SIZE);
 }
 
-gboolean audio_format_finalize_wav_header(FILE *file, gsize data_size) {
+bool audio_format_finalize_wav_header(FILE *file, gsize data_size) {
     uint32_t ds = (uint32_t)data_size;
     uint32_t riff_size = ds + 36;  /* File size minus 8 bytes for RIFF descriptor */
     unsigned char buf[4];
@@ -137,28 +137,28 @@ gboolean audio_format_finalize_wav_header(FILE *file, gsize data_size) {
 
     /* Patch RIFF chunk size at offset 4 */
     if (fseek(file, 4, SEEK_SET) != 0) {
-        return FALSE;
+        return false;
     }
     PACK32(riff_size);
     size_t written = fwrite(buf, 1, 4, file);
     if (written != 4) {
-        return FALSE;
+        return false;
     }
 
     /* Patch data chunk size at offset 40 */
     if (fseek(file, 40, SEEK_SET) != 0) {
-        return FALSE;
+        return false;
     }
     PACK32(ds);
     written = fwrite(buf, 1, 4, file);
     if (written != 4) {
-        return FALSE;
+        return false;
     }
 
     fseek(file, 0, SEEK_END);
 
     #undef PACK32
-    return TRUE;
+    return true;
 }
 
 /* ===================================================================
@@ -231,7 +231,7 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
      * If the device cannot provide 16kHz, the WAV header would claim 16kHz
      * but contain audio at a different rate, producing distorted playback. */
     if (actual_rate != 16000) {
-        fprintf(stderr, "[audio] Device '%s' provides %u Hz instead of 16000 Hz — skipping\n",
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "[audio] Device '%s' provides %u Hz instead of 16000 Hz — skipping\n",
                 device_name, actual_rate);
         snd_pcm_close(pcm);
         return false;
@@ -283,8 +283,8 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
     recorder->wav_fd = -1;
     recorder->wav_file = NULL;
     recorder->wav_data_size = 0;
-    recorder->is_recording = FALSE;
-    atomic_store(&recorder->stop_flag, FALSE);
+    recorder->is_recording = false;
+    atomic_store(&recorder->stop_flag, false);
     recorder->alsa_pcm = NULL;
     recorder->rms_volume = 0.0;
     pthread_mutex_init(&recorder->volume_mutex, NULL);
@@ -328,8 +328,8 @@ void audio_recorder_destroy(AudioRecorder *recorder) {
     free(recorder);
 }
 
-gboolean audio_recorder_set_device(AudioRecorder *recorder, const char *device) {
-    if (!recorder) return FALSE;
+bool audio_recorder_set_device(AudioRecorder *recorder, const char *device) {
+    if (!recorder) return false;
 
     pthread_mutex_lock(&recorder->mutex);
     if (device) {
@@ -339,7 +339,7 @@ gboolean audio_recorder_set_device(AudioRecorder *recorder, const char *device) 
         recorder->device[0] = '\0';
     }
     pthread_mutex_unlock(&recorder->mutex);
-    return TRUE;
+    return true;
 }
 
 const char *audio_recorder_get_device(const AudioRecorder *recorder) {
@@ -359,7 +359,7 @@ static void *capture_thread_func(void *arg) {
     guchar *buffer = (guchar *)malloc(buffer_bytes);
     if (!buffer) {
         set_audio_error("Failed to allocate capture buffer");
-        recorder->is_recording = FALSE;
+        /* M-008 fix: Don't set is_recording here — main thread handles it after join */
         return NULL;
     }
 
@@ -391,14 +391,15 @@ static void *capture_thread_func(void *arg) {
                    "Please check your microphone configuration.",
                    last_error ? last_error : "unknown");
         set_audio_error(msg);
-        recorder->is_recording = FALSE;
+        /* M-008 fix: Don't set is_recording here — main thread handles it after join */
         scrub_memory(buffer, buffer_bytes);
         free(buffer);
         return NULL;
     }
 
-    /* HI-03 fix: Set is_recording = TRUE only AFTER device is successfully opened */
-    recorder->is_recording = TRUE;
+    /* HI-03 fix: Device successfully opened.
+     * M-008 fix: is_recording is set to TRUE by the main thread under the mutex
+     * in audio_recorder_start() after pthread_create() returns successfully. */
 
     /* Enter the ALSA read loop */
     int err;
@@ -459,7 +460,10 @@ static void *capture_thread_func(void *arg) {
         recorder->alsa_pcm = NULL;
     }
 
-    recorder->is_recording = FALSE;
+    /* M-008 fix: Set is_recording = FALSE under mutex for thread safety */
+    pthread_mutex_lock(&recorder->mutex);
+    recorder->is_recording = false;
+    pthread_mutex_unlock(&recorder->mutex);
 
     scrub_memory(buffer, buffer_bytes);
     free(buffer);
@@ -470,7 +474,7 @@ static void *capture_thread_func(void *arg) {
  * Recording control
  * =================================================================== */
 
-gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
+bool audio_recorder_start(AudioRecorder *recorder, int max_duration) {
     (void)max_duration;
 
     /* M1-003 fix: Reset any stale error before starting a new recording */
@@ -478,15 +482,13 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
 
     if (!recorder) {
         set_audio_error("Invalid recorder handle");
-        return FALSE;
+        return false;
     }
 
     if (recorder->is_recording) {
         set_audio_error("Already recording");
-        return FALSE;
+        return false;
     }
-
-    fprintf(stderr, "[audio] Using recording device: %s\n", recorder->device);
 
     pthread_mutex_lock(&recorder->mutex);
 
@@ -503,12 +505,11 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
             g_error_free(tmp_error);
         }
         pthread_mutex_unlock(&recorder->mutex);
-        return FALSE;
+        return false;
     }
     g_strlcpy(recorder->wav_path, tmp_path, sizeof(recorder->wav_path));
     g_free(tmp_path);
-    /* ME-01 fix: Use owner-only permissions (0600) instead of world-readable (0644).
-     * vLLM runs under the same user, so world-readable is not needed. */
+    /* ME-01 fix: Use owner-only permissions (0600) for privacy. */
     chmod(recorder->wav_path, 0600);
 
     recorder->wav_file = fdopen(recorder->wav_fd, "w+");
@@ -520,7 +521,7 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
                    "Failed to open WAV file stream: %s", strerror(errno));
         set_audio_error(msg);
         pthread_mutex_unlock(&recorder->mutex);
-        return FALSE;
+        return false;
     }
 
     if (!audio_format_write_wav_header(recorder->wav_file, &recorder->format)) {
@@ -529,11 +530,11 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
         unlink(recorder->wav_path);
         recorder->wav_path[0] = '\0';
         pthread_mutex_unlock(&recorder->mutex);
-        return FALSE;
+        return false;
     }
 
     recorder->wav_data_size = 0;
-    atomic_store(&recorder->stop_flag, FALSE);
+    atomic_store(&recorder->stop_flag, false);
 
     int err = pthread_create(&recorder->capture_thread, NULL, capture_thread_func, recorder);
     if (err != 0) {
@@ -546,23 +547,37 @@ gboolean audio_recorder_start(AudioRecorder *recorder, int max_duration) {
         unlink(recorder->wav_path);
         recorder->wav_path[0] = '\0';
         pthread_mutex_unlock(&recorder->mutex);
-        return FALSE;
+        return false;
     }
     /* MAJ-003 fix: Do NOT detach — use pthread_join() in stop() */
 
+    /* M-008 fix: Set is_recording = TRUE under mutex AFTER successful thread creation.
+     * This ensures the main thread and capture thread have a consistent view of
+     * the recording state, protected by the mutex. */
+    recorder->is_recording = true;
+
     pthread_mutex_unlock(&recorder->mutex);
-    return TRUE;
+    return true;
 }
 
-gboolean audio_recorder_stop(AudioRecorder *recorder) {
-    if (!recorder || !recorder->is_recording) {
-        return FALSE;
+bool audio_recorder_stop(AudioRecorder *recorder) {
+    if (!recorder) {
+        return false;
     }
+
+    /* M-008 fix: Check stop_flag atomically to guard against double-stop.
+     * We check is_recording under the mutex below after setting the stop flag. */
 
     pthread_mutex_lock(&recorder->mutex);
 
+    /* Guard: if not recording, bail out */
+    if (!recorder->is_recording) {
+        pthread_mutex_unlock(&recorder->mutex);
+        return false;
+    }
+
     /* HI-02 + SG-01 fix: Use atomic store for portable thread safety */
-    atomic_store(&recorder->stop_flag, TRUE);
+    atomic_store(&recorder->stop_flag, true);
 
     pthread_mutex_unlock(&recorder->mutex);
 
@@ -573,6 +588,9 @@ gboolean audio_recorder_stop(AudioRecorder *recorder) {
         set_audio_error("Failed to join capture thread");
     }
 
+    /* Finalize WAV header and close file before clearing is_recording.
+     * The capture thread sets is_recording=FALSE under mutex, but we must
+     * finalize the WAV file first. */
     if (recorder->wav_file) {
         audio_format_finalize_wav_header(recorder->wav_file, recorder->wav_data_size);
         fflush(recorder->wav_file);
@@ -581,20 +599,11 @@ gboolean audio_recorder_stop(AudioRecorder *recorder) {
         fclose(recorder->wav_file);
         recorder->wav_file = NULL;
         recorder->wav_fd = -1;
-        /* ME-01 fix: Use owner-only permissions (0600) for privacy.
-         * vLLM runs under the same user, so world-readable is not needed. */
+        /* ME-01 fix: Use owner-only permissions (0600) for privacy. */
         chmod(recorder->wav_path, 0600);
     }
 
-    return TRUE;
-}
-
-/* TODO: Unused public function — considered for removal.
- * The `is_recording` field is accessed directly inside the module.
- * No external caller uses this getter. Keep for potential debugging/monitoring. */
-gboolean audio_recorder_is_recording(const AudioRecorder *recorder) {
-    if (!recorder) return FALSE;
-    return recorder->is_recording;
+    return true;
 }
 
 /* ===================================================================
@@ -622,50 +631,24 @@ AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder) {
     return recorder->backend;
 }
 
-/* TODO: Unused public function — considered for removal.
- * Could be useful for debugging/monitoring but currently has no callers. */
-gsize audio_recorder_get_bytes_recorded(const AudioRecorder *recorder) {
-    if (!recorder) return 0;
-    return recorder->wav_data_size;
-}
-
 void audio_recorder_reset_error(void) {
     pthread_mutex_lock(&g_audio_error_mutex);
     g_audio_error[0] = '\0';
     pthread_mutex_unlock(&g_audio_error_mutex);
 }
 
-/* TODO: Unused public function — considered for removal.
- * Comment says "caller manages lifecycle" but no caller invokes this. */
-gboolean audio_recorder_clear(AudioRecorder *recorder) {
-    if (!recorder) return FALSE;
-
-    if (recorder->wav_file) {
-        fclose(recorder->wav_file);
-        recorder->wav_file = NULL;
-    } else if (recorder->wav_fd >= 0) {
-        close(recorder->wav_fd);
-        recorder->wav_fd = -1;
-    }
-
-    /* Do NOT delete the WAV file here — caller manages its lifecycle.
-       The file must remain accessible for vLLM transcription. */
-    recorder->wav_data_size = 0;
-    return TRUE;
-}
-
 /**
  * Delete the WAV file from disk. Call this AFTER transcription is done.
  */
-gboolean audio_recorder_delete_wav(AudioRecorder *recorder) {
-    if (!recorder) return FALSE;
+bool audio_recorder_delete_wav(AudioRecorder *recorder) {
+    if (!recorder) return false;
 
     if (recorder->wav_path[0]) {
         unlink(recorder->wav_path);
         recorder->wav_path[0] = '\0';
-        return TRUE;
+        return true;
     }
-    return FALSE;
+    return false;
 }
 
 /* ===================================================================
@@ -673,12 +656,12 @@ gboolean audio_recorder_delete_wav(AudioRecorder *recorder) {
  * =================================================================== */
 
 /* Try to open a device for capture to verify it's actually usable */
-static gboolean test_capture_device(const char *device_name) {
+static bool test_capture_device(const char *device_name) {
     snd_pcm_t *pcm;
     int err = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0);
-    if (err < 0) return FALSE;
+    if (err < 0) return false;
     snd_pcm_close(pcm);
-    return TRUE;
+    return true;
 }
 
 AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {

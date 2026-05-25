@@ -445,4 +445,32 @@ void app_text_window_set_error(TextWindow *tw, const char *error);
  */
 void app_window_set_volume_level(MainWindow *win, double level);
 
+/* app_window_set_model_loading — Update the model loading indicator.
+ *
+ * When model_loading is TRUE, the icon draw callback overlays "WAIT" text
+ * in bold black on top of the microphone icon to inform the user that
+ * the system is not yet ready for dictation.
+ *
+ * When model_loading is set to FALSE, the "WAIT" overlay is removed and
+ * the icon displays normally. This should be called once the Whisper model
+ * has finished loading at startup.
+ *
+ * Parameters:
+ *   win          — The MainWindow handle.
+ *   model_loading — TRUE to show "WAIT" overlay, FALSE to remove it.
+ */
+void app_window_set_model_loading(MainWindow *win, bool model_loading);
+
+/* app_window_get_model_loading — Query the model loading indicator.
+ *
+ * Returns TRUE if the "WAIT" overlay is currently being displayed,
+ * FALSE if the model has finished loading (or failed to load).
+ *
+ * Parameters:
+ *   win — The MainWindow handle.
+ *
+ * Returns: TRUE if model is still loading, FALSE otherwise.
+ */
+bool app_window_get_model_loading(MainWindow *win);
+
 #endif /* APP_WINDOW_H */

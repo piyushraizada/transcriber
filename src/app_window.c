@@ -137,6 +137,9 @@ struct _MainWindow {
     GdkPixbuf *cached_red_icon;
     GdkPixbuf *cached_green_icon;
     bool checking_blink;
+    /* Model loading indicator — true while whisper model is loading at startup.
+     * When true, the icon draw callback overlays "WAIT" text on the red mic. */
+    bool model_loading;
     guint checking_source_id;
     /* Countdown timer */
     guint countdown_source_id;
@@ -316,6 +319,8 @@ static void render_icon(MainWindow *win, const char *icon_name) {
 /**
  * Draw callback for the icon drawing area.
  * Renders the microphone icon from XPM file.
+ * When model_loading is true, overlays "WAIT" text in bold black
+ * to inform the user that the system is not yet ready for dictation.
  */
 static void on_icon_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
@@ -325,7 +330,8 @@ static void on_icon_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
         return;
     }
 
-    GdkPixbuf *pixbuf = load_xpm(win, icon_name);
+    // L-010 fix: Use cached icon instead of loading XPM every draw call
+    GdkPixbuf *pixbuf = get_cached_icon(win, icon_name);
     if (!pixbuf) {
         return;
     }
@@ -342,6 +348,33 @@ static void on_icon_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     cairo_paint(cr);
 
     g_object_unref(pixbuf);
+
+    /* Overlay "WAIT" text when model is still loading */
+    if (win->model_loading) {
+        double text_x = area_width / 2.0;
+        double text_y = area_height / 2.0;
+
+        /* Use a font size proportional to the icon size */
+        int font_size = (area_width < area_height) ? area_width : area_height;
+        font_size = font_size / 5;  /* Roughly 20% of the smallest dimension */
+        if (font_size < 10) font_size = 10;
+        if (font_size > 30) font_size = 30;
+
+        cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, font_size);
+
+        /* Measure text for centering */
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, "WAIT", &te);
+        text_x -= te.width / 2.0 + te.x_bearing;
+        text_y -= te.y_bearing + (te.height / 3.0);
+
+        /* Draw "WAIT" in bold black */
+        cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+        cairo_move_to(cr, text_x, text_y);
+        cairo_show_text(cr, "WAIT");
+        cairo_close_path(cr);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,7 +542,7 @@ static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, g
 static void on_gear_button_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     MainWindow *win = (MainWindow *)user_data;
-    bool saved = config_dialog_show(win->window, win->config, win->whisper_client);
+    bool saved = config_dialog_show(win->window, win->config);
     if (saved && win->on_config_changed) {
         win->on_config_changed(win->config_changed_user_data);
     }
@@ -564,7 +597,6 @@ static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpoin
  * Hides the window instead of destroying it.
  */
 static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
-    fprintf(stderr, "[text-window] delete_event: hiding window\n");
     gtk_widget_hide(widget);
     (void)user_data;
     (void)event;
@@ -634,6 +666,9 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     win->checking_blink = FALSE;
     win->countdown_source_id = 0;
     win->countdown_seconds = 0;
+    /* Default to TRUE — model has not loaded yet at window creation time.
+     * Main() will set to FALSE once the model is fully loaded. */
+    win->model_loading = TRUE;
 
     /* Determine asset directory */
     get_asset_dir(win);
@@ -1055,8 +1090,6 @@ void app_text_window_destroy(TextWindow *tw) {
 void app_text_window_append_text(TextWindow *tw, const char *text) {
     if (!tw || !text) return;
 
-    fprintf(stderr, "[text-window] append_text: showing window with %zu chars\n", strlen(text));
-
     /* Append text to the buffer */
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
@@ -1067,8 +1100,6 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
     gtk_widget_show_all(GTK_WIDGET(tw->window));
     gtk_window_present(tw->window);
 
-    fprintf(stderr, "[text-window] append_text: window shown and presented\n");
-
     /* Scroll to the end */
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
     gtk_text_view_scroll_to_iter(tw->text_view, &end, 0, FALSE, 0, 0);
@@ -1076,8 +1107,6 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
 
 void app_text_window_set_error(TextWindow *tw, const char *error) {
     if (!tw || !error) return;
-
-    fprintf(stderr, "[text-window] set_error: showing window with error: %s\n", error);
 
     /* Prefix with "ERROR: " */
     GtkTextIter end;
@@ -1089,8 +1118,6 @@ void app_text_window_set_error(TextWindow *tw, const char *error) {
     /* Show and raise the window */
     gtk_widget_show_all(GTK_WIDGET(tw->window));
     gtk_window_present(tw->window);
-
-    fprintf(stderr, "[text-window] set_error: window shown and presented\n");
 }
 
 /* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
@@ -1100,4 +1127,17 @@ void app_window_set_volume_level(MainWindow *win, double level) {
     if (level < 0.0) level = 0.0;
     if (level > 1.0) level = 1.0;
     gtk_level_bar_set_value(win->volume_level_bar, level);
+}
+
+void app_window_set_model_loading(MainWindow *win, bool model_loading) {
+    if (!win) return;
+    if (win->model_loading == model_loading) return;  /* No change */
+    win->model_loading = model_loading;
+    /* Queue a redraw to show/remove the "WAIT" overlay */
+    gtk_widget_queue_draw(GTK_WIDGET(win->icon_area));
+}
+
+bool app_window_get_model_loading(MainWindow *win) {
+    if (!win) return FALSE;
+    return win->model_loading;
 }

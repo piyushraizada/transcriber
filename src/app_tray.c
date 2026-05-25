@@ -372,7 +372,7 @@ SystemTray *tray_create(void) {
                                            APP_INDICATOR_CATEGORY_APPLICATION_STATUS,
                                            tray->icon_dir);
     if (!tray->indicator) {
-        fprintf(stderr, "[tray] Failed to create AppIndicator\n");
+        g_log("app-tray", G_LOG_LEVEL_MESSAGE, "[tray] Failed to create AppIndicator\n");
         rmdir(tray->icon_dir);
         free(tray);
         return NULL;

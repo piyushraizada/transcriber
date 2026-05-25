@@ -156,8 +156,7 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
 /**
  * Transcribe a WAV file with automatic retry on transient errors.
  *
- * In local mode, retry is less critical than with network API, but it
- * provides protection against memory allocation failures or other
+ * Retry provides protection against memory allocation failures or other
  * transient issues during model loading.
  *
  * @param client         Pointer to a valid WhisperClient. Must not be NULL.
@@ -172,8 +171,7 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
 /*---------------------------------------------------------------------------
  * Section 6: Connection Health Check (Model Availability)
  *---------------------------------------------------------------------------
- * In local mode, "connection check" verifies the model file exists
- * and is accessible.
+ * "Connection check" verifies the model file exists and is accessible.
  */
 
 /**
@@ -285,22 +283,23 @@ bool whisper_client_is_loading(const WhisperClient *client);
  *
  * This function loads the model into memory so that the first
  * transcription request does not incur loading latency. It handles
- * GPU selection automatically:
- *   1. If compiled with CUDA, attempts GPU load first
- *   2. Falls back to CPU if GPU load fails
- *   3. If a GPU index is specified (non-negative), uses that GPU
+ * GPU selection based on the gpu_mode parameter:
+ *   - "auto": Select GPU with most free memory, fallback to CPU if insufficient
+ *   - "cpu": Force CPU-only processing
+ *   - "gpu:N": Use specific GPU device N, fallback to CPU on failure
+ *   - NULL: Defaults to "auto"
  *
  * Safe to call from a background thread. Do NOT call from the GTK
  * main thread as this may block for several seconds.
  *
  * @param client   Pointer to a valid WhisperClient. Must not be NULL.
- * @param gpu_index GPU device index to use (-1 for auto-detect, -2 for CPU-only)
+ * @param gpu_mode GPU mode string: "auto", "cpu", or "gpu:N" (may be NULL for auto)
  * @return true if the model was loaded successfully, false on error.
  *         Check whisper_client_get_error() for details on failure.
  *
  * @thread_safe This function is safe to call from any thread.
  */
-bool whisper_client_load_model(WhisperClient *client, int gpu_index);
+bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode);
 
 /**
  * Unload the whisper model from memory.

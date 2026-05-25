@@ -13,6 +13,7 @@
 
 #include "app_whisper.h"
 
+#include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,8 @@
 
 // whisper.cpp header
 #include "whisper.h"
+
+#include "app_gpu.h"
 
 /* ===================================================================
  * Constants and defaults
@@ -73,8 +76,12 @@ static bool whisper_abort_callback(void *data) {
 /* ===================================================================
  * Public: resolve model path with tilde expansion and directory search
  * =================================================================== */
+/* M-006 fix: Distinct return codes for path resolution:
+ *   0  = path resolved and file exists
+ *  -1  = path resolved but file does not exist (valid path, missing file)
+ *  -2  = path resolution failed (invalid input, no HOME, etc.) */
 int whisper_resolve_model_path(const char *input, char *output, size_t out_size) {
-    if (!input || !output || out_size == 0) return -1;
+    if (!input || !output || out_size == 0) return -2;
 
     char resolved[MAX_PATH_LEN];
 
@@ -82,7 +89,7 @@ int whisper_resolve_model_path(const char *input, char *output, size_t out_size)
     if (input[0] == '~') {
         if (input[1] == '/' || input[1] == '\0') {
             const char *home = getenv("HOME");
-            if (!home) return -1;
+            if (!home) return -2;
             snprintf(resolved, sizeof(resolved), "%s%s", home, input + 1);
         } else {
             // ~username style - not supported, treat as literal
@@ -131,7 +138,7 @@ int whisper_resolve_model_path(const char *input, char *output, size_t out_size)
 
     // Use the resolved path as-is (may not exist yet)
     snprintf(output, out_size, "%s", resolved);
-    return -1;
+    return -1;  // Path resolved but file does not exist
 }
 
 /* ===================================================================
@@ -205,8 +212,6 @@ void whisper_client_unload_model(WhisperClient *client) {
     client->model_loading = false;
     client->using_gpu = false;
     pthread_mutex_unlock(&client->mutex);
-
-    fprintf(stderr, "[whisper] Model unloaded\n");
 }
 
 /* ===================================================================
@@ -230,8 +235,6 @@ static bool load_model_internal(WhisperClient *client) {
         return false;
     }
 
-    fprintf(stderr, "[whisper] Loading model: %s\n", client->model_path);
-
     // Determine GPU strategy
     bool try_gpu = false;
     int gpu_idx = client->gpu_index;
@@ -239,19 +242,31 @@ static bool load_model_internal(WhisperClient *client) {
     if (gpu_idx == GPU_INDEX_CPU_ONLY) {
         // User explicitly requested CPU-only
         try_gpu = false;
-        fprintf(stderr, "[whisper] CPU-only mode requested\n");
+    } else if (gpu_idx == GPU_INDEX_AUTO_MEMORY) {
+        // Auto-select GPU with most free memory
+        int best_gpu = -1;
+        size_t free_mem = 0;
+        if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
+            // Check if free memory meets minimum threshold (2 GB)
+            if (free_mem >= ((size_t)(2UL * 1024 * 1024 * 1024))) {
+                try_gpu = true;
+                gpu_idx = best_gpu;
+            } else {
+                try_gpu = false;
+            }
+        } else {
+            try_gpu = false;
+        }
     } else if (gpu_idx >= 0) {
         // User specified a specific GPU
         try_gpu = whisper_gpu_available();
-        if (try_gpu) {
-            fprintf(stderr, "[whisper] Using specified GPU index: %d\n", gpu_idx);
-        } else {
-            fprintf(stderr, "[whisper] GPU requested but CUDA not available, falling back to CPU\n");
+        if (!try_gpu) {
+            try_gpu = false;
         }
     } else {
-        // Auto-detect: try GPU if compiled with CUDA support
+        // Legacy auto-detect (GPU_INDEX_AUTO = -1): try first GPU
         try_gpu = whisper_gpu_available();
-        gpu_idx = 0; // Default to first GPU for auto-detect
+        gpu_idx = 0; // Default to first GPU for legacy auto-detect
     }
 
     bool gpu_loaded = false;
@@ -269,20 +284,15 @@ static bool load_model_internal(WhisperClient *client) {
     struct whisper_context *ctx = NULL;
 
     if (try_gpu) {
-        fprintf(stderr, "[whisper] Attempting to load model on GPU (CUDA device %d)...\n",
-                gpu_idx >= 0 ? gpu_idx : 0);
         ctx = whisper_init_from_file_with_params(client->model_path, cparams);
 
         if (ctx) {
             gpu_loaded = true;
-            fprintf(stderr, "[whisper] Model loaded on GPU successfully\n");
         } else {
-            fprintf(stderr, "[whisper] GPU load failed, falling back to CPU...\n");
             cparams.use_gpu = false;
             ctx = whisper_init_from_file_with_params(client->model_path, cparams);
         }
     } else {
-        fprintf(stderr, "[whisper] Loading model on CPU...\n");
         ctx = whisper_init_from_file_with_params(client->model_path, cparams);
     }
 
@@ -297,11 +307,6 @@ static bool load_model_internal(WhisperClient *client) {
     client->model_loaded = true;
     client->using_gpu = gpu_loaded;
 
-    // Report backend used
-    const char *backend = client->using_gpu ? "GPU (CUDA)" : "CPU";
-    int n_lang = whisper_lang_max_id();
-    fprintf(stderr, "[whisper] Model loaded successfully on %s (%d languages supported)\n",
-            backend, n_lang);
 
     return true;
 }
@@ -325,11 +330,21 @@ static bool load_model(WhisperClient *client) {
 
 /* ===================================================================
  * Public: Load the model synchronously (blocking call)
+ *
+ * @param client      WhisperClient instance
+ * @param gpu_mode    GPU mode string: "auto", "cpu", or "gpu:N"
+ *                    If NULL, defaults to "auto" (GPU_INDEX_AUTO_MEMORY)
  * =================================================================== */
-bool whisper_client_load_model(WhisperClient *client, int gpu_index) {
+bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
     if (!client) return false;
 
     pthread_mutex_lock(&client->mutex);
+
+    // Parse GPU mode string to get internal index
+    int gpu_index = GPU_INDEX_AUTO_MEMORY;  // Default to auto
+    if (gpu_mode) {
+        gpu_mode_parse(gpu_mode, &gpu_index);
+    }
 
     // If already loaded with same GPU config, skip
     if (client->model_loaded && client->gpu_index == gpu_index) {
@@ -376,7 +391,7 @@ static uint32_t le32dec(const unsigned char *p) {
 static bool read_wav_samples(const char *path, float **samples_out, int *n_samples_out) {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "[whisper] Failed to open WAV file: %s\n", path);
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Failed to open WAV file: %s\n", path);
         return false;
     }
 
@@ -387,14 +402,14 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     uint32_t data_size = 0;
 
     if (fread(riff, 1, 4, f) != 4 || memcmp(riff, "RIFF", 4) != 0) {
-        fprintf(stderr, "[whisper] Invalid WAV: not a RIFF file\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Invalid WAV: not a RIFF file\n");
         fclose(f);
         return false;
     }
     // Skip riff_size (not needed for parsing)
     if (fseek(f, 4, SEEK_CUR) != 0) { fclose(f); return false; }
     if (fread(wave, 1, 4, f) != 4 || memcmp(wave, "WAVE", 4) != 0) {
-        fprintf(stderr, "[whisper] Invalid WAV: missing WAVE header\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Invalid WAV: missing WAVE header\n");
         fclose(f);
         return false;
     }
@@ -431,23 +446,23 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     }
 
     if (data_size == 0) {
-        fprintf(stderr, "[whisper] Invalid WAV: no data chunk found\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Invalid WAV: no data chunk found\n");
         fclose(f);
         return false;
     }
 
     // Validate format - we expect 16-bit PCM, mono, 16kHz
     if (audio_format != 1) {
-        fprintf(stderr, "[whisper] Warning: non-PCM format (%d), attempting anyway\n", audio_format);
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: non-PCM format (%d), attempting anyway\n", audio_format);
     }
     if (channels != 1) {
-        fprintf(stderr, "[whisper] Warning: %d channels, expected 1 (mono)\n", channels);
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: %d channels, expected 1 (mono)\n", channels);
     }
     if (bits_per_sample != 16) {
-        fprintf(stderr, "[whisper] Warning: %d bits/sample, expected 16\n", bits_per_sample);
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: %d bits/sample, expected 16\n", bits_per_sample);
     }
     if (sample_rate != 16000) {
-        fprintf(stderr, "[whisper] Warning: %d Hz sample rate, expected 16000\n", sample_rate);
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: %d Hz sample rate, expected 16000\n", sample_rate);
     }
 
     // Read PCM data and convert to float32
@@ -461,7 +476,7 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
 
     float *samples = (float *)calloc(n_samples, sizeof(float));
     if (!samples) {
-        fprintf(stderr, "[whisper] Memory allocation failed for samples\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Memory allocation failed for samples\n");
         fclose(f);
         return false;
     }
@@ -470,7 +485,7 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     int16_t *pcm = (int16_t *)malloc(data_size);
     if (!pcm) {
         free(samples);
-        fprintf(stderr, "[whisper] Memory allocation failed for PCM buffer\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Memory allocation failed for PCM buffer\n");
         fclose(f);
         return false;
     }
@@ -479,7 +494,7 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     fclose(f);
 
     if (read_count < (size_t)(n_samples * channels)) {
-        fprintf(stderr, "[whisper] Warning: read %zu samples, expected %d\n",
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: read %zu samples, expected %d\n",
                 read_count, n_samples * channels);
         n_samples = read_count / channels;
     }
@@ -498,9 +513,6 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     free(pcm);
     *samples_out = samples;
     *n_samples_out = n_samples;
-
-    fprintf(stderr, "[whisper] Read %d samples from WAV (%.1f seconds)\n",
-            n_samples, (double)n_samples / 16000.0);
 
     return true;
 }
@@ -586,12 +598,6 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
         }
     }
 
-    if (ret == 0) {
-        fprintf(stderr, "[whisper] Model path set: %s\n", client->model_path);
-    } else {
-        fprintf(stderr, "[whisper] Model path set (not yet verified): %s\n", client->model_path);
-    }
-
     pthread_mutex_unlock(&client->mutex);
     return true;
 }
@@ -671,9 +677,6 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
     // Always auto-detect language
     params.language = NULL;
 
-    fprintf(stderr, "[whisper] Starting transcription (%d samples, %.1f seconds)\n",
-            n_samples, (double)n_samples / 16000.0);
-
     // Run transcription WITHOUT holding the mutex
     int result = whisper_full(ctx, params, samples, n_samples);
 
@@ -743,9 +746,6 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
         full_text[--len] = '\0';
     }
 
-    fprintf(stderr, "[whisper] Transcription complete: %zu chars, %d segments\n",
-            len, n_segments);
-
     response->text = full_text;
     response->success = true;
     response->error_code = 0;
@@ -787,7 +787,7 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
 
         if (i == attempts - 1) break;  // Last attempt
 
-        fprintf(stderr, "[whisper] Retry %d/%d after error: %s\n",
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Retry %d/%d after error: %s\n",
                 i + 1, max_retries, whisper_client_get_error(client));
 
         // Brief delay before retry
@@ -837,7 +837,7 @@ bool whisper_validate_model_file(const char* model_path) {
         return true;
     }
 
-    fprintf(stderr, "[whisper] Invalid model magic: 0x%08x (expected GGML 0x%08x or GGUF 0x%08x)\n",
+    g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Invalid model magic: 0x%08x (expected GGML 0x%08x or GGUF 0x%08x)\n",
             magic, GGML_MAGIC, GGUF_MAGIC);
     return false;
 }
@@ -892,6 +892,5 @@ int whisper_client_get_error_code(const WhisperClient* client) {
  * =================================================================== */
 void whisper_client_cancel(WhisperClient* client) {
     if (!client) return;
-    fprintf(stderr, "[whisper] Cancellation requested\n");
     atomic_store(&client->cancel_requested, 1);
 }

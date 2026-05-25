@@ -54,37 +54,47 @@ extern "C" {
 typedef struct _AppConfig {
     /* Local Whisper Model Settings */
     char model_path[512];        ///< Path to GGML model file (e.g., "~/.cache/whisper/ggml-base.bin")
-                                  ///< Can be absolute path, relative path, or just filename
-                                  ///< (will search default model directories).
-                                  ///< @see CFG-005: Model Path
+                                   ///< Can be absolute path, relative path, or just filename
+                                   ///< (will search default model directories).
+                                   ///< @see CFG-005: Model Path
 
     /* Audio Settings */
     char audio_device[256];      ///< Audio device identifier (backend-specific)
-                                 ///< Examples: "hw:2,0" (ALSA), "default" (ALSA default)
-                                 ///< Empty string means system default.
-                                 ///< @see CFG-006: Audio Device
-                                 ///< @see AUD-008a: Microphone Selection
+                                  ///< Examples: "hw:2,0" (ALSA), "default" (ALSA default)
+                                  ///< "default" means system default microphone.
+                                  ///< @see CFG-006: Audio Device
+                                  ///< @see CFG-010: Microphone Selection
+                                  ///< @see CFG-015: Audio Device Validation
 
     char audio_device_display_name[256];  ///< User-friendly display name for the audio device
-                                          ///< Examples: "Built-in Microphone", "BlueSnowball"
-                                          ///< Stored for readability in config file; not used for device opening.
-                                          ///< @see CFG-006: Audio Device
+                                           ///< Examples: "Built-in Microphone", "BlueSnowball"
+                                           ///< Stored for readability in config file; not used for device opening.
+                                           ///< @see CFG-006: Audio Device
 
     int max_duration;            ///< Maximum recording duration in seconds (5-30)
-                                 ///< @see CFG-014: Max Recording Duration
-                                 ///< @see FR-007a: Maximum Session Limit
+                                  ///< @see CFG-014: Max Recording Duration
+                                  ///< @see FR-007a: Maximum Session Limit
 
     /* Window Settings */
     int window_x;                ///< Window X position (screen coordinates, -1 = center)
-                                 ///< @see CFG-004: Window Position
+                                  ///< @see CFG-004: Window Position
 
     int window_y;                ///< Window Y position (screen coordinates, -1 = center)
-                                 ///< @see CFG-004: Window Position
+                                  ///< @see CFG-004: Window Position
 
-    /* UI Settings */
-    bool enable_notifications;   ///< Enable desktop notifications for critical errors
-                                  ///< @see CFG-009: Notification
-                                  ///< @see ERR-006: Desktop Notifications
+    /* GPU Settings */
+    char gpu_mode[32];           ///< GPU acceleration mode
+                                   ///< "auto" = select GPU with most free memory
+                                   ///< "cpu" = force CPU-only processing
+                                   ///< "gpu:N" = use specific GPU device N
+                                   ///< @see CFG-GPU-001: GPU Mode
+
+    /* NOTE: Language field removed.
+     * M-001 fix: The SRS originally specified a language configuration field
+     * (CFG-007, WHISPER-005), but this was removed in favor of using
+     * multilingual-only models which auto-detect the input language.
+     * The language_combo was removed from the config dialog (MIN-002 fix).
+     * The SRS should be updated to reflect this deviation. */
 
 } AppConfig;
 
@@ -164,13 +174,12 @@ char* config_get_path(void);
  *
  * This function sets all fields in the AppConfig struct to their
  * default values as specified in the SRS. The defaults are:
- *   - model_path: "models/ggml-base.bin"
- *   - language: "en" (English)
- *   - audio_device: "system_default" (system default microphone)
+ *   - model_path: "ggml-large-v3-turbo-q8_0.bin"
+ *   - audio_device: "default" (system default microphone)
  *   - max_duration: 30 (30 seconds)
  *   - window_x: 100 (default horizontal position)
  *   - window_y: 100 (default vertical position)
- *   - enable_notifications: true
+ *   - gpu_mode: "auto" (select GPU with most free memory)
  *
  * @param config Pointer to an AppConfig struct to initialize. Must not be NULL.
  *
@@ -294,11 +303,11 @@ bool config_save_to_path(const AppConfig* config, const char* path);
  *
  * This function checks each field in the AppConfig struct for validity
  * and reports any issues. Validation rules:
- *   - model_path: Must be a non-empty path to a .bin model file
- *   - language: Must be empty (auto) or valid ISO 639-1 code (2 letters)
- *   - audio_device: Any non-empty string is valid (backend validates at runtime)
+ *   - model_path: Must be a non-empty path to a .bin/.gguf model file
+ *   - audio_device: "default" or valid ALSA device identifier (validated at recording start via CFG-015)
  *   - max_duration: Must be in range [5, 30]
  *   - window_x, window_y: Must be >= -1 (-1 means center)
+ *   - gpu_mode: Must be "auto", "cpu", or "gpu:N"
  *
  * @param config Pointer to an AppConfig struct to validate. Must not be NULL.
  * @return true if all fields are valid, false if any field is invalid.
@@ -400,18 +409,21 @@ int config_get_window_x(const AppConfig* config);
 int config_get_window_y(const AppConfig* config);
 
 /**
- * Set the notification enable flag.
+ * Set the GPU acceleration mode.
  * @param config  Pointer to AppConfig. Must not be NULL.
- * @param enable  true to enable desktop notifications, false to disable.
+ * @param mode    GPU mode string: "auto", "cpu", or "gpu:N". Copied internally.
+ *                Must not be NULL.
+ * @return true if valid, false if mode is invalid or too long.
+ * @see CFG-GPU-001: GPU Mode
  */
-void config_set_notifications(AppConfig* config, bool enable);
+bool config_set_gpu_mode(AppConfig* config, const char* mode);
 
 /**
- * Get the notification enable flag.
+ * Get the GPU acceleration mode.
  * @param config Pointer to AppConfig. Must not be NULL.
- * @return true if notifications are enabled, false otherwise.
+ * @return The gpu_mode string (internal, must NOT be freed or modified).
  */
-bool config_get_notifications(const AppConfig* config);
+const char* config_get_gpu_mode(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

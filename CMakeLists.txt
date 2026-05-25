@@ -69,6 +69,7 @@ set(SOURCES
     src/app_audio.c
     src/app_whisper.c
     src/app_model_info.c
+    src/app_gpu.c
     src/app_config.c
     src/app_config_dialog.c
     src/app_clipboard.c

@@ -14,7 +14,6 @@
  *   - Language selection (combo box dropdown — ISO 639-1 codes)
  *   - Maximum recording duration (spin button — 5 to 30 seconds)
  *   - Window position reset (button)
- *   - Desktop notifications enable/disable (check button)
  *   - D-Bus hotkey command display (read-only label)
  *
  * The dialog is launched as a modal window when the user clicks the gear
@@ -39,8 +38,6 @@
 
 /* Forward declarations */
 struct _AppConfig;
-struct _WhisperClient;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -79,7 +76,7 @@ typedef struct _ConfigDialog ConfigDialog;
  * is closed (Save or Cancel).
  *
  * The function performs the following steps:
- *   1. Create a GTK Dialog window with title "Configuration"
+ *   1. Create a GTK Dialog window with title "Transcriber Settings"
  *   2. Set the dialog as modal and transient to the parent window
  *   3. Populate all widgets with current config values
  *   4. Query available audio devices for the dropdown
@@ -90,7 +87,7 @@ typedef struct _ConfigDialog ConfigDialog;
  *  10. Return the result
  *
  * The dialog window has the following properties:
- *   - Title: "Configuration"
+ *   - Title: "Transcriber Settings"
  *   - Modal: true (blocks parent window)
  *   - Resizable: false (fixed size)
  *   - Destroy with parent: true
@@ -101,9 +98,6 @@ typedef struct _ConfigDialog ConfigDialog;
  * @param config        Pointer to the AppConfig struct to edit. The dialog
  *                      reads current values from this struct and writes
  *                      new values on Save. Must not be NULL.
- * @param whisper_client Pointer to a WhisperClient for the Test Connection
- *                      button. May be NULL (button will be insensitive).
- *
  * @return true if the user clicked "Save" and configuration was updated,
  *         false if the user clicked "Cancel" or the dialog was closed
  *         via window manager (X button).
@@ -117,8 +111,7 @@ typedef struct _ConfigDialog ConfigDialog;
  * @see FR-027: Save Configuration
  * @see FR-028: Cancel Configuration
  */
-bool config_dialog_show(GtkWindow* parent_window, struct _AppConfig* config,
-                         struct _WhisperClient* whisper_client);
+bool config_dialog_show(GtkWindow* parent_window, struct _AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 3: Audio Device Population

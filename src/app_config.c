@@ -10,6 +10,7 @@
  */
 
 #include "app_config.h"
+#include "app_gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,7 +193,7 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->model_path, "ggml-large-v3-turbo-q8_0.bin", sizeof(config->model_path) - 1);
     config->model_path[sizeof(config->model_path) - 1] = '\0';
 
-    strncpy(config->audio_device, "system_default", sizeof(config->audio_device) - 1);
+    strncpy(config->audio_device, "default", sizeof(config->audio_device) - 1);
     config->audio_device[sizeof(config->audio_device) - 1] = '\0';
 
     config->audio_device_display_name[0] = '\0';  /* No display name by default */
@@ -202,7 +203,9 @@ void config_set_defaults(AppConfig* config)
     config->window_x = 100;  /* Default position */
     config->window_y = 100;  /* Default position */
 
-    config->enable_notifications = true;
+    /* GPU mode — default to "auto" (select best GPU by free memory) */
+    strncpy(config->gpu_mode, gpu_mode_get_default(), sizeof(config->gpu_mode) - 1);
+    config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
 
     set_error(NULL);
 }
@@ -254,11 +257,12 @@ bool config_load_from_path(AppConfig* config, const char* path)
     }
 
     /* Get file size */
+    /* M-004 fix: Use off_t + ftello for portable file size handling */
     fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    off_t fsize = ftello(fp);
+    fseeko(fp, 0, SEEK_SET);
 
-    if (fsize <= 0 || fsize > 1024 * 1024) {
+    if (fsize <= 0 || fsize > (off_t)(1024 * 1024)) {
         /* File too small or too large */
         fclose(fp);
         set_error("Config file has invalid size");
@@ -336,9 +340,15 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "enable_notifications");
-    if (item && cJSON_IsBool(item)) {
-        config->enable_notifications = (cJSON_IsTrue(item) ? true : false);
+    /* GPU mode */
+    item = cJSON_GetObjectItemCaseSensitive(root, "gpu_mode");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        if (gpu_mode_validate(item->valuestring)) {
+            strncpy(config->gpu_mode, item->valuestring, sizeof(config->gpu_mode) - 1);
+            config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid gpu_mode \"%s\", using default\n", item->valuestring);
+        }
     }
 
     cJSON_Delete(root);
@@ -402,7 +412,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddNumberToObject(window_pos, "y", config->window_y);
     cJSON_AddItemToObject(root, "window_position", window_pos);
 
-    cJSON_AddBoolToObject(root, "enable_notifications", config->enable_notifications);
+    cJSON_AddStringToObject(root, "gpu_mode", config->gpu_mode);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -601,15 +611,28 @@ int config_get_window_y(const AppConfig* config)
     return config->window_y;
 }
 
-void config_set_notifications(AppConfig* config, bool enable)
+bool config_set_gpu_mode(AppConfig* config, const char* mode)
 {
-    if (!config) return;
-    config->enable_notifications = enable;
+    if (!config || !mode) {
+        set_error("NULL parameter");
+        return false;
+    }
+    if (!gpu_mode_validate(mode)) {
+        set_error("Invalid GPU mode string");
+        return false;
+    }
+    if (strlen(mode) >= sizeof(config->gpu_mode)) {
+        set_error("GPU mode string too long");
+        return false;
+    }
+    strncpy(config->gpu_mode, mode, sizeof(config->gpu_mode) - 1);
+    config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
+    return true;
 }
 
-bool config_get_notifications(const AppConfig* config)
+const char* config_get_gpu_mode(const AppConfig* config)
 {
-    if (!config) return true;
-    return config->enable_notifications;
+    if (!config) return "";
+    return config->gpu_mode;
 }
 

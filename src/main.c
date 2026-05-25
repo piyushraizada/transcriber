@@ -2,12 +2,7 @@
  * main.c — Application Entry Point, State Controller, Recording Lifecycle,
  *          Runtime Config Updates, Recording Completion Beep
  *
- * This file serves two purposes:
- *
- *   1. Implements the AppStateController API declared in app.h
- *      (lifecycle, state transitions, thread-safe accessors).
- *
- *   2. Provides the main() entry point that initializes all subsystems,
+ * This file provides the main() entry point that initializes all subsystems,
  *      creates the MainWindow, sets up D-Bus service, starts the GTK
  *      main loop, and handles graceful shutdown.
  *
@@ -66,6 +61,7 @@
 #include "app.h"
 #include "app_audio.h"
 #include "app_whisper.h"
+#include "whisper.h"
 #include "app_config.h"
 #include "app_config_dialog.h"
 #include "app_clipboard.h"
@@ -95,29 +91,43 @@ static void on_dbus_toggle(void *user_data);
 static void on_config_changed(void *user_data);
 static gboolean watchdog_timer_callback(gpointer user_data);
 static gpointer transcribe_thread_func(gpointer data);
-static gboolean volume_poll_callback(gpointer user_data);
+static gboolean volume_poll_callback(gpointer data);
 static gpointer model_loading_thread_func(gpointer data);
 static gboolean on_model_loaded_idle(gpointer data);
 static gboolean on_model_load_failed_idle(gpointer data);
 
+/* H-002 fix: Shutdown flag — declared early so idle callbacks can reference it */
+static volatile bool g_shutting_down = false;
+
 /* Wrappers for g_idle_add (GSourceFunc signature: gboolean (*)(gpointer)) */
 static gboolean on_transcription_result_idle(gpointer data) {
+    /* H-002 fix: Bail out early if application is shutting down */
+    if (g_shutting_down) {
+        g_free(data);
+        return FALSE;
+    }
     on_transcription_result((const char *)data, true, NULL);
     g_free(data);
     return FALSE;
 }
 
 static gboolean on_transcription_result_error_idle(gpointer data) {
+    /* H-002 fix: Bail out early if application is shutting down */
+    if (g_shutting_down) {
+        g_free(data);
+        return FALSE;
+    }
     on_transcription_result_error((const char *)data, false, NULL);
     g_free(data);
     return FALSE;
 }
 
-static gboolean on_connection_status_idle(gpointer data) {
-    ConnectionStatus status = (ConnectionStatus)GPOINTER_TO_INT(data);
-    on_connection_status_change(status, NULL);
+/* Wrapper for g_timeout_add: GSourceFunc signature requires gboolean return */
+static gboolean auto_close_dialog(gpointer data) {
+    gtk_widget_destroy(GTK_WIDGET(data));
     return FALSE;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Global application state (accessible from callbacks)                */
@@ -134,11 +144,19 @@ static guint g_transcription_watchdog_source_id = 0;
 static guint g_volume_poll_source_id = 0;
 static SystemTray *g_tray = NULL;
 static char g_current_wav_path[PATH_MAX];
+/* TRUE when model loading was triggered by user click (lazy loading).
+ * Causes on_model_loaded_idle to auto-transition to LISTENING on success.
+ * FALSE when model loading was triggered at startup (just clear WAIT). */
+static bool g_model_loading_from_toggle = FALSE;
 static pthread_mutex_t g_wav_path_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* HI-04 fix: Store transcription thread handle for clean shutdown */
 static GThread *g_transcribe_thread = NULL;
 static pthread_mutex_t g_transcribe_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* H-001 fix: Store model loading thread handle for clean shutdown */
+static GThread *g_model_load_thread = NULL;
+static pthread_mutex_t g_model_load_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Volume poll interval (milliseconds) — ~10fps for smooth updates */
 #define VOLUME_POLL_INTERVAL_MS 100
@@ -301,10 +319,8 @@ static void on_config_changed(void *user_data) {
         const char *device = config_get_audio_device(g_controller.config);
         if (device && device[0] != '\0') {
             audio_recorder_set_device(g_audio_recorder, device);
-            fprintf(stderr, "[config] Updated audio device to: %s\n", device);
         } else {
             audio_recorder_set_device(g_audio_recorder, NULL);
-            fprintf(stderr, "[config] Reset audio device to default\n");
         }
     }
 }
@@ -584,9 +600,11 @@ static gpointer model_loading_thread_func(gpointer data) {
     const char *model_path = config_get_model_path(g_controller.config);
     whisper_client_set_model_path(g_whisper_client, model_path);
 
-    /* Load the model - GPU_INDEX_AUTO = -1 means auto-detect GPU, fallback to CPU.
+    /* Load the model with GPU mode from config.
+     * gpu_mode can be "auto", "cpu", or "gpu:N".
      * This blocks until the model is loaded (or fails). */
-    bool loaded = whisper_client_load_model(g_whisper_client, -1); /* GPU_INDEX_AUTO */
+    const char *gpu_mode = config_get_gpu_mode(g_controller.config);
+    bool loaded = whisper_client_load_model(g_whisper_client, gpu_mode);
 
     /* Marshal result back to GTK main thread */
     if (loaded) {
@@ -601,10 +619,21 @@ static gpointer model_loading_thread_func(gpointer data) {
 }
 
 /**
- * GTK idle callback: model loaded successfully — transition to LISTENING.
+ * GTK idle callback: model loaded successfully — clear "WAIT" indicator.
+ * If the loading was triggered by user click (lazy loading), also
+ * auto-transition to LISTENING to start recording.
  */
 static gboolean on_model_loaded_idle(gpointer data) {
     (void)data;
+
+    /* Capture and clear the flag before any potential re-entry */
+    bool from_toggle = g_model_loading_from_toggle;
+    g_model_loading_from_toggle = FALSE;
+
+    /* Clear the "WAIT" overlay from the icon */
+    if (g_main_window) {
+        app_window_set_model_loading(g_main_window, FALSE);
+    }
 
     /* Update connection status to connected */
     app_set_connection_status(&g_controller, CONNECTION_CONNECTED);
@@ -615,19 +644,26 @@ static gboolean on_model_loaded_idle(gpointer data) {
         tray_set_connection_status(g_tray, CONNECTION_CONNECTED);
     }
 
-    fprintf(stderr, "[main] Model loaded successfully, transitioning to LISTENING\n");
-
-    /* Toggle to LISTENING state — this starts recording */
-    app_toggle_state(&g_controller);
+    /* If loading was triggered by user click, auto-transition to LISTENING */
+    if (from_toggle) {
+        app_toggle_state(&g_controller);
+    }
 
     return FALSE;
 }
 
 /**
- * GTK idle callback: model loading failed — show error dialog.
+ * GTK idle callback: model loading failed — show error, clear "WAIT".
+ * Falls back to disconnected state so lazy loading on first click
+ * can still attempt to load the model.
  */
 static gboolean on_model_load_failed_idle(gpointer data) {
     char *error_msg = (char *)data;
+
+    /* Clear the "WAIT" overlay from the icon */
+    if (g_main_window) {
+        app_window_set_model_loading(g_main_window, FALSE);
+    }
 
     /* Reset connection status to disconnected */
     app_set_connection_status(&g_controller, CONNECTION_DISCONNECTED);
@@ -638,19 +674,25 @@ static gboolean on_model_load_failed_idle(gpointer data) {
         tray_set_connection_status(g_tray, CONNECTION_DISCONNECTED);
     }
 
-    /* Show error dialog */
-    GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
-    GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
-        parent,
-        GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
-        GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_OK,
-        "Failed to load Whisper model.\n\n%s\n\n"
-        "Please check that the model file exists, is not corrupted, "
-        "and is compatible with your system.", error_msg ? error_msg : "Unknown error"));
-    gtk_window_set_title(GTK_WINDOW(dialog), "Model Load Failed");
-    gtk_dialog_run(dialog);
-    gtk_widget_destroy(GTK_WIDGET(dialog));
+    /* M-005 fix: Show non-modal, auto-closing warning dialog.
+     * Using gtk_window_present() + response signal instead of gtk_dialog_run()
+     * to avoid blocking the GTK main loop. The dialog auto-closes after 8 seconds. */
+    {
+        GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
+        GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
+            parent,
+            GTK_DIALOG_DESTROY_WITH_PARENT,  /* Non-modal — does not block main loop */
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_OK,
+            "Failed to load Whisper model at startup.\n\n%s\n\n"
+            "The application will attempt to load the model when you "
+            "first click the microphone icon.", error_msg ? error_msg : "Unknown error"));
+        gtk_window_set_title(GTK_WINDOW(dialog), "Model Load Warning");
+        /* Auto-close after 8 seconds */
+        g_timeout_add_seconds(8, auto_close_dialog, dialog);
+        /* Present without blocking */
+        gtk_window_present(GTK_WINDOW(dialog));
+    }
 
     g_free(error_msg);
     return FALSE;
@@ -668,6 +710,10 @@ static gboolean on_model_load_failed_idle(gpointer data) {
  * while the model is being loaded. Once loaded, recording starts.
  * This prevents the application from crashing at startup or config
  * dialog open due to GPU initialization issues.
+ *
+ * STARTUP-LOADING: If the model is still loading from startup
+ * (indicated by model_loading==TRUE on the MainWindow), reject the
+ * click and let the user know to wait.
  */
 static void on_microphone_toggle(void *user_data) {
     (void)user_data;
@@ -675,6 +721,50 @@ static void on_microphone_toggle(void *user_data) {
     /* HI-03 fix: Only check local model when starting recording (IDLE -> LISTENING) */
     AppState current = app_get_state(&g_controller);
     if (current == STATE_IDLE) {
+        /* STARTUP-LOADING: If model is still loading from startup,
+         * reject the click. The "WAIT" overlay on the icon should
+         * have made this clear to the user. */
+        if (g_main_window && app_window_get_model_loading(g_main_window)) {
+            return;  /* Model still loading — ignore click */
+        }
+        /* CFG-015: Validate that the configured audio device is available */
+        {
+            const char *configured_device = config_get_audio_device(g_controller.config);
+            bool device_valid = false;
+
+            /* "default" is always valid — ALSA will use the system default */
+            if (configured_device && g_strcmp0(configured_device, "default") == 0) {
+                device_valid = true;
+            } else if (configured_device && configured_device[0] != '\0') {
+                /* Check if the configured device exists in the available device list */
+                AudioDeviceList *devices = audio_recorder_get_device_list(g_audio_recorder);
+                if (devices) {
+                    for (gint i = 0; i < devices->count; i++) {
+                        if (g_strcmp0(devices->device_names[i], configured_device) == 0) {
+                            device_valid = true;
+                            break;
+                        }
+                    }
+                    audio_device_list_free(devices);
+                }
+            }
+
+            if (!device_valid) {
+                GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
+                GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
+                    parent,
+                    GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_ERROR,
+                    GTK_BUTTONS_OK,
+                    "The configured microphone is not available.\n\n"
+                    "Please select a valid microphone in Transcriber Settings."));
+                gtk_window_set_title(GTK_WINDOW(dialog), "Microphone Not Available");
+                gtk_dialog_run(dialog);
+                gtk_widget_destroy(GTK_WIDGET(dialog));
+                return; /* Abort — do not start recording */
+            }
+        }
+
         /* Check that a valid GGUF model file is configured and accessible */
         const char *model_path = config_get_model_path(g_controller.config);
         if (!model_path || model_path[0] == '\0' ||
@@ -685,7 +775,7 @@ static void on_microphone_toggle(void *user_data) {
                 GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
                 GTK_MESSAGE_ERROR,
                 GTK_BUTTONS_OK,
-                "No valid whisper ggml file found.\n\n"
+                APP_ERROR_NO_VALID_MODEL ".\n\n"
                 "Please configure a valid Whisper model file in Settings."));
             gtk_window_set_title(GTK_WINDOW(dialog), "Model Not Found");
             gtk_dialog_run(dialog);
@@ -723,41 +813,44 @@ static void on_microphone_toggle(void *user_data) {
 
         /* MODEL-LOADING: If model file exists but is not yet loaded,
          * start loading in a background thread with LOADING indicator.
-         * Only transition to LISTENING once loading completes. */
+         * Set flag so on_model_loaded_idle auto-transitions to LISTENING. */
         if (g_whisper_client && !whisper_client_is_model_loaded(g_whisper_client) &&
             !whisper_client_is_loading(g_whisper_client)) {
+
+            /* Mark that this load was triggered by user click,
+             * so on_model_loaded_idle will auto-transition to LISTENING */
+            g_model_loading_from_toggle = TRUE;
 
             /* Set model path */
             const char *model_path = config_get_model_path(g_controller.config);
             whisper_client_set_model_path(g_whisper_client, model_path);
 
-            /* Show LOADING indicator */
+            /* Show LOADING indicator and "WAIT" overlay */
             app_set_connection_status(&g_controller, CONNECTION_LOADING);
             if (g_main_window) {
                 app_window_set_connection_status(g_main_window, CONNECTION_LOADING);
+                app_window_set_model_loading(g_main_window, TRUE);
             }
             if (g_tray) {
                 tray_set_connection_status(g_tray, CONNECTION_LOADING);
             }
 
-            fprintf(stderr, "[main] Starting model loading in background thread\n");
-
-            /* Start background thread to load the model */
-            GThread *load_thread = g_thread_new("model_loading",
+            /* H-001 fix: Store model loading thread handle for clean shutdown */
+            pthread_mutex_lock(&g_model_load_thread_mutex);
+            g_model_load_thread = g_thread_new("model_loading",
                                   model_loading_thread_func, NULL);
-            (void)load_thread; /* Thread is detached — runs to completion */
+            pthread_mutex_unlock(&g_model_load_thread_mutex);
 
             return; /* Wait for loading to complete before recording */
         }
 
         /* If model is already loading (another click), just return */
         if (g_whisper_client && whisper_client_is_loading(g_whisper_client)) {
-            fprintf(stderr, "[main] Model is already loading, ignoring toggle\n");
             return;
         }
     }
 
-    /* Toggle the state — state_monitor_callback will handle the actual work.
+    /* Toggle the state — on_state_change callback will handle the actual work.
      * If we reach here, either:
      * 1. Model was already loaded (normal fast path)
      * 2. User is stopping recording (LISTENING -> TRANSCRIBING)
@@ -774,103 +867,99 @@ static void on_dbus_toggle(void *user_data) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Connection Check                                                    */
+/* Startup Model Loading                                               */
 /* ------------------------------------------------------------------ */
 
 /**
- * Perform an initial connection check to verify the local Whisper model.
- * Runs in a background thread to avoid blocking the GTK main loop.
+ * Load the Whisper model at startup in a background thread.
+ * The MainWindow displays a "WAIT" overlay on the mic icon until
+ * loading completes. On success, "WAIT" is removed and the
+ * connection indicator turns green. On failure, "WAIT" is removed,
+ * the indicator turns red, and a non-blocking warning is shown.
+ * The user can still attempt lazy loading on first click.
  */
-static gpointer connection_check_thread_func(gpointer data) {
-    (void)data;
-
-    if (g_whisper_client) {
-        bool connected = whisper_check_connection(g_whisper_client);
-
-        ConnectionStatus status = connected ? CONNECTION_CONNECTED
-                                            : CONNECTION_DISCONNECTED;
-
-        /* Update the controller state */
-        app_set_connection_status(&g_controller, status);
-
-        /* Marshal UI update to the GTK main thread */
-        g_idle_add(on_connection_status_idle,
-                   GINT_TO_POINTER((int)status));
-    }
-
-    return NULL;
-}
-
-/**
- * Start the initial connection check.
- */
-static void perform_initial_connection_check(void) {
+static void perform_initial_model_load(void) {
     if (!g_whisper_client) return;
 
+    /* Validate model path before attempting load */
     const char *model_path = config_get_model_path(g_controller.config);
-    whisper_client_set_model_path(g_whisper_client, model_path);
-
-    /* Set status to CHECKING */
-    app_set_connection_status(&g_controller, CONNECTION_CHECKING);
-    if (g_main_window) {
-        app_window_set_connection_status(g_main_window, CONNECTION_CHECKING);
+    if (!model_path || model_path[0] == '\0') {
+        /* No model configured — clear WAIT, show disconnected */
+        if (g_main_window) {
+            app_window_set_model_loading(g_main_window, FALSE);
+        }
+        app_set_connection_status(&g_controller, CONNECTION_DISCONNECTED);
+        if (g_main_window) {
+            app_window_set_connection_status(g_main_window, CONNECTION_DISCONNECTED);
+        }
+        return;
     }
 
-    /* Start the connection check in a background thread */
-    g_thread_new("connection_check", connection_check_thread_func, NULL);
+    /* Set model path */
+    whisper_client_set_model_path(g_whisper_client, model_path);
+
+    /* Show LOADING indicator on the status bar */
+    app_set_connection_status(&g_controller, CONNECTION_LOADING);
+    if (g_main_window) {
+        app_window_set_connection_status(g_main_window, CONNECTION_LOADING);
+    }
+    if (g_tray) {
+        tray_set_connection_status(g_tray, CONNECTION_LOADING);
+    }
+
+    /* The "WAIT" overlay is already active (set to TRUE in app_window_create).
+      * Start background thread to load the model. */
+    /* H-001 fix: Store model loading thread handle for clean shutdown */
+    pthread_mutex_lock(&g_model_load_thread_mutex);
+    g_model_load_thread = g_thread_new("startup_model_load",
+                                       model_loading_thread_func, NULL);
+    pthread_mutex_unlock(&g_model_load_thread_mutex);
 }
 
 /* ------------------------------------------------------------------ */
-/* State Change Monitoring                                             */
+/* State Change Callback (direct invocation on transition)             */
 /* ------------------------------------------------------------------ */
 
 /**
- * Idle callback to monitor state changes and trigger handlers.
- * This runs in the GTK main loop and detects state transitions.
+ * Direct state change callback invoked by the state controller
+ * on each successful transition. Replaces the polling-based
+ * state_monitor_callback pattern for zero-latency response.
+ *
+ * This callback is invoked from the GTK main thread, as all
+ * callers of app_transition_to/app_toggle_state run on that thread.
  */
-static AppState g_last_monitored_state = STATE_IDLE;
-
-static gboolean state_monitor_callback(gpointer user_data) {
+static void on_state_change(AppState new_state, void *user_data) {
     (void)user_data;
 
-    AppState current = app_get_state(&g_controller);
-
-    if (current != g_last_monitored_state) {
-        /* State has changed — trigger appropriate handler */
-        switch (current) {
-            case STATE_LISTENING:
-                handle_enter_listening();
-                break;
-            case STATE_TRANSCRIBING:
+    switch (new_state) {
+        case STATE_LISTENING:
+            handle_enter_listening();
+            break;
+        case STATE_TRANSCRIBING:
+            if (g_audio_recorder) {
+                audio_recorder_stop(g_audio_recorder);
+            }
+            {
+                const char *path = NULL;
                 if (g_audio_recorder) {
-                    audio_recorder_stop(g_audio_recorder);
+                    path = audio_recorder_get_wav_path(g_audio_recorder);
                 }
-                {
-                    const char *path = NULL;
-                    if (g_audio_recorder) {
-                        path = audio_recorder_get_wav_path(g_audio_recorder);
-                    }
-                    if (path && path[0] != '\0') {
-                        handle_enter_transcribing(path);
-                    } else {
-                        app_transition_to(&g_controller, STATE_IDLE);
-                        g_last_monitored_state = STATE_IDLE;
-                        if (g_main_window) {
-                            app_window_set_state(g_main_window, STATE_IDLE);
-                        }
+                if (path && path[0] != '\0') {
+                    handle_enter_transcribing(path);
+                } else {
+                    app_transition_to(&g_controller, STATE_IDLE);
+                    if (g_main_window) {
+                        app_window_set_state(g_main_window, STATE_IDLE);
                     }
                 }
-                break;
-            case STATE_IDLE:
-                if (g_main_window) {
-                    app_window_set_state(g_main_window, STATE_IDLE);
-                }
-                break;
-        }
-        g_last_monitored_state = current;
+            }
+            break;
+        case STATE_IDLE:
+            if (g_main_window) {
+                app_window_set_state(g_main_window, STATE_IDLE);
+            }
+            break;
     }
-
-    return TRUE; /* Continue monitoring */
 }
 
 /* ------------------------------------------------------------------ */
@@ -881,6 +970,9 @@ int main(int argc, char *argv[]) {
 
     /* Initialize GTK */
     gtk_init(&argc, &argv);
+
+    /* Suppress whisper.cpp library internal log output */
+    whisper_log_set(NULL, NULL);
 
     /* Load configuration */
     AppConfig config;
@@ -894,6 +986,7 @@ int main(int argc, char *argv[]) {
                                   on_transcription_result,
                                   on_connection_status_change,
                                   on_recording_stop,
+                                  on_state_change,
                                   NULL) != 0) {
         return 1;
     }
@@ -956,14 +1049,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Add state monitor to the GTK main loop */
-    g_idle_add(state_monitor_callback, NULL);
-
-    /* Show the main window */
+    /* Show the main window (with "WAIT" overlay on the mic icon) */
     gtk_widget_show_all(GTK_WIDGET(gtk_win));
 
-    /* Perform initial connection check */
-    perform_initial_connection_check();
+    /* Load the Whisper model at startup in a background thread.
+     * The window shows "WAIT" overlay on the red mic icon until
+     * the model is fully loaded. Once loaded, "WAIT" is removed
+     * and the connection indicator turns green. This eliminates
+     * the lag when the user first clicks the mic to start recording. */
+    perform_initial_model_load();
 
     /* Start the GTK main loop */
     gtk_main();
@@ -971,6 +1065,9 @@ int main(int argc, char *argv[]) {
     /* ------------------------------------------------------------------ */
     /* Shutdown                                                            */
     /* ------------------------------------------------------------------ */
+
+    /* H-002 fix: Set shutdown flag to prevent idle callbacks from accessing freed resources */
+    g_shutting_down = true;
 
     /* Reset volume level tracking */
     g_last_volume_level = -1.0;
@@ -1012,7 +1109,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* HI-04 fix: Gracefully cancel and join any in-flight transcription thread
-     * before destroying the client. This prevents use-after-free during shutdown. */
+      * before destroying the client. This prevents use-after-free during shutdown. */
     if (g_whisper_client) {
         whisper_client_cancel(g_whisper_client);
     }
@@ -1024,6 +1121,14 @@ int main(int argc, char *argv[]) {
         g_transcribe_thread = NULL;
     }
     pthread_mutex_unlock(&g_transcribe_thread_mutex);
+
+    /* H-001 fix: Join the model loading thread if it's still running */
+    pthread_mutex_lock(&g_model_load_thread_mutex);
+    if (g_model_load_thread) {
+        g_thread_join(g_model_load_thread);
+        g_model_load_thread = NULL;
+    }
+    pthread_mutex_unlock(&g_model_load_thread_mutex);
 
     if (g_whisper_client) {
         whisper_client_destroy(g_whisper_client);
