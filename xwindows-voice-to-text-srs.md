@@ -120,7 +120,7 @@ The application is built on a multi-threaded architecture managed by a **Central
 
 | Thread | Responsibility | Key Operations |
 |--------|---------------|----------------|
-| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC polling via `g_timeout_source_new(100)` timer-based dispatch (avoiding `dbus_connection_get_unix_fd()` crash risk), system tray icon updates via libappindicator |
+| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC via GDBus (GIO) integrated into the GLib main loop, system tray icon updates via libappindicator |
 | **Audio Thread** | Real-time PCM capture | Captures audio from ALSA using real-time priority scheduling. Writes raw PCM frames to a temporary WAV file. Suspended in `STATE_IDLE`, active in `STATE_LISTENING`. |
 | **Transcription Thread** | Local whisper.cpp model processing | Loads GGML model file, reads WAV samples, runs `whisper_full()` for local transcription. Supports GPU (CUDA) acceleration with CPU fallback. Active only in `STATE_TRANSCRIBING`. |
 
@@ -1326,7 +1326,7 @@ The application does not manage hotkey assignments internally. Instead, users co
 
 ### 8.2 D-Bus Interface Specification
 
-The application registers the following D-Bus interface on startup using `libdbus-1`:
+The application registers the following D-Bus interface on startup using GDBus (GIO):
 
 | Property | Value |
 |----------|-------|
@@ -1340,7 +1340,7 @@ The `Toggle` method takes no parameters and returns no values. It simply toggles
 ### 8.3 Application Behavior (The Listener)
 
 On startup, the application:
-1. Uses `libdbus-1` to connect to the user's Session Bus
+1. Uses GDBus (GIO) to connect to the user's Session Bus
 2. Requests the well-known bus name `org.xvoice.Controller`
 3. Registers the object path `/org/xvoice/App` with interface `org.xvoice.Actions`
 4. Binds the `Toggle` method to the internal state-toggle handler
@@ -1728,7 +1728,7 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Required Functions**: `cJSON_Parse`
 
 #### DEP-013: D-Bus Library
-- **Name**: libdbus-1
+- **Name**: GDBus (GIO)
 - **Minimum Version**: 1.12
 - **Purpose**: D-Bus IPC for hotkey toggle interface
 - **Required Functions**: `dbus_bus_get`, `dbus_connection_send`
@@ -2197,7 +2197,7 @@ This section documents the validation of the SRS by specialized domain experts, 
 **Findings**:
 - MainWindow correctly uses `gtk_window_set_decorated(FALSE)` to disable decorations, `gtk_window_set_resizable(FALSE)` to prevent resizing, and `gtk_window_set_title()` for proper window naming. GTK3 handles `_MOTIF_WM_HINTS`, `XSizeHints`, and `WM_NAME`/`_NET_WM_NAME` automatically via the GTK backend.
 - TextWindow correctly uses `gtk_window_set_transient_for()` for proper window stacking, and the `delete-event` signal for graceful hiding. GTK3 sets `WM_TRANSIENT_FOR` and `_NET_WM_WINDOW_TYPE_UTILITY` automatically for transient dialogs.
-- D-Bus integration uses a timer-based polling approach via `g_timeout_source_new(100)` (100ms interval) to avoid `dbus_connection_get_unix_fd()` which can crash in some environments. The periodic `dbus_connection_read_write()` call processes messages within the GLib main context, preventing blocking.
+- D-Bus integration uses GDBus (GIO), which integrates natively with the GLib main loop for event-driven message processing, eliminating the need for manual polling and avoiding potential crashes associated with low-level D-Bus file descriptor handling.
 - D-Bus bus name ownership (`org.xvoice.Controller`) correctly prevents ghost instance launches.
 - Wayland compatibility correctly addressed: GTK3 natively supports Wayland via the `gtk-wayland` backend (falling back to X11 via `gtk-x11`). The D-Bus hotkey approach circumvents global-keylogger restrictions on Wayland, while GTK3 handles the display backend transparently.
 - **Status**: APPROVED

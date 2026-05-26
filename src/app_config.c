@@ -102,8 +102,12 @@ static char* expand_tilde(const char* path)
 {
     const char* home = getenv("HOME");
     if (!home) {
-        /* Fallback */
-        return strdup(path);
+        /* Fallback — HOME not set, return copy of original path */
+        char* result = strdup(path);
+        if (!result) {
+            set_error("Memory allocation failed in expand_tilde (strdup)");
+        }
+        return result;
     }
 
     if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
@@ -114,11 +118,17 @@ static char* expand_tilde(const char* path)
             memcpy(expanded, home, home_len);
             memcpy(expanded + home_len, path + 1, rest_len);
             expanded[home_len + rest_len] = '\0';
+        } else {
+            set_error("Memory allocation failed in expand_tilde (malloc)");
         }
         return expanded;
     }
 
-    return strdup(path);
+    char* result = strdup(path);
+    if (!result) {
+        set_error("Memory allocation failed in expand_tilde (strdup)");
+    }
+    return result;
 }
 
 /*---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ bool gpu_get_device_name(int device_idx, char *name_out, size_t name_size)
                 device_idx, cudaGetErrorString(err));
         return false;
     }
-    snprintf(name_out, name_size, "%.*s", (int)(name_size > 0 ? name_size - 1 : 0), prop.name);
+    snprintf(name_out, name_size, "%.*s", (int)(name_size - 1), prop.name);
     return true;
 }
 

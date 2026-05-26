@@ -15,31 +15,17 @@
  * behavior by claiming a well-known bus name.
  *
  * Architecture:
- *   - Uses libdbus-1 for D-Bus session bus communication
- *   - Integrates with GTK main loop via GSource wrapper around D-Bus file descriptor
- *   - Exponential backoff retry for bus connection
+ *   - Uses GDBus (GIO) for D-Bus session bus communication
+ *   - Integrates natively with GLib/GTK main loop (no polling required)
+ *   - Single-instance check via synchronous GetNameOwner call
  *   - Graceful degradation when D-Bus is unavailable
  */
 
-#define _POSIX_C_SOURCE 199309L
-
 #include "app_dbus.h"
-#include <dbus/dbus.h>
+#include <gio/gio.h>
 #include <glib.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <time.h>
-
-/* ------------------------------------------------------------------ */
-/* Internal constants                                                  */
-/* ------------------------------------------------------------------ */
-
-#define DBUS_RETRY_MAX_ATTEMPTS 5
-#define DBUS_RETRY_INITIAL_DELAY_MS 100
-#define DBUS_RETRY_MAX_DELAY_MS 1000
 
 /* ------------------------------------------------------------------ */
 /* Internal structures                                                 */
@@ -48,33 +34,62 @@
 /**
  * Internal D-Bus service state.
  *
- * connection:    DBusConnection* to the session bus (NULL if not connected)
- * owner_id:      Unique name owner ID from dbus_bus_request_name()
+ * introspection: Parsed D-Bus introspection XML (describes our interface)
+ * owner_id:      Return value from g_bus_own_name() (0 = not owned)
  * callback:      Function pointer for toggle method handler
  * user_data:     User data passed to callback
- * source:        GSource for integrating D-Bus FD into GTK main loop
- * source_funcs:  GSourceFuncs table for the GSource
  * error_msg:     Human-readable error message buffer
  */
 struct _DBusService {
-    DBusConnection *connection;
-    int owner_id;
+    GDBusNodeInfo    *introspection;
+    guint             owner_id;
     dbus_toggle_callback callback;
-    void *user_data;
-    GSource *source;
-    char error_msg[256];
+    void             *user_data;
+    char              error_msg[256];
 };
 
 /* ------------------------------------------------------------------ */
 /* Static helper function declarations                                 */
 /* ------------------------------------------------------------------ */
 
-/* Renamed from dbus_set_error to avoid conflict with D-Bus library's dbus_set_error() */
 static void dbus_service_set_error(DBusService *service, const char *msg);
-static gboolean dbus_setup_main_loop_integration(DBusService *service);
-static gboolean dbus_dispatch_timeout(gpointer user_data);
-static void dbus_handle_method_call(DBusService *service, DBusMessage *msg);
-static void dbus_send_error_reply(DBusService *service, DBusMessage *msg, const char *error_name, const char *error_msg);
+static GDBusNodeInfo *parse_introspection(void);
+
+/* GDBus method handler — forward declaration for vtable below */
+static void on_toggle_method(GDBusConnection       *connection,
+                              const gchar           *sender,
+                              const gchar           *object_path,
+                              const gchar           *interface_name,
+                              const gchar           *method_name,
+                              GVariant              *parameters,
+                              GDBusMethodInvocation *invocation,
+                              gpointer               user_data);
+
+/* D-Bus interface vtable — defined at file scope to avoid static inside function */
+static const GDBusInterfaceVTable g_dbus_vtable = {
+    .method_call = on_toggle_method,
+};
+
+/* GDBus name ownership callbacks */
+static void on_bus_acquired(GDBusConnection *connection,
+                            const gchar     *name,
+                            gpointer         user_data);
+static void on_name_acquired(GDBusConnection *connection,
+                             const gchar     *name,
+                             gpointer         user_data);
+static void on_name_lost(GDBusConnection *connection,
+                         const gchar     *name,
+                         gpointer         user_data);
+
+/* GDBus method handler */
+static void on_toggle_method(GDBusConnection       *connection,
+                             const gchar           *sender,
+                             const gchar           *object_path,
+                             const gchar           *interface_name,
+                             const gchar           *method_name,
+                             GVariant              *parameters,
+                             GDBusMethodInvocation *invocation,
+                             gpointer               user_data);
 
 /* ------------------------------------------------------------------ */
 /* Error management                                                    */
@@ -82,7 +97,6 @@ static void dbus_send_error_reply(DBusService *service, DBusMessage *msg, const 
 
 /**
  * Set an error message on the D-Bus service.
- * Renamed from dbus_set_error to avoid name conflict with D-Bus library.
  */
 static void dbus_service_set_error(DBusService *service, const char *msg) {
     if (!service || !msg) return;
@@ -91,7 +105,6 @@ static void dbus_service_set_error(DBusService *service, const char *msg) {
 
 /**
  * Get the last error message from the D-Bus service.
- * Matches header declaration: const char* dbus_service_get_error(const DBusService* service);
  */
 const char* dbus_service_get_error(const DBusService *service) {
     if (!service) return NULL;
@@ -99,128 +112,150 @@ const char* dbus_service_get_error(const DBusService *service) {
 }
 
 /* ------------------------------------------------------------------ */
-/* D-Bus timeout-based integration with GLib main loop                 */
+/* Introspection XML                                                   */
 /* ------------------------------------------------------------------ */
 
 /**
- * Periodic dispatch timeout - polls D-Bus for messages.
- * Uses a simple timeout-based approach to avoid dbus_connection_get_unix_fd()
- * which can crash in some environments.
- */
-static gboolean dbus_dispatch_timeout(gpointer user_data) {
-    DBusService *service = (DBusService *)user_data;
-    if (!service || !service->connection) {
-        return FALSE;
-    }
-
-    /* Use read_write (NOT read_write_dispatch) so messages remain in the
-     * queue for dbus_connection_pop_message() to consume.
-     * read_write_dispatch() would internally dispatch messages via slots,
-     * bypassing our pop-based handler. */
-    dbus_connection_read_write(service->connection, 0);
-    dbus_service_process_messages(service);
-
-    return TRUE; /* keep repeating */
-}
-
-/**
- * Set up D-Bus integration with the GLib main loop using a periodic timeout.
+ * Parse the D-Bus introspection XML that describes our service interface.
  *
- * Returns TRUE on success, FALSE on failure.
+ * This XML defines the org.xvoice.Actions interface with a single Toggle
+ * method that takes no parameters and returns no value.
+ *
+ * @return Parsed GDBusNodeInfo on success, NULL on failure.
  */
-static gboolean dbus_setup_main_loop_integration(DBusService *service) {
-    if (!service || !service->connection) {
-        return FALSE;
-    }
+static GDBusNodeInfo *parse_introspection(void) {
+    static const char xml[] =
+        "<node>"
+        "  <interface name=\"" DBUS_INTERFACE "\">"
+        "    <method name=\"" DBUS_METHOD_TOGGLE "\">"
+        "      <arg direction=\"out\" type=\"b\" name=\"success\"/>"
+        "    </method>"
+        "  </interface>"
+        "</node>";
 
-    /* Set up a periodic dispatch timeout (100ms interval) */
-    service->source = g_timeout_source_new(100);
-    if (service->source) {
-        g_source_set_callback(service->source, dbus_dispatch_timeout, service, NULL);
-        g_source_set_priority(service->source, G_PRIORITY_HIGH);
-        g_source_attach(service->source, NULL);
+    GError *error = NULL;
+    GDBusNodeInfo *info = g_dbus_node_info_new_for_xml(xml, &error);
+    if (error) {
+        g_critical("GDBus: Failed to parse introspection XML: %s", error->message);
+        g_error_free(error);
+        return NULL;
     }
-
-    return TRUE;
+    return info;
 }
 
 /* ------------------------------------------------------------------ */
-/* D-Bus method call handling                                          */
+/* GDBus method handler                                                */
 /* ------------------------------------------------------------------ */
 
 /**
- * Send an error reply to a D-Bus method call.
+ * Handle the Toggle method call from external clients.
+ *
+ * When a desktop environment hotkey triggers:
+ *   dbus-send --session --dest=org.xvoice.Controller \
+ *     /org/xvoice/App org.xvoice.Actions.Toggle
+ *
+ * This handler is invoked by GDBus automatically. It calls the registered
+ * toggle callback (which performs the state machine transition), then
+ * sends a success reply.
  */
-static void dbus_send_error_reply(DBusService *service, DBusMessage *msg, const char *error_name, const char *error_msg) {
-    if (!service || !msg) return;
+static void on_toggle_method(GDBusConnection       *connection,
+                             const gchar           *sender,
+                             const gchar           *object_path,
+                             const gchar           *interface_name,
+                             const gchar           *method_name,
+                             GVariant              *parameters,
+                             GDBusMethodInvocation *invocation,
+                             gpointer               user_data)
+{
+    (void)connection;
+    (void)sender;
+    (void)object_path;
+    (void)interface_name;
+    (void)method_name;
+    (void)parameters;
 
-    DBusMessage *reply = dbus_message_new_error(msg, error_name, error_msg);
-    if (reply) {
-        dbus_connection_send(service->connection, reply, NULL);
-        dbus_message_unref(reply);
+    DBusService *service = (DBusService *)user_data;
+
+    /* Invoke the toggle callback if registered */
+    if (service && service->callback) {
+        service->callback(service->user_data);
     }
+
+    /* Send success reply with explicit return type matching introspection XML */
+    g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", true));
 }
 
+/* ------------------------------------------------------------------ */
+/* GDBus name ownership callbacks                                      */
+/* ------------------------------------------------------------------ */
+
 /**
- * Handle a D-Bus method call message.
- * Currently only handles the ToggleMicrophone method.
+ * Called when the D-Bus connection is acquired and our name is ready.
+ * This is where we register the method handler for our interface.
  */
-static void dbus_handle_method_call(DBusService *service, DBusMessage *msg) {
-    if (!service || !msg) return;
+static void on_bus_acquired(GDBusConnection *connection,
+                            const gchar     *name,
+                            gpointer         user_data)
+{
+    (void)name;
 
-    /* Check if this is the ToggleMicrophone method */
-    const char *member = dbus_message_get_member(msg);
-    if (!member) return;
+    DBusService *service = (DBusService *)user_data;
 
-    if (strcmp(member, DBUS_METHOD_TOGGLE) == 0) {
-        /* Invoke the toggle callback if registered */
-        if (service->callback) {
-            service->callback(service->user_data);
-        }
+    if (!connection || !service || !service->introspection) {
+        return;
+    }
 
-        /* Send a success reply */
-        DBusMessage *reply = dbus_message_new_method_return(msg);
-        if (reply) {
-            dbus_connection_send(service->connection, reply, NULL);
-            dbus_message_unref(reply);
-        }
+    /* Get the interface definition from parsed introspection */
+    GDBusInterfaceInfo *iface = service->introspection->interfaces[0];
+    if (!iface) {
+        g_warning("GDBus: No interface found in introspection data");
+        return;
+    }
+
+    /* Register our object at /org/xvoice/App */
+    GError *error = NULL;
+    gboolean registered = g_dbus_connection_register_object(
+        connection,
+        DBUS_OBJECT_PATH,
+        iface,
+        &g_dbus_vtable,
+        service,
+        NULL,   // GDestroyNotify
+        &error
+    );
+
+    if (!registered) {
+        g_critical("GDBus: Failed to register object at %s: %s",
+                   DBUS_OBJECT_PATH, error->message);
+        g_error_free(error);
     } else {
-        /* Unknown method - send error */
-        dbus_send_error_reply(service, msg,
-                              "org.xvoice.Actions.Error.UnknownMethod",
-                              "Unknown method called");
+        g_message("GDBus: Registered object at %s with interface %s",
+                  DBUS_OBJECT_PATH, iface->name);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API - Message Processing                                     */
-/* ------------------------------------------------------------------ */
+/**
+ * Called when we successfully acquire the bus name.
+ */
+static void on_name_acquired(GDBusConnection *connection,
+                             const gchar     *name,
+                             gpointer         user_data)
+{
+    (void)connection;
+    (void)user_data;
+    g_message("GDBus: Acquired bus name '%s'", name);
+}
 
 /**
- * Process pending D-Bus messages.
- * Matches header declaration: bool dbus_service_process_messages(DBusService* service);
+ * Called when we lose the bus name (another process took it, or we released it).
  */
-bool dbus_service_process_messages(DBusService *service) {
-    if (!service || !service->connection) {
-        return false;
-    }
-
-    /* Pop and process all pending messages from the D-Bus connection.
-     * Note: We use pop_message rather than dispatch because the caller
-     * (dbus_dispatch_timeout) already called read_write to pull data
-     * off the socket. Messages are now queued internally and ready to pop. */
-    DBusMessage *msg;
-    bool processed = false;
-
-    while ((msg = dbus_connection_pop_message(service->connection))) {
-        if (dbus_message_get_type(msg) == DBUS_MESSAGE_TYPE_METHOD_CALL) {
-            dbus_handle_method_call(service, msg);
-            processed = true;
-        }
-        dbus_message_unref(msg);
-    }
-
-    return processed;
+static void on_name_lost(GDBusConnection *connection,
+                         const gchar     *name,
+                         gpointer         user_data)
+{
+    (void)connection;
+    (void)user_data;
+    g_warning("GDBus: Lost bus name '%s'", name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -229,21 +264,9 @@ bool dbus_service_process_messages(DBusService *service) {
 
 /**
  * Create and initialize a D-Bus service instance.
- * Matches header declaration: DBusService* dbus_service_create(void);
  */
 DBusService *dbus_service_create(void) {
-    DBusService *service = (DBusService *)calloc(1, sizeof(DBusService));
-    if (!service) {
-        return NULL;
-    }
-
-    service->connection = NULL;
-    service->owner_id = -1;
-    service->callback = NULL;
-    service->user_data = NULL;
-    service->source = NULL;
-    service->error_msg[0] = '\0';
-
+    DBusService *service = g_new0(DBusService, 1);
     return service;
 }
 
@@ -254,12 +277,18 @@ void dbus_service_destroy(DBusService *service) {
     if (!service) return;
 
     /* Stop the service if it's running */
-    if (service->connection) {
+    if (service->owner_id != 0) {
         dbus_service_stop(service);
     }
 
+    /* Free introspection data */
+    if (service->introspection) {
+        g_dbus_node_info_unref(service->introspection);
+        service->introspection = NULL;
+    }
+
     /* Free the service structure */
-    free(service);
+    g_free(service);
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,105 +297,133 @@ void dbus_service_destroy(DBusService *service) {
 
 /**
  * Start the D-Bus service and request the bus name.
- * Matches header declaration:
- *   bool dbus_service_start(DBusService* service, dbus_toggle_callback callback, void* user_data);
+ *
+ * Single-instance enforcement: Before requesting the bus name, we perform
+ * a synchronous D-Bus call to org.freedesktop.DBus.GetNameOwner. If the
+ * name already has an owner, another instance is running and we return
+ * false so the application can exit.
  */
-bool dbus_service_start(DBusService *service, dbus_toggle_callback callback, void *user_data) {
+bool dbus_service_start(DBusService *service,
+                        dbus_toggle_callback callback,
+                        void *user_data)
+{
     if (!service) return false;
+
+    /* Validate callback parameter (pre-condition: callback != NULL) */
+    if (!callback) {
+        dbus_service_set_error(service, "Toggle callback must not be NULL");
+        return false;
+    }
 
     /* Store callback and user data */
     service->callback = callback;
     service->user_data = user_data;
 
-    DBusError err;
-    dbus_error_init(&err);
-
-    /* Connect to the session bus */
-    service->connection = dbus_bus_get(DBUS_BUS_SESSION, &err);
-    if (dbus_error_is_set(&err)) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "D-Bus session bus connection failed: %s", err.message);
-        dbus_service_set_error(service, msg);
-        dbus_error_free(&err);
+    /* Parse introspection XML */
+    service->introspection = parse_introspection();
+    if (!service->introspection) {
+        dbus_service_set_error(service, "Failed to parse D-Bus introspection XML");
         return false;
     }
 
-    /* Request the well-known bus name */
-    service->owner_id = dbus_bus_request_name(
-        service->connection,
-        DBUS_BUS_NAME,
-        DBUS_NAME_FLAG_DO_NOT_QUEUE,
-        &err
+    /* Check if another instance already owns the bus name (single-instance) */
+    GError *call_error = NULL;
+    GDBusConnection *bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &call_error);
+
+    if (!bus) {
+        /* Cannot reach session bus — D-Bus unavailable */
+        if (call_error) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "D-Bus session bus unavailable: %s", call_error->message);
+            dbus_service_set_error(service, msg);
+            g_error_free(call_error);
+        } else {
+            dbus_service_set_error(service, "D-Bus session bus unavailable");
+        }
+        g_dbus_node_info_unref(service->introspection);
+        service->introspection = NULL;
+        return false;
+    }
+
+    /* Pass NULL for expected_return_type to skip type validation (avoids leak) */
+    GVariant *owner_var = g_dbus_connection_call_sync(
+        bus,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "GetNameOwner",
+        g_variant_new("(s)", DBUS_BUS_NAME),
+        NULL,  // expected_return_type — NULL skips type validation
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,    // no timeout
+        NULL,  // cancellable
+        &call_error
     );
 
-    if (dbus_error_is_set(&err)) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "D-Bus name request failed: %s", err.message);
-        dbus_service_set_error(service, msg);
-        dbus_error_free(&err);
-        /* Do NOT close shared connection - just clear pointer */
-        service->connection = NULL;
-        return false;
-    }
+    g_object_unref(bus);  // done with the connection
 
-    /* Check if we successfully acquired the name */
-    if (service->owner_id == DBUS_REQUEST_NAME_REPLY_EXISTS ||
-        service->owner_id == DBUS_REQUEST_NAME_REPLY_IN_QUEUE) {
-        /* Another instance is already running */
+    if (call_error != NULL) {
+        /* Error calling GetNameOwner — if it's NAME_HAS_NO_OWNER, that's good */
+        if (g_error_matches(call_error, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER)) {
+            /* No owner — we can claim the name */
+            g_error_free(call_error);
+        } else {
+            /* Real error (bus gone, timeout, etc.) */
+            char msg[256];
+            snprintf(msg, sizeof(msg), "D-Bus GetNameOwner failed: %s", call_error->message);
+            dbus_service_set_error(service, msg);
+            g_error_free(call_error);
+            g_dbus_node_info_unref(service->introspection);
+            service->introspection = NULL;
+            return false;
+        }
+    } else if (owner_var != NULL) {
+        /* Name is already owned — another instance is running */
+        g_variant_unref(owner_var);
         dbus_service_set_error(service, "Another instance is already running");
-        dbus_bus_release_name(service->connection, DBUS_BUS_NAME, NULL);
-        /* Do NOT close shared connection - just clear pointer */
-        service->connection = NULL;
-        service->owner_id = -1;
+        g_dbus_node_info_unref(service->introspection);
+        service->introspection = NULL;
+        return false;
+    }
+    /* else: owner_var is NULL and no error — should not happen, but safe to continue */
+
+    /* Request bus name ownership via GDBus */
+    service->owner_id = g_bus_own_name(
+        G_BUS_TYPE_SESSION,
+        DBUS_BUS_NAME,
+        G_BUS_NAME_OWNER_FLAGS_NONE,  // Do not queue, do not replace
+        on_bus_acquired,
+        on_name_acquired,
+        on_name_lost,
+        service,
+        NULL  // GDestroyNotify
+    );
+
+    if (service->owner_id == 0) {
+        dbus_service_set_error(service, "Failed to own D-Bus bus name");
+        g_dbus_node_info_unref(service->introspection);
+        service->introspection = NULL;
         return false;
     }
 
-    /* Set up D-Bus integration with GLib main loop */
-    if (!dbus_setup_main_loop_integration(service)) {
-        dbus_service_set_error(service, "Failed to set up D-Bus main loop integration");
-        dbus_bus_release_name(service->connection, DBUS_BUS_NAME, NULL);
-        /* Do NOT close shared connection - just clear pointer */
-        service->connection = NULL;
-        service->owner_id = -1;
-        return false;
-    }
-
+    g_message("GDBus: Service started, watching bus name '%s'", DBUS_BUS_NAME);
     return true;
 }
 
 /**
  * Stop the D-Bus service and release the bus name.
- * Matches header declaration: bool dbus_service_stop(DBusService* service);
  */
 bool dbus_service_stop(DBusService *service) {
     if (!service) return false;
 
-    /* Remove the GSource from the main loop */
-    if (service->source) {
-        g_source_destroy(service->source);
-        g_source_unref(service->source);
-        service->source = NULL;
+    if (service->owner_id != 0) {
+        g_bus_unown_name(service->owner_id);
+        service->owner_id = 0;
+        g_message("GDBus: Released bus name '%s'", DBUS_BUS_NAME);
     }
-
-    /* Release the bus name using dbus_bus_release_name */
-    if (service->connection && service->owner_id != -1) {
-        dbus_bus_release_name(service->connection, DBUS_BUS_NAME, NULL);
-        service->owner_id = -1;
-    }
-
-    /* Do NOT close shared connections obtained via dbus_bus_get().
-     * The session bus connection is shared across the process, and closing
-     * it would break other D-Bus users. Just release the bus name and clear
-     * the pointer. After this, dbus_service_process_messages() will return
-     * false silently if called (connection is NULL guard). */
-    service->connection = NULL;
 
     return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Public API - Status Checks                                          */
-/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
 /* Public API - Command String Generation                              */
@@ -377,11 +434,7 @@ bool dbus_service_stop(DBusService *service) {
  */
 const char *dbus_get_toggle_command(void) {
     return "dbus-send --session --type=method_call "
-           "--dest=org.xvoice.Controller "
-           "/org/xvoice/App "
-           "org.xvoice.Actions.Toggle";
+           "--dest=" DBUS_BUS_NAME " "
+           DBUS_OBJECT_PATH " "
+           DBUS_INTERFACE "." DBUS_METHOD_TOGGLE;
 }
-
-/* MAJ-002/MIN-001 fix: Removed unused dbus_get_toggle_command_formatted()
- * and dbus_another_instance_running(). Single-instance check is done
- * inline in dbus_service_start(). */

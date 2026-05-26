@@ -8,9 +8,9 @@ find_package(PkgConfig REQUIRED)
 
 # Find Packages
 # GTK3 (includes GDK, Pango, Cairo, ATK, GDK-Pixbuf, GLib, GObject, GIO)
+# Note: GIO (GDBus) is pulled in by gtk+-3.0, so no separate dbus-1 dependency needed
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0>=3.20)
 pkg_check_modules(ALSA REQUIRED alsa>=1.1.0)
-pkg_check_modules(DBUS REQUIRED dbus-1>=1.12)
 
 # JSON Library (still needed for config file parsing)
 pkg_check_modules(CJSON REQUIRED libcjson>=1.7.14)
@@ -125,7 +125,6 @@ target_include_directories(transcriber PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
     ${GTK3_INCLUDE_DIRS}
     ${ALSA_INCLUDE_DIRS}
-    ${DBUS_INCLUDE_DIRS}
     ${CJSON_INCLUDE_DIRS}
     ${APPINDICATOR_INCLUDE_DIRS}
     # whisper.cpp headers via FetchContent
@@ -137,7 +136,6 @@ target_include_directories(transcriber PRIVATE
 target_link_libraries(transcriber PRIVATE
     ${GTK3_LIBRARIES}
     ${ALSA_LIBRARIES}
-    ${DBUS_LIBRARIES}
     ${CJSON_LIBRARIES}
     ${APPINDICATOR_LIBRARIES}
     whisper
@@ -155,7 +153,6 @@ target_compile_definitions(transcriber PRIVATE
 target_compile_options(transcriber PRIVATE
     ${GTK3_CFLAGS_OTHER}
     ${ALSA_CFLAGS_OTHER}
-    ${DBUS_CFLAGS_OTHER}
     ${APPINDICATOR_CFLAGS_OTHER}
 )
 

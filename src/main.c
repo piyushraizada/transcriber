@@ -130,10 +130,51 @@ static gboolean on_transcription_result_error_idle(gpointer data) {
     return FALSE;
 }
 
+/* Auto-close dialog timeout (seconds) */
+#define DIALOG_AUTO_CLOSE_SECONDS 8
+
+/* Forward declaration of g_main_window for use in show_auto_close_dialog */
+static MainWindow *g_main_window;
+
 /* Wrapper for g_timeout_add: GSourceFunc signature requires gboolean return */
 static gboolean auto_close_dialog(gpointer data) {
     gtk_widget_destroy(GTK_WIDGET(data));
     return FALSE;
+}
+
+/**
+ * Show a non-modal, auto-closing error/warning dialog.
+ *
+ * Helper function to reduce boilerplate for the repeated GTK dialog pattern.
+ * The dialog is non-modal (does not block the GTK main loop) and auto-closes
+ * after DIALOG_AUTO_CLOSE_SECONDS.
+ *
+ * @param title       Window title for the dialog.
+ * @param type        GTK message type (GTK_MESSAGE_ERROR, GTK_MESSAGE_WARNING, etc.).
+ * @param format      Printf-style format string for the message.
+ * @param ...         Variable arguments for the format string.
+ */
+static void show_auto_close_dialog(const char *title,
+                                   GtkMessageType type,
+                                   const char *format,
+                                   ...) {
+    va_list args;
+    char message[512];
+
+    va_start(args, format);
+    g_vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    GtkWindow *parent = g_main_window ? GTK_WINDOW(app_window_get_gtk_window(g_main_window)) : NULL;
+    GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_DESTROY_WITH_PARENT,
+        type,
+        GTK_BUTTONS_OK,
+        "%s", message));
+    gtk_window_set_title(GTK_WINDOW(dialog), title);
+    g_timeout_add_seconds(DIALOG_AUTO_CLOSE_SECONDS, auto_close_dialog, dialog);
+    gtk_window_present(GTK_WINDOW(dialog));
 }
 
 
@@ -170,6 +211,18 @@ static pthread_mutex_t g_model_load_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Volume poll interval (milliseconds) — ~10fps for smooth updates */
 #define VOLUME_POLL_INTERVAL_MS 100
+
+/* Default max recording duration (seconds) */
+#define DEFAULT_MAX_DURATION_SECONDS 30
+
+/* Minimum transcription timeout (seconds) */
+#define MIN_TRANSCRIPTION_TIMEOUT_SECONDS 30
+
+/* Maximum transcription timeout (seconds) */
+#define MAX_TRANSCRIPTION_TIMEOUT_SECONDS 120
+
+/* Maximum transcription retries on failure */
+#define WHISPER_MAX_RETRIES 3
 
 /* ------------------------------------------------------------------ */
 /* Watchdog Timer                                                      */
@@ -209,7 +262,7 @@ static void start_watchdog_timer(void) {
 
     int max_duration = g_controller.config->max_duration;
     if (max_duration <= 0) {
-        max_duration = 30; /* Default 30 seconds */
+        max_duration = DEFAULT_MAX_DURATION_SECONDS;
     }
 
     /* Schedule the watchdog to fire after max_duration seconds */
@@ -222,11 +275,11 @@ static void start_watchdog_timer(void) {
  * the AppConfig max_duration field, scaled by a factor to allow longer
  * transcriptions for longer recordings. Minimum 30s, maximum 120s. */
 static int get_transcription_timeout_seconds(void) {
-    int base = g_controller.config ? g_controller.config->max_duration : 30;
-    /* Scale: 1.5x the recording duration, clamped to [30, 120] */
+    int base = g_controller.config ? g_controller.config->max_duration : DEFAULT_MAX_DURATION_SECONDS;
+    /* Scale: 1.5x the recording duration, clamped to [MIN, MAX] */
     int scaled = base * 3 / 2;
-    if (scaled < 30) scaled = 30;
-    if (scaled > 120) scaled = 120;
+    if (scaled < MIN_TRANSCRIPTION_TIMEOUT_SECONDS) scaled = MIN_TRANSCRIPTION_TIMEOUT_SECONDS;
+    if (scaled > MAX_TRANSCRIPTION_TIMEOUT_SECONDS) scaled = MAX_TRANSCRIPTION_TIMEOUT_SECONDS;
     return scaled;
 }
 
@@ -371,7 +424,7 @@ static void handle_enter_listening(void) {
     /* Start audio recording */
     if (g_audio_recorder) {
         int max_duration = g_controller.config->max_duration;
-        if (max_duration <= 0) max_duration = 30;
+        if (max_duration <= 0) max_duration = DEFAULT_MAX_DURATION_SECONDS;
         if (audio_recorder_start(g_audio_recorder)) {
             /* Start the watchdog timer */
             start_watchdog_timer();
@@ -495,7 +548,7 @@ static gpointer transcribe_thread_func(gpointer data) {
     /* Perform transcription with retry */
     WhisperResponse *response = whisper_transcribe_with_retry(g_whisper_client,
                                                 wav_path,
-                                                3); /* 3 retries */
+                                                WHISPER_MAX_RETRIES);
 
     /* Marshal result to the GTK main thread */
     if (g_controller.on_transcription_result) {
@@ -708,25 +761,11 @@ static gboolean on_model_load_failed_idle(gpointer data) {
         tray_set_connection_status(g_tray, CONNECTION_DISCONNECTED);
     }
 
-    /* M-005 fix: Show non-modal, auto-closing warning dialog.
-     * Using gtk_window_present() + response signal instead of gtk_dialog_run()
-     * to avoid blocking the GTK main loop. The dialog auto-closes after 8 seconds. */
-    {
-        GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
-        GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
-            parent,
-            GTK_DIALOG_DESTROY_WITH_PARENT,  /* Non-modal — does not block main loop */
-            GTK_MESSAGE_WARNING,
-            GTK_BUTTONS_OK,
-            "Failed to load Whisper model at startup.\n\n%s\n\n"
-            "The application will attempt to load the model when you "
-            "first click the microphone icon.", error_msg ? error_msg : "Unknown error"));
-        gtk_window_set_title(GTK_WINDOW(dialog), "Model Load Warning");
-        /* Auto-close after 8 seconds */
-        g_timeout_add_seconds(8, auto_close_dialog, dialog);
-        /* Present without blocking */
-        gtk_window_present(GTK_WINDOW(dialog));
-    }
+    /* Show non-modal, auto-closing warning dialog */
+    show_auto_close_dialog("Model Load Warning", GTK_MESSAGE_WARNING,
+        "Failed to load Whisper model at startup.\n\n%s\n\n"
+        "The application will attempt to load the model when you "
+        "first click the microphone icon.", error_msg ? error_msg : "Unknown error");
 
     g_free(error_msg);
     return FALSE;
@@ -784,18 +823,9 @@ static void on_microphone_toggle(void *user_data) {
             }
 
             if (!device_valid) {
-                /* HIGH-4 fix: Non-modal, auto-closing dialog to avoid blocking GTK main loop */
-                GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
-                GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
-                    parent,
-                    GTK_DIALOG_DESTROY_WITH_PARENT,
-                    GTK_MESSAGE_ERROR,
-                    GTK_BUTTONS_OK,
+                show_auto_close_dialog("Microphone Not Available", GTK_MESSAGE_ERROR,
                     "The configured microphone is not available.\n\n"
-                    "Please select a valid microphone in Transcriber Settings."));
-                gtk_window_set_title(GTK_WINDOW(dialog), "Microphone Not Available");
-                g_timeout_add_seconds(8, auto_close_dialog, dialog);
-                gtk_window_present(GTK_WINDOW(dialog));
+                    "Please select a valid microphone in Transcriber Settings.");
                 return; /* Abort — do not start recording */
             }
         }
@@ -804,18 +834,9 @@ static void on_microphone_toggle(void *user_data) {
         const char *model_path = config_get_model_path(g_controller.config);
         if (!model_path || model_path[0] == '\0' ||
             !config_dialog_validate_gguf_model(model_path)) {
-            /* HIGH-4 fix: Non-modal, auto-closing dialog */
-            GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
-            GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
-                parent,
-                GTK_DIALOG_DESTROY_WITH_PARENT,
-                GTK_MESSAGE_ERROR,
-                GTK_BUTTONS_OK,
+            show_auto_close_dialog("Model Not Found", GTK_MESSAGE_ERROR,
                 APP_ERROR_NO_VALID_MODEL ".\n\n"
-                "Please configure a valid Whisper model file in Settings."));
-            gtk_window_set_title(GTK_WINDOW(dialog), "Model Not Found");
-            g_timeout_add_seconds(8, auto_close_dialog, dialog);
-            gtk_window_present(GTK_WINDOW(dialog));
+                "Please configure a valid Whisper model file in Settings.");
             return; /* Abort — do not start recording */
         }
 
@@ -830,19 +851,10 @@ static void on_microphone_toggle(void *user_data) {
                 model_available = false;
             }
             if (!model_available) {
-                /* HIGH-4 fix: Non-modal, auto-closing dialog */
-                GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
-                GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
-                    parent,
-                    GTK_DIALOG_DESTROY_WITH_PARENT,
-                    GTK_MESSAGE_ERROR,
-                    GTK_BUTTONS_OK,
+                show_auto_close_dialog("Model Unavailable", GTK_MESSAGE_ERROR,
                     "Local Whisper model is unavailable.\n\n"
                     "Please check that the model file exists and is "
-                    "correctly configured, then try again."));
-                gtk_window_set_title(GTK_WINDOW(dialog), "Model Unavailable");
-                g_timeout_add_seconds(8, auto_close_dialog, dialog);
-                gtk_window_present(GTK_WINDOW(dialog));
+                    "correctly configured, then try again.");
                 return; /* Abort — do not start recording */
             }
         }

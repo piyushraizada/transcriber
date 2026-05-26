@@ -39,11 +39,9 @@
  *   4. On method call: Invoke the toggle callback in the GTK main thread.
  *   5. On shutdown: Release the bus name and close the connection.
  *
- * The module uses libdbus-1 (the reference D-Bus C library) for low-level
- * D-Bus operations. The D-Bus main loop integration is handled via a
- * GSource wrapper that integrates the D-Bus file descriptor into the GTK
- * main loop, allowing D-Bus messages to be processed without a separate
- * thread.
+ * The module uses GDBus (GIO) for D-Bus operations. GDBus integrates
+ * natively with GLib's main loop, allowing D-Bus messages to be processed
+ * without a separate thread or polling timer.
  *
  * @see SRS Section 8: Hotkey Integration (HK-001 through HK-005)
  * @see SRS Section 2.5: Hotkey Event Flow — D-Bus Integration
@@ -51,7 +49,6 @@
  * @see NR-020: X11 and Wayland Hotkey Support
  */
 
-#include <dbus-1.0/dbus/dbus.h>
 #include <stdbool.h>
 
 /* Forward declarations — avoid circular dependencies */
@@ -86,15 +83,16 @@ extern "C" {
  * Section 2: D-Bus Service Handle (Opaque)
  *---------------------------------------------------------------------------
  * Opaque handle to the internal D-Bus service state. The actual structure
- * contains the DBusConnection pointer, the bus name owner ID, the GSource
- * ID for main loop integration, and the toggle callback function pointer.
+ * contains the GDBus introspection data, the bus name owner ID from
+ * g_bus_own_name(), and the toggle callback function pointer.
  *
  * Users of this module should NEVER access the internal fields directly.
  * All interaction must go through the public API functions defined below.
  *
  * The D-Bus service is initialized once at application startup and
  * cleaned up at application exit. The service runs in the GTK main
- * thread (presentation thread) via GSource integration.
+ * thread (presentation thread) via GDBus's native GLib main loop
+ * integration.
  *
  * @see SRS Section 2.1: Threading Model — Presentation Thread handles D-Bus
  */
@@ -142,10 +140,9 @@ DBusService* dbus_service_create(void);
  * Destroy a D-Bus service and release all resources.
  *
  * This function performs the following cleanup steps:
- *   1. Stop the D-Bus service (if running) — release bus name
- *   2. Remove the GSource from the GTK main loop
- *   3. Close the D-Bus connection
- *   4. Free the DBusService struct
+ *   1. Stop the D-Bus service (if running) — release bus name via g_bus_unown_name()
+ *   2. Free the GDBus introspection data
+ *   3. Free the DBusService struct
  *
  * @param service Pointer to a valid DBusService. Must not be NULL.
  */
@@ -156,17 +153,15 @@ void dbus_service_destroy(DBusService* service);
  *
  * This function activates the D-Bus service by performing the following
  * steps:
- *   1. Connect to the D-Bus session bus via dbus_bus_get()
- *   2. Request the well-known name "org.xvoice.Controller" via
- *      dbus_bus_request_name() with flags:
- *         - DBUS_NAME_FLAG_REPLACE_EXISTING: Replace any existing owner
- *           (enforces single-instance behavior)
- *   3. If name acquisition fails (another instance owns it):
- *      Log a warning and return false (the application should exit)
- *   4. Register the Toggle method handler
- *   5. Create a GSource for the D-Bus file descriptor and attach it
- *      to the GTK main context
- *   6. Set the toggle callback function
+ *   1. Check if another instance already owns the bus name via a synchronous
+ *      D-Bus call to org.freedesktop.DBus.GetNameOwner
+ *   2. If name is already owned: log a warning and return false
+ *   3. Register for bus name ownership via g_bus_own_name() with callbacks:
+ *      - on_bus_acquired: Register the Toggle method handler
+ *      - on_name_acquired: Log success
+ *      - on_name_lost: Log warning
+ *   4. GDBus integrates with the default GLib main context automatically,
+ *      so no polling timer or GSource wrapper is needed
  *
  * @param service    Pointer to a valid DBusService. Must not be NULL.
  * @param callback   The callback function to invoke on Toggle calls.
@@ -176,7 +171,7 @@ void dbus_service_destroy(DBusService* service);
  *         false if:
  *         - D-Bus session bus is unavailable (HK-005)
  *         - Another instance owns the bus name (single-instance conflict)
- *         - GSource creation fails
+ *         - Introspection XML parsing fails
  *
  * @pre service != NULL && callback != NULL
  *
@@ -193,9 +188,7 @@ bool dbus_service_start(
  * Stop the D-Bus service and release the bus name.
  *
  * This function gracefully stops the D-Bus service by:
- *   1. Removing the GSource from the GTK main loop
- *   2. Releasing the bus name via dbus_bus_release_name()
- *   3. Closing the D-Bus connection via dbus_connection_close()
+ *   1. Releasing the bus name via g_bus_unown_name()
  *
  * After calling this function, the service is no longer listening for
  * D-Bus method calls. The service can be restarted by calling
@@ -225,33 +218,7 @@ bool dbus_service_stop(DBusService* service);
 const char* dbus_service_get_error(const DBusService* service);
 
 /*---------------------------------------------------------------------------
- * Section 6: D-Bus Message Processing
- *---------------------------------------------------------------------------
- * Functions for integrating D-Bus message processing with the GTK main loop.
- *
- * These functions are used internally to create a GSource that monitors
- * the D-Bus file descriptor and dispatches incoming messages. The GSource
- * is attached to the GTK main context, allowing D-Bus messages to be
- * processed in the GTK main thread without a separate D-Bus thread.
- */
-
-/**
- * Process pending D-Bus messages.
- *
- * This function reads and dispatches any pending D-Bus messages from the
- * connection. It should be called from the GTK main loop via the GSource
- * callback when the D-Bus file descriptor becomes readable.
- *
- * This function is typically called internally by the GSource callback
- * and does NOT need to be called by application code.
- *
- * @param service Pointer to a valid DBusService. Must not be NULL.
- * @return true if messages were processed successfully, false on error.
- */
-bool dbus_service_process_messages(DBusService* service);
-
-/*---------------------------------------------------------------------------
- * Section 7: D-Bus Command String Generation
+ * Section 6: D-Bus Command String Generation
  *---------------------------------------------------------------------------
  * Functions for generating the dbus-send command string for documentation.
  */
@@ -275,9 +242,6 @@ bool dbus_service_process_messages(DBusService* service);
  * @see SRS Section 8.4: Hotkey Configuration (The Trigger)
  */
 const char* dbus_get_toggle_command(void);
-
-/* MAJ-002/MIN-001 fix: Removed unused dbus_get_toggle_command_formatted()
- * and dbus_another_instance_running() declarations. */
 
 #ifdef __cplusplus
 }
