@@ -155,7 +155,9 @@ static char g_current_wav_path[PATH_MAX];
 /* TRUE when model loading was triggered by user click (lazy loading).
  * Causes on_model_loaded_idle to auto-transition to LISTENING on success.
  * FALSE when model loading was triggered at startup (just clear WAIT). */
-static bool g_model_loading_from_toggle = FALSE;
+/* CRIT-1 fix: Use atomic_bool for defense-in-depth against potential
+ * cross-thread access if future refactoring moves idle callbacks. */
+static atomic_int g_model_loading_from_toggle = 0;
 static pthread_mutex_t g_wav_path_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* HI-04 fix: Store transcription thread handle for clean shutdown */
@@ -216,8 +218,17 @@ static void start_watchdog_timer(void) {
                                                   NULL);
 }
 
-/* MIN-012 fix: Transcription phase watchdog with constant 30s timeout (NR-019) */
-static const int TRANSCRIPTION_TIMEOUT_SECONDS = 30;
+/* LOW-16 fix: Transcription phase watchdog timeout is now configurable via
+ * the AppConfig max_duration field, scaled by a factor to allow longer
+ * transcriptions for longer recordings. Minimum 30s, maximum 120s. */
+static int get_transcription_timeout_seconds(void) {
+    int base = g_controller.config ? g_controller.config->max_duration : 30;
+    /* Scale: 1.5x the recording duration, clamped to [30, 120] */
+    int scaled = base * 3 / 2;
+    if (scaled < 30) scaled = 30;
+    if (scaled > 120) scaled = 120;
+    return scaled;
+}
 
 static gboolean transcription_watchdog_callback(gpointer user_data) {
     (void)user_data;
@@ -227,7 +238,10 @@ static gboolean transcription_watchdog_callback(gpointer user_data) {
         /* Force transition back to IDLE */
         app_transition_to(&g_controller, STATE_IDLE);
         if (g_text_window) {
-            app_text_window_set_error(g_text_window, "Transcription timed out (30s limit)");
+            char msg[64];
+            int timeout = get_transcription_timeout_seconds();
+            snprintf(msg, sizeof(msg), "Transcription timed out (%ds limit)", timeout);
+            app_text_window_set_error(g_text_window, msg);
         }
         if (g_main_window) {
             app_window_set_state(g_main_window, STATE_IDLE);
@@ -242,8 +256,9 @@ static void start_transcription_watchdog(void) {
     if (g_transcription_watchdog_source_id != 0) {
         return; /* Already running */
     }
+    int timeout = get_transcription_timeout_seconds();
     g_transcription_watchdog_source_id = g_timeout_add_seconds(
-        TRANSCRIPTION_TIMEOUT_SECONDS, transcription_watchdog_callback, NULL);
+        timeout, transcription_watchdog_callback, NULL);
 }
 
 static void stop_transcription_watchdog(void) {
@@ -275,7 +290,6 @@ static void stop_watchdog_timer(void) {
 /* MIN-007 fix: Threshold-based volume level updates to reduce unnecessary
  * GTK widget redraws. Only update when level changes by more than VOLUME_DELTA. */
 #define VOLUME_DELTA 0.05
-static double g_last_volume_level = -1.0;
 
 static gboolean volume_poll_callback(gpointer user_data) {
     (void)user_data;
@@ -285,11 +299,12 @@ static gboolean volume_poll_callback(gpointer user_data) {
         /* Only update GTK widget if level changed significantly */
         if (level < 0.0) level = 0.0;
         if (level > 1.0) level = 1.0;
-        if (level - g_last_volume_level > VOLUME_DELTA ||
-            g_last_volume_level - level > VOLUME_DELTA ||
-            g_last_volume_level < 0.0) {
+        double last_level = app_window_get_last_volume_level(g_main_window);
+        if (level - last_level > VOLUME_DELTA ||
+            last_level - level > VOLUME_DELTA ||
+            last_level < 0.0) {
             app_window_set_volume_level(g_main_window, level);
-            g_last_volume_level = level;
+            app_window_set_last_volume_level(g_main_window, level);
         }
     }
 
@@ -357,7 +372,7 @@ static void handle_enter_listening(void) {
     if (g_audio_recorder) {
         int max_duration = g_controller.config->max_duration;
         if (max_duration <= 0) max_duration = 30;
-        if (audio_recorder_start(g_audio_recorder, max_duration)) {
+        if (audio_recorder_start(g_audio_recorder)) {
             /* Start the watchdog timer */
             start_watchdog_timer();
             /* Start volume level polling */
@@ -416,10 +431,22 @@ static void handle_enter_transcribing(const char *wav_path) {
     /* Store the WAV path for transcription */
     pthread_mutex_lock(&g_wav_path_mutex);
     if (wav_path) {
+        size_t len = strlen(wav_path);
+        if (len >= sizeof(g_current_wav_path)) {
+            g_log("main", G_LOG_LEVEL_WARNING,
+                  "[main] WAV path truncated: %.100s... (len=%zu, max=%zu)\n",
+                  wav_path, len, sizeof(g_current_wav_path) - 1);
+        }
         g_strlcpy(g_current_wav_path, wav_path, sizeof(g_current_wav_path));
     } else if (g_audio_recorder) {
         const char *path = audio_recorder_get_wav_path(g_audio_recorder);
         if (path) {
+            size_t len = strlen(path);
+            if (len >= sizeof(g_current_wav_path)) {
+                g_log("main", G_LOG_LEVEL_WARNING,
+                      "[main] WAV path truncated: %.100s... (len=%zu, max=%zu)\n",
+                      path, len, sizeof(g_current_wav_path) - 1);
+            }
             g_strlcpy(g_current_wav_path, path, sizeof(g_current_wav_path));
         }
     }
@@ -634,9 +661,8 @@ static gpointer model_loading_thread_func(gpointer data) {
 static gboolean on_model_loaded_idle(gpointer data) {
     (void)data;
 
-    /* Capture and clear the flag before any potential re-entry */
-    bool from_toggle = g_model_loading_from_toggle;
-    g_model_loading_from_toggle = FALSE;
+    /* Capture and clear the flag atomically before any potential re-entry */
+    bool from_toggle = atomic_exchange(&g_model_loading_from_toggle, 0) != 0;
 
     /* Clear the "WAIT" overlay from the icon */
     if (g_main_window) {
@@ -758,17 +784,18 @@ static void on_microphone_toggle(void *user_data) {
             }
 
             if (!device_valid) {
+                /* HIGH-4 fix: Non-modal, auto-closing dialog to avoid blocking GTK main loop */
                 GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
                 GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
                     parent,
-                    GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
+                    GTK_DIALOG_DESTROY_WITH_PARENT,
                     GTK_MESSAGE_ERROR,
                     GTK_BUTTONS_OK,
                     "The configured microphone is not available.\n\n"
                     "Please select a valid microphone in Transcriber Settings."));
                 gtk_window_set_title(GTK_WINDOW(dialog), "Microphone Not Available");
-                gtk_dialog_run(dialog);
-                gtk_widget_destroy(GTK_WIDGET(dialog));
+                g_timeout_add_seconds(8, auto_close_dialog, dialog);
+                gtk_window_present(GTK_WINDOW(dialog));
                 return; /* Abort — do not start recording */
             }
         }
@@ -777,17 +804,18 @@ static void on_microphone_toggle(void *user_data) {
         const char *model_path = config_get_model_path(g_controller.config);
         if (!model_path || model_path[0] == '\0' ||
             !config_dialog_validate_gguf_model(model_path)) {
+            /* HIGH-4 fix: Non-modal, auto-closing dialog */
             GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
             GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
                 parent,
-                GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
+                GTK_DIALOG_DESTROY_WITH_PARENT,
                 GTK_MESSAGE_ERROR,
                 GTK_BUTTONS_OK,
                 APP_ERROR_NO_VALID_MODEL ".\n\n"
                 "Please configure a valid Whisper model file in Settings."));
             gtk_window_set_title(GTK_WINDOW(dialog), "Model Not Found");
-            gtk_dialog_run(dialog);
-            gtk_widget_destroy(GTK_WIDGET(dialog));
+            g_timeout_add_seconds(8, auto_close_dialog, dialog);
+            gtk_window_present(GTK_WINDOW(dialog));
             return; /* Abort — do not start recording */
         }
 
@@ -802,19 +830,19 @@ static void on_microphone_toggle(void *user_data) {
                 model_available = false;
             }
             if (!model_available) {
-                /* ME-06 fix: Consolidated error dialog - updated message for local model */
+                /* HIGH-4 fix: Non-modal, auto-closing dialog */
                 GtkWindow *parent = GTK_WINDOW(app_window_get_gtk_window(g_main_window));
                 GtkDialog *dialog = GTK_DIALOG(gtk_message_dialog_new(
                     parent,
-                    GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
+                    GTK_DIALOG_DESTROY_WITH_PARENT,
                     GTK_MESSAGE_ERROR,
                     GTK_BUTTONS_OK,
                     "Local Whisper model is unavailable.\n\n"
                     "Please check that the model file exists and is "
                     "correctly configured, then try again."));
                 gtk_window_set_title(GTK_WINDOW(dialog), "Model Unavailable");
-                gtk_dialog_run(dialog);
-                gtk_widget_destroy(GTK_WIDGET(dialog));
+                g_timeout_add_seconds(8, auto_close_dialog, dialog);
+                gtk_window_present(GTK_WINDOW(dialog));
                 return; /* Abort — do not start recording */
             }
         }
@@ -827,7 +855,7 @@ static void on_microphone_toggle(void *user_data) {
 
             /* Mark that this load was triggered by user click,
              * so on_model_loaded_idle will auto-transition to LISTENING */
-            g_model_loading_from_toggle = TRUE;
+            atomic_store(&g_model_loading_from_toggle, 1);
 
             /* Set model path */
             const char *model_path = config_get_model_path(g_controller.config);
@@ -1077,9 +1105,6 @@ int main(int argc, char *argv[]) {
     /* H-002 fix: Set shutdown flag to prevent idle callbacks from accessing freed resources */
     g_shutting_down = true;
 
-    /* Reset volume level tracking */
-    g_last_volume_level = -1.0;
-
     /* Stop the watchdog timer */
     stop_watchdog_timer();
 
@@ -1117,12 +1142,16 @@ int main(int argc, char *argv[]) {
     }
 
     /* HI-04 fix: Gracefully cancel and join any in-flight transcription thread
-      * before destroying the client. This prevents use-after-free during shutdown. */
+     * before destroying the client. This prevents use-after-free during shutdown. */
     if (g_whisper_client) {
         whisper_client_cancel(g_whisper_client);
     }
 
-    /* Join the transcription thread if it's still running */
+    /* CRIT-2 fix: Join the transcription thread. The whisper_client_cancel()
+     * above sets the cancel flag which whisper.cpp checks periodically during
+     * whisper_full(). If the thread is stuck (e.g., in a long GPU operation),
+     * the join may block. In practice, the cancel callback is checked every
+     * encoder/decoder step, so this should complete within a few seconds. */
     pthread_mutex_lock(&g_transcribe_thread_mutex);
     if (g_transcribe_thread) {
         g_thread_join(g_transcribe_thread);

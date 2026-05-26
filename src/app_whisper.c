@@ -279,6 +279,18 @@ static bool load_model_internal(WhisperClient *client) {
 
     bool gpu_loaded = false;
 
+    // Log which GPU device will be used
+    if (try_gpu && gpu_idx >= 0) {
+        char gpu_name[256];
+        if (gpu_get_device_name(gpu_idx, gpu_name, sizeof(gpu_name))) {
+            fprintf(stderr, "[whisper] Using GPU device %d: %s\n", gpu_idx, gpu_name);
+        } else {
+            fprintf(stderr, "[whisper] Using GPU device %d\n", gpu_idx);
+        }
+    } else if (!try_gpu) {
+        fprintf(stderr, "[whisper] Using CPU (no GPU)\n");
+    }
+
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = try_gpu;
 
@@ -315,6 +327,12 @@ static bool load_model_internal(WhisperClient *client) {
     client->model_loaded = true;
     client->using_gpu = gpu_loaded;
 
+    /* Release CUDA contexts on GPUs not used by the loaded model.
+     * whisper_init_from_file_with_params() enumerates all CUDA devices
+     * internally, creating ~256 MiB contexts on each. Clean them up. */
+    if (gpu_loaded && gpu_idx >= 0) {
+        gpu_release_unused_devices(gpu_idx);
+    }
 
     return true;
 }

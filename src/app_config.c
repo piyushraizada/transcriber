@@ -255,10 +255,13 @@ bool config_load_from_path(AppConfig* config, const char* path)
     FILE* fp = fopen(path, "r");
     if (!fp) {
         if (errno == ENOENT) {
-            /* File does not exist — create it with defaults (CFG-012) */
+            /* File does not exist — create it with defaults (CFG-012).
+             * Return true because config has been populated with valid
+             * defaults and the file has been created. The caller does not
+             * need to treat this as a failure. */
             set_error(NULL);
             config_save_to_path(config, path);
-            return false;
+            return true;
         }
         set_error("Failed to open config file");
         return false;
@@ -277,7 +280,10 @@ bool config_load_from_path(AppConfig* config, const char* path)
         return false;
     }
 
-    /* Read file content */
+    /* Read file content
+     * MED-12 fix: The cast (size_t)fsize is safe because fsize is bounded
+     * to [1, 1MB] by the check above. On 32-bit systems, size_t is 32-bit,
+     * but 1MB fits comfortably in 32 bits (max ~4GB). */
     char* content = malloc((size_t)fsize + 1);
     if (!content) {
         fclose(fp);

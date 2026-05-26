@@ -126,6 +126,9 @@ void model_info_init(ModelInfo *info) {
     info->error_message[0] = '\0';
 }
 
+/* HIGH-7 fix: model_info_load() now returns false on I/O errors and true
+ * only when metadata was successfully parsed. Callers should check the
+ * return value first, then check info.valid for format validation. */
 bool model_info_load(const char *model_path, ModelInfo *info) {
     if (!model_path || !info) return false;
 
@@ -133,11 +136,19 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
 
     /* Resolve the path (handle tilde expansion and directory search) */
     char resolved[PATH_MAX];
-    int path_ok = (whisper_resolve_model_path(model_path, resolved, sizeof(resolved)) == 0);
-    if (!path_ok) {
+    int path_result = whisper_resolve_model_path(model_path, resolved, sizeof(resolved));
+    /* LOW-17 fix: Use distinct return codes for better error messages */
+    if (path_result == -2) {
+        /* Path resolution failed (invalid input, no HOME, etc.) */
+        snprintf(info->error_message, sizeof(info->error_message),
+            "Invalid model path: %s", model_path);
+        return false;
+    }
+    if (path_result != 0) {
+        /* Path resolved but file does not exist */
         snprintf(info->error_message, sizeof(info->error_message),
             "Model file not found: %s", model_path);
-        return true;
+        return false;
     }
 
     /* Open the file */
@@ -145,7 +156,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
     if (!f) {
         snprintf(info->error_message, sizeof(info->error_message),
             "Cannot open model file: %.200s", resolved);
-        return true;
+        return false;
     }
 
     /* Read magic to determine format */
@@ -154,7 +165,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
         snprintf(info->error_message, sizeof(info->error_message),
             "Failed to read model file header");
         fclose(f);
-        return true;
+        return false;
     }
     uint32_t magic = read_u32_le(magic_buf);
 
@@ -219,7 +230,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
         snprintf(info->error_message, sizeof(info->error_message),
             "Not a valid model file (bad magic: 0x%08x)", magic);
         fclose(f);
-        return true;
+        return false;
     }
 
     /* ----------------------------------------------------------------

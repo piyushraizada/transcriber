@@ -165,6 +165,23 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes);
  */
 bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes);
 
+/**
+ * Release CUDA contexts on all GPU devices except the one in use.
+ *
+ * When CUDA devices are enumerated or queried (via cudaSetDevice +
+ * cudaMemGetInfo, or by whisper.cpp during model loading), a CUDA context
+ * is implicitly created on each device, consuming ~256 MiB of VRAM per
+ * device. This function calls cudaDeviceReset() on all devices except the
+ * specified used_device_idx, freeing that VRAM.
+ *
+ * This should be called after model loading completes on GPU to ensure
+ * unused GPUs do not hold unnecessary VRAM.
+ *
+ * @param used_device_idx The GPU device index that is actively in use (>= 0)
+ * @return true if cleanup was performed, false if CUDA not available
+ */
+bool gpu_release_unused_devices(int used_device_idx);
+
 /*---------------------------------------------------------------------------
  * Section 4: GPU Mode String Parsing
  *---------------------------------------------------------------------------

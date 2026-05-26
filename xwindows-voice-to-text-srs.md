@@ -82,7 +82,7 @@ The X-Windows voice-to-text application provides:
 - **FR-XXX**: Functional Requirement
 - **NR-XXX**: Non-Functional Requirement
 - **AUD-XXX**: Audio Pipeline Requirement
-- **WHISPER-XXX**: Whisper API Requirement
+- **WHISPER-XXX**: Whisper (whisper.cpp) Requirement
 - **UI-XXX**: UI Component Requirement
 - **HK-XXX**: Hotkey Requirement
 - **CFG-XXX**: Configuration Requirement
@@ -98,7 +98,7 @@ This document is organized by functional areas:
 - Section 3: Functional Requirements
 - Section 4: Non-Functional Requirements
 - Section 5: Audio Capture Pipeline
-- Section 6: Whisper API Integration
+- Section 6: Whisper Integration (whisper.cpp)
 - Section 7: X-Windows UI Components
 - Section 8: Hotkey Integration
 - Section 9: Configuration Management
@@ -120,14 +120,14 @@ The application is built on a multi-threaded architecture managed by a **Central
 
 | Thread | Responsibility | Key Operations |
 |--------|---------------|----------------|
-| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC polling via `g_unix_fd_add()` on the D-Bus file descriptor integrated into the GTK main loop, system tray icon updates via libappindicator |
+| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC polling via `g_timeout_source_new(100)` timer-based dispatch (avoiding `dbus_connection_get_unix_fd()` crash risk), system tray icon updates via libappindicator |
 | **Audio Thread** | Real-time PCM capture | Captures audio from ALSA using real-time priority scheduling. Writes raw PCM frames to a temporary WAV file. Suspended in `STATE_IDLE`, active in `STATE_LISTENING`. |
 | **Transcription Thread** | Local whisper.cpp model processing | Loads GGML model file, reads WAV samples, runs `whisper_full()` for local transcription. Supports GPU (CUDA) acceleration with CPU fallback. Active only in `STATE_TRANSCRIBING`. |
 
 **Design Rationale:**
 - The Audio Thread runs independently to guarantee real-time capture without being blocked by GTK rendering or transcription processing.
 - The Transcription Thread isolates blocking whisper.cpp model processing from the Presentation Thread, preventing UI freezes during local transcription.
-- The Presentation Thread concurrently polls the D-Bus file descriptor using `g_unix_fd_add()`, enabling responsive hotkey toggling without a dedicated D-Bus thread.
+- The Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch, enabling responsive hotkey toggling without a dedicated D-Bus thread.
 - The Central State Controller ensures thread-safe state transitions using mutex-protected state variables.
 - No network thread is required since all transcription is performed locally via whisper.cpp.
 
@@ -308,7 +308,7 @@ The application responds by toggling between IDLE and LISTENING/TRANSCRIBING sta
 
 #### D-Bus Polling Mechanism
 
-- The GTK main loop in the Presentation Thread concurrently polls the D-Bus file descriptor using `g_unix_fd_add()` integrated into the GLib main context.
+- The GTK main loop in the Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch integrated into the GLib main context.
 - This design eliminates the need for a dedicated D-Bus thread, reducing complexity and resource usage.
 - **Prevents Ghost Instances**: D-Bus bus name ownership (`org.xvoice.Controller`) naturally enforces single-instance semantics, eliminating the need for lock files.
 - **Circumvents Wayland Global-Keylogger Restrictions**: Since the application does not register global keyboard shortcuts itself (hotkeys are configured externally in the compositor/DE), it avoids Wayland's security restrictions on applications attempting to capture global key events. The D-Bus interface works identically under X11 and Wayland.
@@ -497,8 +497,6 @@ The application shall verify the local Whisper model file is accessible on start
 
 **Traceability**: FR-030 → WHISPER-013
 
-#### FR-037: Manual Connection Check
-
 #### FR-038: Recording Countdown Timer
 The application shall display a countdown timer in the **center of the MainWindow status bar** (between the gear icon on the left and the connection indicator on the right). The timer shall:
 - Display the remaining recording time in seconds, counting down from the configured `max_duration` value to 0
@@ -541,7 +539,7 @@ The application shall limit each transcription session to a configurable maximum
 **Traceability**: FR-031 → FR-007a, CFG-014
 
 #### FR-032: Complete Session Transcription
-The application shall send the complete recorded audio (up to the configured maximum duration) to Whisper API for transcription and update the persistent text area with the transcribed text.
+The application shall transcribe the complete recorded audio (up to the configured maximum duration) using the local whisper.cpp model and update the persistent text area with the transcribed text.
 
 **Traceability**: FR-032 → WHISPER-001
 
@@ -719,7 +717,7 @@ Configuration files shall have permissions `600` (rw-------).
 **Traceability**: NR-008 → CFG-005
 
 #### NR-009 (Security): Temporary File Cleanup
-The temporary WAV file `/tmp/transcriber_capture.wav` shall be unlinked and deleted immediately after successful `libcurl` transmission of the audio data to the Whisper API. No `.wav` files shall persist in `/tmp/` post-transcription.
+The temporary WAV file shall be unlinked and deleted immediately after the transcription thread completes (success or failure). No `.wav` files shall persist in the temporary directory post-transcription. The WAV file path is managed via `mkstemp()` in `$XDG_RUNTIME_DIR` or `/tmp/`.
 
 **Traceability**: NR-009 → AUD-008, WHISPER-012
 
@@ -738,26 +736,21 @@ Configuration settings, including microphone selection, shall be persisted betwe
 
 **Traceability**: NR-014 → CFG-010
 
-#### NR-015: HTTP Retry Filtering by Status Code
-The application shall implement intelligent retry logic that filters HTTP status codes by retryability. Retries shall only be attempted for transient error conditions.
+#### NR-015: Transcription Retry Filtering by Error Code
+The application shall implement intelligent retry logic that filters whisper.cpp error codes by retryability. Retries shall only be attempted for transient error conditions.
 
-**Retryable Status Codes**:
-- `408 Request Timeout` — Server took too long to respond
-- `429 Too Many Requests` — Rate limiting (with exponential backoff)
-- `500 Internal Server Error` — Server-side error
-- `502 Bad Gateway` — Upstream server unavailable
-- `503 Service Unavailable` — Server temporarily overloaded
-- `504 Gateway Timeout` — Upstream server timeout
+**Retryable Error Codes**:
+- Code 4 — WAV file read error (transient file system issue)
+- Code 5 — `whisper_full()` decode error (transient processing failure)
+- Code 7 — Memory allocation failure (transient resource pressure)
 
-**Non-Retryable Status Codes**:
-- `400 Bad Request` — Client error (request malformed)
-- `401 Unauthorized` — Authentication failure
-- `403 Forbidden` — Permission denied
-- `404 Not Found` — Resource not found
-- `413 Payload Too Large` — Audio file exceeds size limit
-- `415 Unsupported Media Type` — Wrong audio format
+**Non-Retryable Error Codes**:
+- Code 1 — Invalid parameters (NULL client or wav_path)
+- Code 2 — Model file not found (permanent configuration issue)
+- Code 3 — Failed to load whisper model (permanent model corruption)
+- Code 6 — No transcription segments produced (permanent: audio is silent/unintelligible)
 
-**Implementation**: The retry counter shall reset after a successful request. After exhausting retries, the application shall display an error message indicating whether the issue is retryable.
+**Implementation**: The retry counter shall reset after a successful transcription. Retries use progressive backoff: 100ms, 200ms, ... (maximum 3 retries). After exhausting retries, the application shall display an error message indicating whether the issue is retryable.
 
 **Traceability**: NR-015 → WHISPER-010, ERR-003
 
@@ -791,7 +784,7 @@ The application shall be compatible with GTK3 on both X11 and Wayland display se
 #### NR-012: Transcription Continuity
 The system shall maintain transcription continuity within each 30-second session, providing seamless transcription for the recorded audio.
 
-**Implementation**: Complete audio file sent to Whisper API for transcription
+**Implementation**: Complete audio file processed by local whisper.cpp for transcription
 
 **Traceability**: NR-012 → FR-031
 
@@ -803,14 +796,21 @@ The system shall respond to stop request within 1 second.
 **Traceability**: NR-013 → FR-034
 
 #### NR-019: Transcription Phase Watchdog Timeout
-The total time from recording completion to transcription display shall not exceed 30 seconds. A fixed 30-second watchdog timer starts when the application transitions to `STATE_TRANSCRIBING`. If the transcription thread has not completed within this period, the application shall:
+A watchdog timer starts when the application transitions to `STATE_TRANSCRIBING`. The timeout is scaled based on the configured `max_duration`:
+- Base value: `max_duration` (default 30s, configurable 5–30s)
+- Scaled timeout = `base × 1.5`, clamped to the range [30, 120] seconds
+- This allows longer transcriptions for longer recordings
+
+If the transcription thread has not completed within this period, the application shall:
 1. Cancel the in-progress transcription via `whisper_client_cancel()`
-2. Display an error message in the TextWindow indicating the timeout
+2. Display an error message in the TextWindow indicating the timeout (with the actual timeout value)
 3. Return to `STATE_IDLE`
 
-This watchdog applies to local whisper.cpp transcription (no network component). The timeout is fixed at 30 seconds and is not user-configurable.
+This watchdog applies to local whisper.cpp transcription (no network component). The timeout is scaled based on max_duration, not user-configurable as a separate parameter.
 
-**Traceability**: NR-019 → WHISPER-008, WHISPER-009
+**Implementation**: `get_transcription_timeout_seconds()` in `main.c` — `base * 3 / 2`, clamped to [30, 120]
+
+**Traceability**: NR-019 → WHISPER-008, WHISPER-009, CFG-014
 
 ### 4.7 Hotkey Compatibility
 
@@ -1284,14 +1284,14 @@ The application shall display a fixed-size modal configuration dialog titled "Tr
 | 7 | **Hotkey Command** | Read-only text box | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | Monospace font, read-only. Adjacent "Copy" button copies command to system clipboard. |
 
 **Dialog Action Buttons (bottom row)**:
-- **"Test Connection"** — Validates Whisper API connectivity before saving (non-blocking, displays result in a status label)
+- **"Test Model"** — Verifies the configured model file exists and validates GGUF/GGML header before saving (non-blocking, displays result in a status label)
 - **"Save"** — Validates inputs, writes to `~/.config/transcriber/config.json`, closes dialog
 - **"Cancel"** — Discards changes, closes dialog
 
 **Configuration Items That Are NOT Exposed (Fixed Defaults)**:
-- Network timeout (30s) — fixed, not configurable
-- Retry count (3) with exponential backoff — fixed, not configurable
-- Audio format (16000 Hz, 1 channel, 16-bit PCM) — fixed for Whisper compatibility, not configurable
+- Transcription watchdog timeout — fixed (scaled from max_duration), not directly configurable
+- Retry count (3) with progressive backoff — fixed from whisper.cpp, not configurable
+- Audio format (16000 Hz, 1 channel, 16-bit PCM) — fixed for Whisper model compatibility, not configurable
 
 **Traceability**: UI-012 → FR-019
 
@@ -1306,9 +1306,9 @@ The configuration dialog shall include a drop-down (combo box) showing all avail
 **Traceability**: UI-015 → FR-020, FR-008a
 
 #### UI-023: Interactive Connection Status Indicator
-The connection status indicator circle (defined in UI-021) shall act as a clickable button area. When clicked while in the Red (disconnected) state, the application shall immediately execute a connectivity ping (WHISPER-013). During the ping execution, the indicator shall briefly display a visual active state (e.g., turning Yellow or blinking) until the network response is received. If clicked while in the Green (connected) state, the click shall be ignored or silently re-verify the connection without visual disruption.
+The connection status indicator circle (defined in UI-021) shall act as a clickable button area. When clicked while in the Red (disconnected) state, the application shall immediately execute a model file verification (WHISPER-012). During the verification, the indicator shall briefly display a visual active state (e.g., turning Yellow or blinking) until the verification result is received. If clicked while in the Green (connected) state, the click shall be ignored or silently re-verify the model without visual disruption.
 
-**Traceability**: UI-023 → FR-037, WHISPER-013, UI-021
+**Traceability**: UI-023 → FR-037, WHISPER-012, UI-021
 
 ### 7.4 Hotkey UI Integration
 
@@ -1546,8 +1546,8 @@ The following settings have fixed defaults and are **not exposed** in the Config
 
 | Setting | Fixed Value | Rationale |
 |---------|-------------|-----------|
-| Network Timeout | 30 seconds | Aligned with Whisper API response time expectations |
-| Retry Count | 3 (with exponential backoff: 1s, 2s, 4s) | Provides resilient error handling without excessive delays |
+| Transcription Watchdog | Scaled: max_duration × 1.5, clamped [30, 120]s | Allows longer transcriptions for longer recordings |
+| Retry Count | 3 (with progressive backoff: 100ms, 200ms, ...) | Retrys retryable whisper.cpp errors only |
 | Audio Format | 16000 Hz, 1 channel, 16-bit PCM | Required for Whisper model compatibility |
 
 ### 9.5 Hotkey Configuration
@@ -1570,14 +1570,15 @@ The application shall handle audio device open and read errors.
 
 **Traceability**: ERR-002 → AUD-001
 
-#### ERR-003: Network Errors
-The application shall handle HTTP connection and response errors. On network failure, the application shall:
-1. Log the error to stderr with the HTTP status code (if available)
-2. Implement exponential backoff retry: wait 1s after first failure, 2s after second, 4s after third (maximum 3 retries)
-3. If all retries fail, display an error message in the TextWindow ("Transcription failed: Network error") and transition back to STATE_IDLE
-4. The HTTP request timeout shall be 30 seconds (as specified in WHISPER-009)
+#### ERR-003: Transcription Errors
+The application shall handle local transcription errors (model load failure, WAV file read failure, whisper.cpp execution failure). On transcription failure, the application shall:
+1. Log the error to stderr with the specific error code
+2. Implement progressive retry with backoff: 100ms, 200ms, ... (maximum 3 retries)
+3. Only retry on retryable errors (WAV read, decode, or memory allocation failures)
+4. Non-retryable errors (model not found, invalid parameters) fail immediately
+5. If all retries fail, display an error message in the TextWindow and transition back to STATE_IDLE
 
-**Traceability**: ERR-003 → WHISPER-008
+**Traceability**: ERR-003 → WHISPER-009, WHISPER-010
 
 #### ERR-004: GTK/GDK Errors
 The application shall handle GTK/GDK display connection and rendering errors.
@@ -1610,14 +1611,14 @@ If the audio device is unavailable, the application shall retry every 5 seconds.
 
 **Traceability**: ERR-009 → AUD-001
 
-#### ERR-010: Whisper API Unavailable
-If the Whisper API is unavailable (connection refused, HTTP 5xx, or timeout after 30s), the application shall:
-1. Attempt retry with exponential backoff (1s, 2s, 4s — maximum 3 attempts)
-2. If all retries fail, display an error message in the TextWindow: "Transcription failed: API unavailable"
-3. Transition the state machine back to STATE_IDLE
-4. Log the detailed error to stderr including the last HTTP status code or connection error
+#### ERR-010: Model Load Failure
+If the Whisper model fails to load (file not found, corrupt GGUF/GGML file, insufficient GPU memory), the application shall:
+1. Display an error dialog with the specific failure reason
+2. Set the connection status indicator to `CONNECTION_DISCONNECTED` (red)
+3. Log the detailed error to stderr
+4. Remain in STATE_IDLE until the user provides a valid model path via the configuration dialog
 
-**Traceability**: ERR-010 → WHISPER-009
+**Traceability**: ERR-010 → WHISPER-002, WHISPER-003, WHISPER-014
 
 #### ERR-011: Display Connection Failed
 If the display connection fails (GTK cannot connect to X11 or Wayland), the application shall log error and exit gracefully.
@@ -1661,12 +1662,6 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 
 ### 11.2 Runtime Dependencies
 
-#### DEP-004: libcurl
-- **Name**: libcurl
-- **Minimum Version**: 7.68.0
-- **Purpose**: HTTP requests to Whisper API
-- **Required Functions**: `curl_easy_init`, `curl_easy_setopt`, `curl_easy_perform`
-
 #### DEP-005: Temporary File Storage
 - **Name**: Temporary file system
 - **Purpose**: Audio capture temporary WAV file storage
@@ -1674,27 +1669,22 @@ When the user clicks the microphone icon to start recording (or invokes the togg
   - Primary: `$XDG_RUNTIME_DIR` (if set and writable)
   - Fallback: `/tmp/` (if XDG_RUNTIME_DIR unavailable)
 - **File Naming**: `transcriber_capture_XXXXXX.wav` (via `mkstemp()`)
-- **Security**: Immediate unlink after successful upload to Whisper API
-- **Rationale**: Using `$XDG_RUNTIME_DIR` provides better security and cleanup guarantees. If unavailable (e.g., non-systemd environments), `/tmp/` serves as a fallback. This resolves the contradiction between temporary file location specifications.
+- **Security**: Temporary WAV file is cleaned up after transcription is complete (success or failure). The file is unlinked after the transcription thread finishes processing.
+- **Rationale**: Using `$XDG_RUNTIME_DIR` provides better security and cleanup guarantees. If unavailable (e.g., non-systemd environments), `/tmp/` serves as a fallback.
 - **Traceability**: DEP-005 → AUD-007, AUD-008, NR-009
 
 #### DEP-006: ALSA Library
-- **Name**: libasound
+- **Name**: libasound (libasound2-dev on Debian)
 - **Minimum Version**: 1.1.0
-- **Purpose**: Audio capture via ALSA
-- **Required Functions**: `snd_pcm_open`, `snd_pcm_readi`
+- **Purpose**: Audio capture via ALSA — sole audio backend
+- **Required Functions**: `snd_pcm_open`, `snd_pcm_readi`, `snd_pcm_hw_params`, `snd_pcm_drop`, `snd_pcm_close`
 
-#### DEP-007: ALSA Library (Required)
-- **Name**: libasound
-- **Minimum Version**: 1.1.0
-- **Purpose**: Audio capture via ALSA
-- **Required Functions**: `snd_pcm_open`, `snd_pcm_readi`, `snd_pcm_hw_params`
-
-#### DEP-008: Whisper API Server
+#### DEP-007: whisper.cpp Library
 - **Name**: whisper.cpp (ggml-org/whisper.cpp)
-- **Minimum Version**: v1.5.0 or compatible
-- **Purpose**: Local, offline speech-to-text transcription via GGML model files
-- **Traceability**: DEP-008 → WHISPER-001
+- **Minimum Version**: v1.8.1
+- **Purpose**: Local, offline speech-to-text transcription via GGML/GGUF model files
+- **Integration**: CMake FetchContent (no system package required)
+- **Traceability**: DEP-007 → WHISPER-001, WHISPER-002, WHISPER-003
 
 #### DEP-009: GTK3 Clipboard (Native)
 - **Name**: GTK3 GdkClipboard
@@ -1908,9 +1898,9 @@ Configuration files shall have permissions `600` (rw-------).
 - **Scenario**: Audio device disconnected during recording
 - **Expected**: Error notification, graceful stop
 
-#### TEST-013: Edge Case - Network Disconnection
-- **Scenario**: Network disconnected during upload
-- **Expected**: Retry with exponential backoff
+#### TEST-013: Edge Case - Model File Removal
+- **Scenario**: Model file deleted or renamed between verification and transcription
+- **Expected**: Error message in TextWindow, transition to STATE_IDLE, status indicator turns red
 
 #### TEST-014: Edge Case - Configuration Corruption
 - **Scenario**: Configuration file corrupted
@@ -1950,7 +1940,7 @@ Configuration files shall have permissions `600` (rw-------).
 | FR-027 | Save Configuration | 3.7 |
 | FR-028 | Cancel Configuration | 3.7 |
 | FR-029 | Configuration Persistence | 3.7 |
-| FR-030 | LLM Connection on Startup | 3.7 |
+| FR-030 | Model Verification on Startup | 3.7 |
 | FR-031 | Maximum Session Duration | 3.8 |
 | FR-032 | Complete Session Transcription | 3.8 |
 | FR-033 | Text Area Display | 3.8 |
@@ -1987,21 +1977,21 @@ Configuration files shall have permissions `600` (rw-------).
 | AUD-009 | File Extension | 5.3 |
 | AUD-010 | Duration Limit | 5.4 |
 | AUD-011 | Graceful Stop | 5.4 |
-| AUD-012 | ALSA Support (Fallback) | 5.5 |
-| AUD-013 | PulseAudio Support (Preferred) | 5.5 |
-| AUD-014 | PipeWire Support | 5.5 |
+| AUD-012 | ALSA Support (Primary and Only Backend) | 5.5 |
+| AUD-013 | ALSA as Primary Backend | 5.5 |
+| AUD-014 | ALSA Device Selection | 5.5 |
 | AUD-015 | Runtime Audio Backend Selection | 5.5 |
-| WHISPER-001 | Endpoint Configuration | 6.1 |
-| WHISPER-002 | Content-Type | 6.1 |
-| WHISPER-003 | File Field Name | 6.1 |
-| WHISPER-005 | Language Parameter | 6.1 |
-| WHISPER-006 | JSON Parsing | 6.2 |
+| WHISPER-001 | Model Path Configuration | 6.1 |
+| WHISPER-002 | Model Loading | 6.1 |
+| WHISPER-003 | GPU (CUDA) Acceleration | 6.1 |
+| WHISPER-005 | WAV File Reading | 6.2 |
+| WHISPER-006 | Transcription Execution | 6.2 |
 | WHISPER-007 | Text Extraction | 6.2 |
-| WHISPER-008 | Error Response Handling | 6.2 |
-| WHISPER-009 | Timeout Configuration | 6.3 |
+| WHISPER-008 | Cancellation Support | 6.2 |
+| WHISPER-009 | Error Codes | 6.3 |
 | WHISPER-010 | Retry Logic | 6.3 |
-| WHISPER-011 | Connection Error Handling | 6.3 |
-| WHISPER-012 | Upload Efficiency | 6.4 |
+| WHISPER-011 | Thread Safety | 6.3 |
+| WHISPER-012 | Model File Verification (Connection Check) | 6.4 |
 | UI-001 | Microphone Icon Display | 7.1 |
 | UI-002 | Window Properties | 7.1 |
 | UI-003 | Click Event Handling | 7.1 |
@@ -2022,11 +2012,12 @@ Configuration files shall have permissions `600` (rw-------).
 | UI-018 | Window Size and Background Attachment | 7.1 |
 | UI-019 | Sine Wave Background Transparency | 7.1 |
 | UI-020 | Sine Wave Line Thickness | 7.1 |
-| UI-021 | LLM Connection Status Indicator | 7.1 |
-| UI-022 | LLM Connection Status Color | 7.1 |
-| UI-023 | Interactive Connection Status Indicator | 7.3 |
-| FR-037 | Manual Connection Check | 3.7 |
-| WHISPER-013 | Connection Check via GET /v1/models | 6.1 |
+| UI-021 | Model Availability Status Indicator | 7.1 |
+| UI-022 | Model Availability Status Color | 7.1 |
+| UI-023 | Loading State Indicator | 7.1 |
+| FR-037 | Manual Model Verification | 3.7 |
+| WHISPER-013 | Model Metadata Extraction | 6.4 |
+| WHISPER-014 | Lazy Model Loading via Background Thread | 6.4 |
 | HK-002 | D-Bus Toggle Method | 8.5 |
 | HK-003 | Documentation | 8.5 |
 | HK-004 | D-Bus Call Fails — No Running Instance | 8.6 |
@@ -2035,7 +2026,7 @@ Configuration files shall have permissions `600` (rw-------).
 | CFG-002 | File Format | 9.1 |
 | CFG-003 | Default Configuration | 9.1 |
 | CFG-004 | Window Position | 9.2 |
-| CFG-005 | Whisper URL | 9.2 |
+| CFG-005 | Model Path | 9.2 |
 | CFG-006 | Audio Device | 9.2 |
 | CFG-010 | Microphone Selection | 9.2 |
 | CFG-011 | Load on Startup | 9.3 |
@@ -2044,33 +2035,30 @@ Configuration files shall have permissions `600` (rw-------).
 | CFG-014 | Max Recording Duration | 9.2 |
 | ERR-001 | File System Errors | 10.1 |
 | ERR-002 | Audio Capture Errors | 10.1 |
-| ERR-003 | Network Errors | 10.1 |
+| ERR-003 | Transcription Errors | 10.1 |
 | ERR-004 | GTK/GDK Errors | 10.1 |
 | ERR-005 | TextWindow Error Messages | 10.2 |
 | ERR-007 | Partial Functionality | 10.3 |
 | ERR-008 | Retry Mechanism | 10.3 |
 | ERR-009 | Audio Device Unavailable | 10.4 |
-| ERR-010 | Whisper API Unavailable | 10.4 |
+| ERR-010 | Model Load Failure | 10.4 |
 | ERR-011 | Display Connection Failed | 10.4 |
 | ERR-013 | Hotkey Toggle Errors | 10.4 |
-| ERR-014 | Pre-Recording Server Availability Check | 10.4 |
+| ERR-014 | Pre-Recording Model Availability Check | 10.4 |
 | DEP-001 | C/C++ Compiler | 11.1 |
 | DEP-002 | CMake | 11.1 |
 | DEP-003 | pkg-config | 11.1 |
-| DEP-004 | libcurl | 11.2 |
 | DEP-005 | Temporary File Storage | 11.2 |
 | DEP-006 | ALSA Library | 11.2 |
-| DEP-007 | PulseAudio Library | 11.2 |
-| DEP-008 | PipeWire Library | 11.2 |
+| DEP-007 | whisper.cpp Library | 11.2 |
 | DEP-009 | GTK3 Clipboard (Native) | 11.2 |
 | DEP-010 | Memory Buffer Scrubbing | 11.2 |
-| DEP-011 | JSON Library | 11.2 |
+| DEP-011 | JSON Library (cJSON) | 11.2 |
 | DEP-013 | D-Bus Library | 11.2 |
 | DEP-014 | GTK3 | 11.3 |
 | GAP-001 | XWayland Clipboard Boundary | 16.1 |
 | GAP-002 | memset_s glibc Trap | 16.2 |
 | GAP-003 | Concurrency Race Condition | 16.3 |
-| GAP-004 | Local API Routing | 16.4 |
 | DEPLOY-001 | Create Configuration Directory | 12.1 |
 | DEPLOY-002 | Install Binary | 12.1 |
 | DEPLOY-003 | Set Permissions | 12.1 |
@@ -2091,7 +2079,7 @@ Configuration files shall have permissions `600` (rw-------).
 | TEST-010 | Security Acceptance | 13.3 |
 | TEST-011 | Latency Benchmark | 13.4 |
 | TEST-012 | Edge Case - Audio Device Change | 13.5 |
-| TEST-013 | Edge Case - Network Disconnection | 13.5 |
+| TEST-013 | Edge Case - Model File Removal | 13.5 |
 | TEST-014 | Edge Case - Configuration Corruption | 13.5 |
 | TEST-015 | Hotkey Toggle | 13.1 |
 
@@ -2184,21 +2172,22 @@ This section documents the validation of the SRS by specialized domain experts, 
 **Validation Scope**: Audio capture pipeline, buffer management, sample rate conversion, audio backend selection.
 
 **Findings**:
-- AUD-003 through AUD-006 correctly specify 16000 Hz / 1 channel / 16-bit PCM / 1024-frame buffer, which aligns with Whisper API input requirements
-- AUD-012 through AUD-015 correctly prioritize PipeWire > PulseAudio > ALSA fallback chain for maximum Linux distribution compatibility
+- AUD-003 through AUD-006 correctly specify 16000 Hz / 1 channel / 16-bit PCM / 1024-frame buffer, which aligns with whisper.cpp input requirements
+- AUD-012 through AUD-015 correctly specify ALSA as the sole audio backend, using `snd_pcm_open()` with the `"default"` device to avoid `-EBUSY` conflicts with sound servers like PulseAudio/PipeWire
 - AUD-006 buffer size (1024 frames = ~64ms at 16kHz) provides optimal latency-throughput tradeoff
 - Temporary file handling via `mkstemp()` (AUD-007/AUD-008) prevents race conditions and symlink attacks
 - **Status**: APPROVED
 
-#### LLM API & Network Protocols Architect
+#### Speech-to-Text & Local Inference Architect
 
-**Validation Scope**: Whisper API integration, HTTP request/response handling, retry logic, JSON parsing.
+**Validation Scope**: Whisper.cpp integration, GGML/GGUF model management, GPU acceleration, transcription pipeline, retry logic.
 
 **Findings**:
-- WHISPER-001 through WHISPER-005 correctly specify OpenAI-compatible `/v1/audio/transcriptions` endpoint with proper multipart/form-data fields
-- WHISPER-006 correctly specifies `cJSON` for robust JSON parsing with error handling
-- WHISPER-009 (30s timeout) and WHISPER-010 (exponential backoff: 1s/2s/4s, max 3 retries) provide resilient network error handling
-- WHISPER-012 correctly mandates `curl_mime_init()` for efficient multipart upload construction
+- WHISPER-001 through WHISPER-003 correctly specify local GGML model file management, lazy loading, and GPU acceleration via CUDA
+- WHISPER-005 through WHISPER-007 correctly specify WAV file parsing, whisper.cpp transcription with `WHISPER_SAMPLING_GREEDY`, and text extraction from segments
+- WHISPER-009 correctly specifies error codes for local transcription failures (model not found, WAV read error, whisper_full failure)
+- WHISPER-010 correctly specifies retry logic with progressive backoff (100ms, 200ms, ...) for retryable errors only
+- WHISPER-014 correctly specifies lazy model loading via background thread with connection status transitions
 - **Status**: APPROVED
 
 #### GTK3/Wayland Display Protocols Specialist
@@ -2208,7 +2197,7 @@ This section documents the validation of the SRS by specialized domain experts, 
 **Findings**:
 - MainWindow correctly uses `gtk_window_set_decorated(FALSE)` to disable decorations, `gtk_window_set_resizable(FALSE)` to prevent resizing, and `gtk_window_set_title()` for proper window naming. GTK3 handles `_MOTIF_WM_HINTS`, `XSizeHints`, and `WM_NAME`/`_NET_WM_NAME` automatically via the GTK backend.
 - TextWindow correctly uses `gtk_window_set_transient_for()` for proper window stacking, and the `delete-event` signal for graceful hiding. GTK3 sets `WM_TRANSIENT_FOR` and `_NET_WM_WINDOW_TYPE_UTILITY` automatically for transient dialogs.
-- D-Bus integration via `g_unix_fd_add()` correctly polls for hotkey events within the GLib main context, which drives the GTK main loop (`gtk_main()`), preventing blocking.
+- D-Bus integration uses a timer-based polling approach via `g_timeout_source_new(100)` (100ms interval) to avoid `dbus_connection_get_unix_fd()` which can crash in some environments. The periodic `dbus_connection_read_write()` call processes messages within the GLib main context, preventing blocking.
 - D-Bus bus name ownership (`org.xvoice.Controller`) correctly prevents ghost instance launches.
 - Wayland compatibility correctly addressed: GTK3 natively supports Wayland via the `gtk-wayland` backend (falling back to X11 via `gtk-x11`). The D-Bus hotkey approach circumvents global-keylogger restrictions on Wayland, while GTK3 handles the display backend transparently.
 - **Status**: APPROVED

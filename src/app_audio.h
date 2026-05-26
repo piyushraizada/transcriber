@@ -126,10 +126,12 @@ AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder);
  * Start audio recording to a temporary WAV file.
  *
  * @param recorder      Pointer to a valid AudioRecorder. Must not be NULL.
- * @param max_duration  Maximum recording duration in seconds (0 = unlimited)
  * @return true if recording started successfully, false on failure.
+ *
+ * @note Duration enforcement is handled by the watchdog timer in main.c,
+ *       not by this function. The audio module has no concept of duration limits.
  */
-bool audio_recorder_start(AudioRecorder *recorder, int max_duration);
+bool audio_recorder_start(AudioRecorder *recorder);
 
 /**
  * Stop the current audio recording and finalize the WAV file.

@@ -86,6 +86,14 @@ AudioFormat audio_format_get_default(void) {
     return fmt;
 }
 
+/* LOW-15 fix: Replace PACK32 macro with inline function for clarity */
+static inline void pack32(unsigned char *buf, uint32_t val) {
+    buf[0] = (unsigned char)((val) & 0xFF);
+    buf[1] = (unsigned char)(((val) >> 8) & 0xFF);
+    buf[2] = (unsigned char)(((val) >> 16) & 0xFF);
+    buf[3] = (unsigned char)(((val) >> 24) & 0xFF);
+}
+
 static bool audio_format_write_wav_header(FILE *file, const AudioFormat *format) {
     if (!file || !format) return false;
 
@@ -133,21 +141,14 @@ static bool audio_format_write_wav_header(FILE *file, const AudioFormat *format)
 bool audio_format_finalize_wav_header(FILE *file, gsize data_size) {
     uint32_t ds = (uint32_t)data_size;
     uint32_t riff_size = ds + 36;  /* File size minus 8 bytes for RIFF descriptor */
-    unsigned char buf[4];
 
-    /* Helper lambda-like macro to pack uint32 into buf (little-endian) */
-    #define PACK32(val) do { \
-        buf[0] = (unsigned char)((val) & 0xFF); \
-        buf[1] = (unsigned char)(((val) >> 8) & 0xFF); \
-        buf[2] = (unsigned char)(((val) >> 16) & 0xFF); \
-        buf[3] = (unsigned char)(((val) >> 24) & 0xFF); \
-    } while(0)
+    unsigned char buf[4];
 
     /* Patch RIFF chunk size at offset 4 */
     if (fseek(file, 4, SEEK_SET) != 0) {
         return false;
     }
-    PACK32(riff_size);
+    pack32(buf, riff_size);
     size_t written = fwrite(buf, 1, 4, file);
     if (written != 4) {
         return false;
@@ -157,7 +158,7 @@ bool audio_format_finalize_wav_header(FILE *file, gsize data_size) {
     if (fseek(file, 40, SEEK_SET) != 0) {
         return false;
     }
-    PACK32(ds);
+    pack32(buf, ds);
     written = fwrite(buf, 1, 4, file);
     if (written != 4) {
         return false;
@@ -165,7 +166,6 @@ bool audio_format_finalize_wav_header(FILE *file, gsize data_size) {
 
     fseek(file, 0, SEEK_END);
 
-    #undef PACK32
     return true;
 }
 
@@ -181,6 +181,8 @@ struct _AudioRecorder {
     gint wav_fd;
     FILE *wav_file;
     gsize wav_data_size;
+    /* CRIT-3 fix: Protect wav_data_size with the same mutex as wav_file
+     * to prevent data races on non-x86 architectures. */
     gboolean is_recording;
 
     pthread_t capture_thread;
@@ -437,7 +439,14 @@ static void *capture_thread_func(void *arg) {
             set_audio_error("Failed to write audio data to WAV file");
             break;
         }
+        /* Protect wav_data_size with mutex for portable thread safety.
+         * Even though the main thread only reads after pthread_join, using
+         * the mutex here ensures correctness on all architectures. The mutex
+         * in start/stop protects is_recording during the capture phase,
+         * and wav_data_size concurrently. */
+        pthread_mutex_lock(&recorder->mutex);
         recorder->wav_data_size += (size_t)bytes_written_count;
+        pthread_mutex_unlock(&recorder->mutex);
         total_frames += (gsize)err;
 
         /* Calculate RMS volume level from PCM samples (16-bit signed) */
@@ -482,8 +491,10 @@ static void *capture_thread_func(void *arg) {
  * Recording control
  * =================================================================== */
 
-bool audio_recorder_start(AudioRecorder *recorder, int max_duration) {
-    (void)max_duration;
+/* HIGH-5 fix: Removed misleading max_duration parameter.
+ * Duration enforcement is done by the watchdog timer in main.c.
+ * The audio module has no concept of duration limits. */
+bool audio_recorder_start(AudioRecorder *recorder) {
 
     /* M1-003 fix: Reset any stale error before starting a new recording */
     audio_recorder_reset_error();

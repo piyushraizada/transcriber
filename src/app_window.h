@@ -453,6 +453,12 @@ void app_text_window_set_error(TextWindow *tw, const char *error);
  */
 void app_window_set_volume_level(MainWindow *win, double level);
 
+/* MED-9 fix: Get/set the last volume level for threshold-based updates.
+ * These are used by the volume poll callback in main.c to avoid
+ * unnecessary GTK widget redraws. */
+double app_window_get_last_volume_level(MainWindow *win);
+void app_window_set_last_volume_level(MainWindow *win, double level);
+
 /* app_window_set_model_loading — Update the model loading indicator.
  *
  * When model_loading is TRUE, the icon draw callback overlays "WAIT" text

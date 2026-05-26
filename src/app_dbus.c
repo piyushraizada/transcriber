@@ -355,7 +355,10 @@ bool dbus_service_stop(DBusService *service) {
     }
 
     /* Do NOT close shared connections obtained via dbus_bus_get().
-     * Just release the bus name and clear the pointer. */
+     * The session bus connection is shared across the process, and closing
+     * it would break other D-Bus users. Just release the bus name and clear
+     * the pointer. After this, dbus_service_process_messages() will return
+     * false silently if called (connection is NULL guard). */
     service->connection = NULL;
 
     return true;

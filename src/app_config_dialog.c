@@ -269,10 +269,17 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
             config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
             valid = FALSE;
         } else {
-            /* Validate GGUF/GGML format by attempting to load metadata */
+            /* Validate GGUF/GGML format by attempting to load metadata
+             * HIGH-7 fix: model_info_load now returns false on I/O errors,
+             * so we check return value first, then info.valid for format. */
             ModelInfo info;
             model_info_init(&info);
-            if (!model_info_load(model_path, &info) || !info.valid) {
+            if (!model_info_load(model_path, &info)) {
+                /* I/O error — file not found, cannot open, etc. */
+                config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
+                valid = FALSE;
+            } else if (!info.valid) {
+                /* File opened but not a valid Whisper model */
                 config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
                 valid = FALSE;
             } else {
@@ -379,25 +386,21 @@ static gboolean model_info_load_callback(gpointer user_data) {
     ModelInfo info;
     model_info_init(&info);
 
-    if (model_info_load(path, &info)) {
-        if (info.valid) {
-            /* MIN-006 fix: Escape model metadata for Pango markup safety */
-            gchar *escaped_name = g_markup_escape_text(info.model_name, -1);
-            gchar *escaped_quant = g_markup_escape_text(info.quantization, -1);
-            const char *lang_str = info.multilingual ? "Multilingual" : "English-only";
-            char markup[512];
-            snprintf(markup, sizeof(markup),
-                "<span size='small'><b>%s</b> — %s — %s</span>",
-                escaped_name, escaped_quant, lang_str);
-            gtk_label_set_markup(dlg->model_info_label, markup);
-            g_free(escaped_name);
-            g_free(escaped_quant);
-        } else {
-            /* Show user-friendly error for invalid models */
-            gtk_label_set_markup(dlg->model_info_label,
-                "<span foreground='red' size='small'>No valid whisper ggml file found</span>");
-        }
+    /* HIGH-7 fix: Check return value first, then info.valid */
+    if (model_info_load(path, &info) && info.valid) {
+        /* MIN-006 fix: Escape model metadata for Pango markup safety */
+        gchar *escaped_name = g_markup_escape_text(info.model_name, -1);
+        gchar *escaped_quant = g_markup_escape_text(info.quantization, -1);
+        const char *lang_str = info.multilingual ? "Multilingual" : "English-only";
+        char markup[512];
+        snprintf(markup, sizeof(markup),
+            "<span size='small'><b>%s</b> — %s — %s</span>",
+            escaped_name, escaped_quant, lang_str);
+        gtk_label_set_markup(dlg->model_info_label, markup);
+        g_free(escaped_name);
+        g_free(escaped_quant);
     } else {
+        /* I/O error or invalid model — show error */
         gtk_label_set_markup(dlg->model_info_label,
             "<span foreground='red' size='small'>No valid whisper ggml file found</span>");
     }

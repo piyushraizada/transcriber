@@ -90,7 +90,7 @@ bool gpu_get_device_name(int device_idx, char *name_out, size_t name_size)
                 device_idx, cudaGetErrorString(err));
         return false;
     }
-    snprintf(name_out, name_size, "%s", prop.name);
+    snprintf(name_out, name_size, "%.*s", (int)(name_size > 0 ? name_size - 1 : 0), prop.name);
     return true;
 }
 
@@ -142,6 +142,39 @@ bool gpu_get_memory_info(int device_idx, size_t *free_bytes, size_t *total_bytes
  * Section 3: GPU Selection
  *---------------------------------------------------------------------------*/
 
+bool gpu_release_unused_devices(int used_device_idx)
+{
+    if (used_device_idx < 0) return false;
+
+#ifndef HAVE_CUDA
+    return false;
+#endif
+
+    int device_count = 0;
+    if (!gpu_get_device_count(&device_count)) {
+        return false;
+    }
+
+    for (int i = 0; i < device_count; i++) {
+        if (i != used_device_idx) {
+            cudaSetDevice(i);
+            cudaError_t err = cudaDeviceReset();
+            if (err != cudaSuccess) {
+                g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+                        "[gpu] cudaDeviceReset(%d) failed: %s\n",
+                        i, cudaGetErrorString(err));
+            } else {
+                g_log("app-gpu", G_LOG_LEVEL_DEBUG,
+                        "[gpu] Released CUDA context on device %d\n", i);
+            }
+        }
+    }
+
+    /* Ensure the used device is the current one */
+    cudaSetDevice(used_device_idx);
+    return true;
+}
+
 bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
 {
     if (!best_device_idx) return false;
@@ -161,8 +194,9 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
     size_t best_free = 0;
 
     for (int i = 0; i < device_count; i++) {
-        size_t free_mem = 0, total_mem = 0;
-        if (gpu_get_memory_info(i, &free_mem, &total_mem)) {
+        /* MED-8 fix: Removed unused total_mem variable */
+        size_t free_mem = 0;
+        if (gpu_get_memory_info(i, &free_mem, NULL)) {
             char name[128] = {"Unknown"};
             gpu_get_device_name(i, name, sizeof(name));
 
@@ -182,6 +216,12 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
 
     *best_device_idx = best_idx;
     if (free_bytes) *free_bytes = best_free;
+
+    /* Release CUDA contexts on all non-selected devices.
+     * Querying memory via cudaSetDevice + cudaMemGetInfo creates a CUDA
+     * context (~256 MiB) on each device. Reset the contexts on devices
+     * we won't use so they don't hold VRAM unnecessarily. */
+    gpu_release_unused_devices(best_idx);
 
     return true;
 }
@@ -220,6 +260,10 @@ bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes
     }
 
     *best_device_idx = best_idx;
+
+    /* Release CUDA contexts on non-selected devices (was missing here) */
+    gpu_release_unused_devices(best_idx);
+
     return true;
 }
 

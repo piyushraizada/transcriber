@@ -152,6 +152,9 @@ struct _MainWindow {
     /* Countdown timer */
     guint countdown_source_id;
     int countdown_seconds;
+    /* MED-9 fix: Volume level tracking moved from global to struct
+     * to avoid fragile global mutable state. */
+    double last_volume_level;
     /* Toggle callback — invoked when the mic icon is clicked */
     void (*on_toggle)(void *user_data);
     void *toggle_user_data;
@@ -619,17 +622,23 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
     }
     (void)event;
 
-    int mx, my, mw, mh;
-    gtk_window_get_position(GTK_WINDOW(widget), &mx, &my);
-    gtk_window_get_size(GTK_WINDOW(widget), &mw, &mh);
+    /* Use gdk_window_get_frame_extents to get the outer frame rectangle
+     * (including title bar and borders). gtk_window_get_position() returns
+     * the outer frame position, but gtk_window_get_size() returns only the
+     * client area. Using frame extents ensures the TextWindow is placed
+     * below the actual bottom edge of the window, not overlapping the
+     * status bar. */
+    GdkWindow *gdk_win = gtk_widget_get_window(widget);
+    GdkRectangle frame_rect;
+    gdk_window_get_frame_extents(gdk_win, &frame_rect);
 
     /* Get TextWindow size */
     int tw_w, tw_h;
     gtk_window_get_size(tw->window, &tw_w, &tw_h);
 
     /* Try to position below MainWindow */
-    int tx = mx;
-    int ty = my + mh + TEXT_WINDOW_OFFSET_Y;
+    int tx = frame_rect.x;
+    int ty = frame_rect.y + frame_rect.height + TEXT_WINDOW_OFFSET_Y;
 
     /* Check if it would go off the bottom of the screen */
     GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(tw->window));
@@ -639,7 +648,7 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
 
     if (ty + tw_h > monitor.y + monitor.height) {
         /* Position above the MainWindow instead */
-        ty = my - tw_h - TEXT_WINDOW_OFFSET_Y;
+        ty = frame_rect.y - tw_h - TEXT_WINDOW_OFFSET_Y;
         if (ty < monitor.y) {
             ty = monitor.y;
         }
@@ -660,6 +669,7 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     if (!win) {
         return NULL;
     }
+    win->last_volume_level = -1.0;
 
     win->config = config;
     win->controller = controller;
@@ -1022,17 +1032,23 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
 
     /* Position below MainWindow, with screen boundary check */
     if (main_window_gtk && gtk_widget_get_visible(GTK_WIDGET(main_window_gtk))) {
-        int mx, my, mw, mh;
-        gtk_window_get_position(main_window_gtk, &mx, &my);
-        gtk_window_get_size(main_window_gtk, &mw, &mh);
+        /* Use gdk_window_get_frame_extents to get the outer frame rectangle
+         * (including title bar and borders). gtk_window_get_position() returns
+         * the outer frame position, but gtk_window_get_size() returns only the
+         * client area. Using frame extents ensures the TextWindow is placed
+         * below the actual bottom edge of the window, not overlapping the
+         * status bar. */
+        GdkWindow *gdk_win = gtk_widget_get_window(GTK_WIDGET(main_window_gtk));
+        GdkRectangle frame_rect;
+        gdk_window_get_frame_extents(gdk_win, &frame_rect);
 
         /* Get TextWindow size */
         int tw_w, tw_h;
         gtk_window_get_size(tw->window, &tw_w, &tw_h);
 
         /* Try to position below MainWindow */
-        int tx = mx;
-        int ty = my + mh + TEXT_WINDOW_OFFSET_Y;
+        int tx = frame_rect.x;
+        int ty = frame_rect.y + frame_rect.height + TEXT_WINDOW_OFFSET_Y;
 
         /* Check if it would go off the bottom of the screen */
         GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(tw->window));
@@ -1042,7 +1058,7 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
 
         if (ty + tw_h > monitor.y + monitor.height) {
             /* Position above the MainWindow instead */
-            ty = my - tw_h - TEXT_WINDOW_OFFSET_Y;
+            ty = frame_rect.y - tw_h - TEXT_WINDOW_OFFSET_Y;
             if (ty < monitor.y) {
                 ty = monitor.y;
             }
@@ -1148,4 +1164,14 @@ void app_window_set_model_loading(MainWindow *win, bool model_loading) {
 bool app_window_get_model_loading(MainWindow *win) {
     if (!win) return FALSE;
     return win->model_loading;
+}
+
+double app_window_get_last_volume_level(MainWindow *win) {
+    if (!win) return -1.0;
+    return win->last_volume_level;
+}
+
+void app_window_set_last_volume_level(MainWindow *win, double level) {
+    if (!win) return;
+    win->last_volume_level = level;
 }
