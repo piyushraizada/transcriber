@@ -257,7 +257,7 @@ The MainWindow is the primary application window hosting the microphone icon, si
 - **Resize Policy**: Fixed size enforced via `gtk_window_set_resizable(window, FALSE)`.
 - **Window Type Hint**: `GDK_WINDOW_TYPE_HINT_UTILITY` for proper window manager behavior.
 - **Icon Rendering**: Microphone icon displayed via `GtkImage` widget loaded from embedded XPM data using `gdk_pixbuf_new_from_xpm_array()`.
-- **Sine Wave Animation**: Rendered on a `GtkDrawingArea` widget using Cairo (`cr = gtk DrawingArea_get_window()`, `cairo_set_source_rgb()`, `cairo_stroke()`). Timer-driven via `g_timeout_add(33, ...)` for 30fps.
+- **Sine Wave Animation**: Rendered on a `GtkDrawingArea` widget using Cairo (`cr = gtk_drawing_area_get_window()`, `cairo_set_source_rgb()`, `cairo_stroke()`). Timer-driven via `g_timeout_add(33, ...)` for 30fps.
 - **Status Bar**:
   - 16-pixel dark-gray `GtkBox` rendered at the bottom of the window.
   - **Left side**: Gear/cog icon (settings button) as a `GtkButton` with `GtkImage` loaded from `assets/gear.xpm` via `gdk_pixbuf_new_from_xpm_array()`. Opens the Configuration Dialog when clicked.
@@ -310,10 +310,8 @@ The application responds by toggling between IDLE and LISTENING/TRANSCRIBING sta
 
 - The GTK main loop in the Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch integrated into the GLib main context.
 - This design eliminates the need for a dedicated D-Bus thread, reducing complexity and resource usage.
-- **Prevents Ghost Instances**: D-Bus bus name ownership (`org.xvoice.Controller`) naturally enforces single-instance semantics, eliminating the need for lock files.
-- **Circumvents Wayland Global-Keylogger Restrictions**: Since the application does not register global keyboard shortcuts itself (hotkeys are configured externally in the compositor/DE), it avoids Wayland's security restrictions on applications attempting to capture global key events. The D-Bus interface works identically under X11 and Wayland.
-
-The application responds by toggling between IDLE and LISTENING/TRANSCRIBING states, with all UI updates (icon change, animation, text area) behaving identically to a mouse-click-triggered toggle.
+- D-Bus bus name ownership (`org.xvoice.Controller`) enforces single-instance semantics, eliminating the need for lock files.
+- Since the application does not register global keyboard shortcuts itself (hotkeys are configured externally in the compositor/DE), it avoids Wayland's security restrictions on applications attempting to capture global key events. The D-Bus interface works identically under X11 and Wayland.
 
 ---
 
@@ -529,7 +527,7 @@ The TextWindow shall be positioned below the MainWindow by default. If the TextW
 #### FR-037: Manual Model Verification
 The application shall allow the user to manually trigger a model file verification by clicking the connection status indicator in the status bar. If the model file is accessible, the indicator shall turn green; if not, the indicator shall remain red.
 
-**Traceability**: FR-037 → WHISPER-013, UI-023
+**Traceability**: FR-037 → WHISPER-013, UI-024
 
 ### 3.8 Transcription Session
 
@@ -923,86 +921,21 @@ This strategy ensures the application avoids the `-EBUSY` (Device or Resource Bu
 
 **Traceability**: AUD-015 → AUD-012, AUD-013, AUD-014
 
-### 5.6 Linux Audio Stack Architecture — Deep Dive
+### 5.6 ALSA Device Access Requirements
 
-**Objective**: Validate audio pipeline abstraction (AUD-012, AUD-013, AUD-014) and transient connection survivability through a comprehensive understanding of the Linux audio subsystem layers, exclusive device locking, and sound server multiplexing.
+#### AUD-018: ALSA Device Name Selection
+The application shall use the ALSA `"default"` device name (not direct hardware identifiers like `hw:0,0`) when opening audio capture devices via `snd_pcm_open()`. The `"default"` device name provides plugin-based format conversion and avoids exclusive-lock conflicts (`-EBUSY`) when other applications are simultaneously accessing the same hardware through a sound server (PulseAudio or PipeWire).
 
-#### 5.6.1 The ALSA Core: Direct Hardware Binding (`hw:0,0`)
+**Traceability**: AUD-018 → AUD-012, AUD-013, AUD-014, AUD-015
 
-Advanced Linux Sound Architecture (ALSA) is part of the Linux kernel. When an application requests an audio stream directly from ALSA using a hardware device identifier like `hw:0,0`, it is talking directly to the kernel driver for that specific sound card.
+#### AUD-017: ALSA Capture API Usage
+The application shall perform audio capture using the following ALSA (`libasound`) API sequence:
+1. Open the configured ALSA device using `snd_pcm_open()`
+2. Configure the PCM stream parameters (16kHz, mono, 16-bit PCM) using `snd_pcm_hw_params()`
+3. Read PCM frames using `snd_pcm_readi()` in a dedicated audio capture thread
+4. Close the PCM stream using `snd_pcm_close()` when recording stops
 
-```
-┌──────────────┐     open() / read()     ┌──────────────────┐     DMA     ┌──────────────┐
-│  Application  │ ──────────────────────► │  ALSA Kernel      │ ──────────► │  Hardware    │
-│  (your app)   │                         │  Driver (hw:0,0)  │             │  (sound card)│
-└──────────────┘                         └──────────────────┘             └──────────────┘
-                                              │
-                                    exclusive open() lock
-                                    /dev/snd/pcmC0D0c
-```
-
-**The Locking Mechanism:**
-
-The standard ALSA hardware device interface operates on a simple POSIX file system mechanism: **exclusive open**.
-
-When your application opens `/dev/snd/pcmC0D0c` (the character device for capture card 0, device 0):
-1. The kernel driver allocates the hardware's DMA (Direct Memory Access) channels to your process's memory buffer.
-2. The device file enters a locked state.
-3. If a second application (like Zoom, Teams, or a browser) attempts an `open()` system call on that same device file, the kernel immediately rejects it, returning the error code **`-EBUSY` (Device or Resource Busy)**.
-
-This is the root cause of the "microphone locked" problem on Linux when applications bypass the sound server and attempt direct hardware access.
-
-**The "Software" Workaround: ALSA `dmix` / `dsnoop`:**
-
-ALSA has a built-in user-space plugin system framework called `alsa-lib`. It includes a plugin called `dsnoop` for splitting input capture streams among multiple applications. However, `dsnoop` has significant limitations:
-- Requires manual configuration in a local `.asoundrc` file.
-- Does not handle dynamic hardware hot-plugging (such as plugging in a USB mic mid-session).
-- Lacks an intelligent resampler. If one application requests 44.1 kHz audio and your app requests 16 kHz mono, standard ALSA plugins often fail or stutter.
-
-#### 5.6.2 ALSA Audio Architecture
-
-Modern Linux distributions do not let user applications talk directly to `hw:0,0`. Instead, they run an intermediate background server (a sound server) that acts as a **central proxy** or a virtual switchboard.
-
-```
-┌──────────────┐
-│  Application  │ ──┐
-│  (your app)   │   │
-└──────────────┘   │  shared Unix socket
-                   │
-┌──────────────┐   │
-│  Application  │ ──┤  ┌──────────────────────┐     open()     ┌──────────────────┐     DMA     ┌──────────────┐
-│  (Zoom/Teams) │ ──┤──►│  ALSA Kernel          │ ──────────► │  Hardware    │
-└──────────────┘   │  │  Driver (hw:0,0)       │             │  (sound card)│
-┌──────────────┐   │  └──────────────────┘             └──────────────┘
-│  Application  │ ──┘
-│  (Browser)    │
-└──────────────┘
-```
-
-**How They Prevent Microphone Locking:**
-
-When using ALSA, **the application holds the open lock** on the physical ALSA kernel driver.
-
-1. **Direct Hardware Access:** When your app wants to record audio, it uses `libasound` (`snd_pcm_open()`) to open the ALSA PCM device directly.
-2. **Device Names:** Use ALSA device names like `"default"` (which provides plugin-based format conversion) or `"hw:0,0"` (direct hardware access).
-3. **Dynamic Routing:** If you unplug a USB microphone or turn on a Bluetooth headset, the sound server dynamically maps the application streams to the new hardware device transparently without your application crashing or needing to restart its audio loops.
-
-#### 5.6.3 What This Means for Developing Your Application
-
-To make your application a stable daily driver that doesn't conflict with system audio, the code should avoid hardcoding direct ALSA dependencies (`libasound`). Instead, choose one of the following runtime strategy approaches:
-
-**Strategy A: Dynamic Library Loading (`dlopen`)**
-
-Your C/C++ application uses ALSA (`libasound`) directly for audio capture:
-1. Open the configured ALSA device using `snd_pcm_open()`.
-2. Configure the PCM stream with `snd_pcm_hw_params()` for the desired format (16kHz mono 16-bit).
-3. Read PCM frames using `snd_pcm_readi()` in a dedicated capture thread.
-
-#### 5.6.4 Research Findings Summary
-
-**ALSA Device Selection**: Use the `"default"` ALSA device name, which provides format conversion and plugin support. This avoids format mismatches and works across all Linux distributions.
-
-**Buffer Safety**: A buffer size of 1024 frames at 16kHz translates to roughly 64ms chunks. This is mathematically optimal for keeping UI wave responsiveness under the 200ms target latency threshold without overloading the CPU.
+**Traceability**: AUD-017 → AUD-012, AUD-013
 
 ---
 
@@ -1305,10 +1238,10 @@ The configuration dialog shall include a drop-down (combo box) showing all avail
 
 **Traceability**: UI-015 → FR-020, FR-008a
 
-#### UI-023: Interactive Connection Status Indicator
+#### UI-024: Interactive Connection Status Indicator
 The connection status indicator circle (defined in UI-021) shall act as a clickable button area. When clicked while in the Red (disconnected) state, the application shall immediately execute a model file verification (WHISPER-012). During the verification, the indicator shall briefly display a visual active state (e.g., turning Yellow or blinking) until the verification result is received. If clicked while in the Green (connected) state, the click shall be ignored or silently re-verify the model without visual disruption.
 
-**Traceability**: UI-023 → FR-037, WHISPER-012, UI-021
+**Traceability**: UI-024 → FR-037, WHISPER-012, UI-021
 
 ### 7.4 Hotkey UI Integration
 
@@ -1337,45 +1270,30 @@ The application registers the following D-Bus interface on startup using GDBus (
 
 The `Toggle` method takes no parameters and returns no values. It simply toggles the recording state of the application.
 
-### 8.3 Application Behavior (The Listener)
+### 8.3 D-Bus Registration Requirements
 
-On startup, the application:
-1. Uses GDBus (GIO) to connect to the user's Session Bus
-2. Requests the well-known bus name `org.xvoice.Controller`
-3. Registers the object path `/org/xvoice/App` with interface `org.xvoice.Actions`
-4. Binds the `Toggle` method to the internal state-toggle handler
-5. The D-Bus daemon handles all networking and message listening in the background
-6. The application continues its normal job (rendering UI, waiting for input)
+#### HK-001: D-Bus Registration on Startup
+On startup, the application shall:
+1. Connect to the D-Bus session bus using GDBus (GIO)
+2. Request ownership of the well-known bus name `org.xvoice.Controller`
+3. Register the object path `/org/xvoice/App` with interface `org.xvoice.Actions`
+4. Bind the `Toggle` method to the internal state-toggle handler
 
-### 8.4 Hotkey Configuration (The Trigger)
+The D-Bus bus name ownership shall enforce single-instance semantics, preventing multiple instances of the application from running simultaneously.
 
-OS keyboard shortcuts map to the `dbus-send` command (not the transcriber binary):
+**Traceability**: HK-001 → HK-002, FR-036
+
+### 8.4 Hotkey Command Specification
+
+The external hotkey trigger shall invoke the following `dbus-send` command:
 
 ```bash
 dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle
 ```
 
-**Example configurations:**
+The application shall respond to this D-Bus method call identically regardless of whether the display server is X11 or Wayland. The hotkey is configured externally by the user in their desktop environment or window manager; the application does not register or manage global keyboard shortcuts.
 
-- **GNOME, KDE, XFCE, etc.:** Use the desktop environment's keyboard shortcut settings to assign a key combination that runs the `dbus-send` command above.
-- **sxhkd/i3:** Add to `~/.config/sxhkd/sxhkdrc`:
-  ```
-  super + shift + m
-      dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle
-  ```
-- **xbindkeys:** Add to `~/.xbindkeysrc`:
-  ```
-  "dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle"
-      Mod4 + Shift + m
-  ```
-- **Wayland (Sway):** Add to `~/.config/sway/config`:
-  ```
-  bindsym Mod4+Shift+m exec "dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle"
-  ```
-- **Wayland (Hyprland):** Add to `~/.config/hypr/hyprland.conf`:
-  ```
-  bind = MOD, SHIFT, M, exec, dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle
-  ```
+**Traceability**: HK-003 → FR-036, NR-020
 
 ### 8.5 Hotkey Requirements
 
@@ -1400,20 +1318,6 @@ If the `dbus-send` command is executed and no running instance of the applicatio
 If the D-Bus session bus is unavailable at application startup, the application shall log a warning to stderr and continue operating without hotkey support. The application shall not attempt to fall back to any other IPC mechanism for hotkey toggling.
 
 **Traceability**: HK-005 → ERR-013
-
-### 8.7 D-Bus Hotkey Architecture Validation
-
-**Objective**: Validate D-Bus-based hotkey architecture for zero-overhead, universal Linux desktop compatibility.
-
-#### Research & Findings
-
-**Zero Overhead**: `dbus-send` is an incredibly tiny, fast C binary pre-installed on virtually every Linux desktop. Execution takes fractions of a millisecond, introducing negligible latency to hotkey activation.
-
-**No App Clones**: No need to worry about accidentally starting multiple instances of transcriber or writing complex lock-file logic. The D-Bus daemon handles single-instance semantics naturally through bus name ownership.
-
-**Universal Compatibility**: The same `dbus-send` command works on X11 (sxhkd, i3, XFCE) and Wayland (Sway, Hyprland, Gnome). GTK3 handles display server abstraction transparently. There is no need for display-server-specific hotkey implementations.
-
-**The Architecture**: By relying on the D-Bus daemon already running on the Linux system, the architecture is clean. The application registers a D-Bus interface on startup; the hotkey triggers a `dbus-send` method call. No secondary processes, no lock files, no CLI toggle arguments needed. The D-Bus daemon handles all networking and message routing in the background, with the application simply responding to method calls on its registered interface.
 
 ---
 
@@ -1854,9 +1758,9 @@ Configuration files shall have permissions `600` (rw-------).
 
 #### TEST-008: Functional Acceptance
 - All functional requirements FR-001 through FR-036 pass
-- All audio requirements AUD-001 through AUD-015 pass
-- All Whisper requirements WHISPER-001 through WHISPER-012 pass
-- All UI requirements UI-001 through UI-022 pass
+- All audio requirements AUD-001 through AUD-018 pass
+- All Whisper requirements WHISPER-001 through WHISPER-014 pass
+- All UI requirements UI-001 through UI-028 pass
 - All hotkey requirements HK-002 through HK-005 pass
 - All configuration requirements CFG-001 through CFG-013 pass
 - All error handling requirements ERR-001 through ERR-013 pass
@@ -1981,6 +1885,9 @@ Configuration files shall have permissions `600` (rw-------).
 | AUD-013 | ALSA as Primary Backend | 5.5 |
 | AUD-014 | ALSA Device Selection | 5.5 |
 | AUD-015 | Runtime Audio Backend Selection | 5.5 |
+| AUD-016 | Real-Time RMS Volume Level Computation | 6.4 |
+| AUD-017 | ALSA Capture API Usage | 5.6 |
+| AUD-018 | ALSA Device Name Selection | 5.6 |
 | WHISPER-001 | Model Path Configuration | 6.1 |
 | WHISPER-002 | Model Loading | 6.1 |
 | WHISPER-003 | GPU (CUDA) Acceleration | 6.1 |
@@ -2015,6 +1922,7 @@ Configuration files shall have permissions `600` (rw-------).
 | UI-021 | Model Availability Status Indicator | 7.1 |
 | UI-022 | Model Availability Status Color | 7.1 |
 | UI-023 | Loading State Indicator | 7.1 |
+| UI-024 | Interactive Connection Status Indicator | 7.3 |
 | FR-037 | Manual Model Verification | 3.7 |
 | WHISPER-013 | Model Metadata Extraction | 6.4 |
 | WHISPER-014 | Lazy Model Loading via Background Thread | 6.4 |
@@ -2160,47 +2068,6 @@ Embedded XPM arrays (from CMake build) are converted to GdkPixbuf, then saved as
 #### Dependencies
 
 - `libayatana-appindicator` (preferred) or `libappindicator` (fallback)
-
----
-
-### 14.3 Multi-Agent Validation
-
-This section documents the validation of the SRS by specialized domain experts, ensuring comprehensive coverage across all technical domains.
-
-#### Systems & Multimedia Audio Engineer
-
-**Validation Scope**: Audio capture pipeline, buffer management, sample rate conversion, audio backend selection.
-
-**Findings**:
-- AUD-003 through AUD-006 correctly specify 16000 Hz / 1 channel / 16-bit PCM / 1024-frame buffer, which aligns with whisper.cpp input requirements
-- AUD-012 through AUD-015 correctly specify ALSA as the sole audio backend, using `snd_pcm_open()` with the `"default"` device to avoid `-EBUSY` conflicts with sound servers like PulseAudio/PipeWire
-- AUD-006 buffer size (1024 frames = ~64ms at 16kHz) provides optimal latency-throughput tradeoff
-- Temporary file handling via `mkstemp()` (AUD-007/AUD-008) prevents race conditions and symlink attacks
-- **Status**: APPROVED
-
-#### Speech-to-Text & Local Inference Architect
-
-**Validation Scope**: Whisper.cpp integration, GGML/GGUF model management, GPU acceleration, transcription pipeline, retry logic.
-
-**Findings**:
-- WHISPER-001 through WHISPER-003 correctly specify local GGML model file management, lazy loading, and GPU acceleration via CUDA
-- WHISPER-005 through WHISPER-007 correctly specify WAV file parsing, whisper.cpp transcription with `WHISPER_SAMPLING_GREEDY`, and text extraction from segments
-- WHISPER-009 correctly specifies error codes for local transcription failures (model not found, WAV read error, whisper_full failure)
-- WHISPER-010 correctly specifies retry logic with progressive backoff (100ms, 200ms, ...) for retryable errors only
-- WHISPER-014 correctly specifies lazy model loading via background thread with connection status transitions
-- **Status**: APPROVED
-
-#### GTK3/Wayland Display Protocols Specialist
-
-**Validation Scope**: GTK3 window management, WM hints, D-Bus integration, Wayland compatibility considerations.
-
-**Findings**:
-- MainWindow correctly uses `gtk_window_set_decorated(FALSE)` to disable decorations, `gtk_window_set_resizable(FALSE)` to prevent resizing, and `gtk_window_set_title()` for proper window naming. GTK3 handles `_MOTIF_WM_HINTS`, `XSizeHints`, and `WM_NAME`/`_NET_WM_NAME` automatically via the GTK backend.
-- TextWindow correctly uses `gtk_window_set_transient_for()` for proper window stacking, and the `delete-event` signal for graceful hiding. GTK3 sets `WM_TRANSIENT_FOR` and `_NET_WM_WINDOW_TYPE_UTILITY` automatically for transient dialogs.
-- D-Bus integration uses GDBus (GIO), which integrates natively with the GLib main loop for event-driven message processing, eliminating the need for manual polling and avoiding potential crashes associated with low-level D-Bus file descriptor handling.
-- D-Bus bus name ownership (`org.xvoice.Controller`) correctly prevents ghost instance launches.
-- Wayland compatibility correctly addressed: GTK3 natively supports Wayland via the `gtk-wayland` backend (falling back to X11 via `gtk-x11`). The D-Bus hotkey approach circumvents global-keylogger restrictions on Wayland, while GTK3 handles the display backend transparently.
-- **Status**: APPROVED
 
 ---
 
