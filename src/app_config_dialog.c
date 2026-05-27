@@ -88,7 +88,7 @@ bool config_dialog_default_model_exists(void) {
  * Validate that a path points to a valid Whisper model (GGML or GGUF).
  * Uses whisper.cpp's own model loader for authoritative validation.
  */
-bool config_dialog_validate_gguf_model(const char *path) {
+bool config_dialog_validate_model(const char *path) {
     if (!path || path[0] == '\0') return false;
     return whisper_validate_model_file(path);
 }
@@ -166,13 +166,11 @@ void config_dialog_clear_error(GtkLabel *error_label) {
 
 /**
  * config_dialog_get_audio_devices
- * Queries the audio backend for available input devices.
+ * Queries ALSA for available input devices.
  *
- * @param backend Audio backend to query
  * @return GtkListStore* of device names (caller must unref), or NULL
  */
-GtkListStore * config_dialog_get_audio_devices(AudioBackend backend) {
-    (void)backend;
+GtkListStore * config_dialog_get_audio_devices(void) {
 
     /* Two-column store: col 0 = display name, col 1 = device name */
     GtkListStore *store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
@@ -490,7 +488,7 @@ static void on_browse_model_clicked(GtkButton *button, ConfigDialog *dlg) {
         gchar *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
         if (filename) {
             /* Immediately validate the selected file as a valid GGUF model */
-            if (config_dialog_validate_gguf_model(filename)) {
+            if (config_dialog_validate_model(filename)) {
                 /* Valid model — set path, clear error, and load metadata */
                 config_dialog_clear_error(dlg->model_path_error);
                 gtk_entry_set_text(dlg->model_path_entry, filename);
@@ -672,7 +670,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
 
     /* First, check if the configured path is valid */
     if (current_path && current_path[0] != '\0') {
-        if (config_dialog_validate_gguf_model(current_path)) {
+        if (config_dialog_validate_model(current_path)) {
             /* Config has a valid model — use it */
             has_valid_model = true;
         }
@@ -717,7 +715,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     gtk_label_set_xalign(GTK_LABEL(device_label), 0);
     gtk_box_pack_start(GTK_BOX(vbox), device_label, FALSE, FALSE, 0);
 
-    GtkListStore *device_store = config_dialog_get_audio_devices(AUDIO_BACKEND_NONE);
+    GtkListStore *device_store = config_dialog_get_audio_devices();
     dlg->device_combo = GTK_COMBO_BOX(gtk_combo_box_new_with_model(GTK_TREE_MODEL(device_store)));
     g_object_unref(device_store);
 

@@ -34,8 +34,7 @@
 int app_state_controller_init(AppStateController *controller,
                               AppConfig *config,
                               transcription_result_callback on_transcription_result,
-                              connection_status_callback on_connection_status,
-                              recording_stop_callback on_recording_stop,
+                              model_status_callback on_model_status,
                               state_change_callback on_state_change,
                               void *user_data) {
     if (!controller || !config) {
@@ -50,12 +49,11 @@ int app_state_controller_init(AppStateController *controller,
 
     /* Set initial state */
     controller->state = STATE_IDLE;
-    controller->connection_status = CONNECTION_DISCONNECTED;
+    controller->model_status = MODEL_UNAVAILABLE;
     controller->sequence_counter = 0;
     controller->config = config;
     controller->on_transcription_result = on_transcription_result;
-    controller->on_connection_status = on_connection_status;
-    controller->on_recording_stop = on_recording_stop;
+    controller->on_model_status = on_model_status;
     controller->on_state_change = on_state_change;
     controller->callback_user_data = user_data;
 
@@ -78,12 +76,12 @@ AppState app_get_state(AppStateController *controller) {
     return state;
 }
 
-ConnectionStatus app_get_connection_status(AppStateController *controller) {
-    if (!controller) return CONNECTION_DISCONNECTED;
+ModelStatus app_get_model_status(AppStateController *controller) {
+    if (!controller) return MODEL_UNAVAILABLE;
 
-    ConnectionStatus status;
+    ModelStatus status;
     pthread_mutex_lock(&controller->state_mutex);
-    status = controller->connection_status;
+    status = controller->model_status;
     pthread_mutex_unlock(&controller->state_mutex);
 
     return status;
@@ -127,11 +125,11 @@ bool app_transition_to(AppStateController *controller, AppState target) {
     return allowed;
 }
 
-void app_set_connection_status(AppStateController *controller, ConnectionStatus status) {
+void app_set_model_status(AppStateController *controller, ModelStatus status) {
     if (!controller) return;
 
     pthread_mutex_lock(&controller->state_mutex);
-    controller->connection_status = status;
+    controller->model_status = status;
     pthread_mutex_unlock(&controller->state_mutex);
 }
 

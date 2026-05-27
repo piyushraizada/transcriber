@@ -492,16 +492,16 @@ static void on_indicator_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
     double cy = height / 2.0;
     double radius = INDICATOR_SIZE / 2.0;
 
-    ConnectionStatus status = app_get_connection_status(win->controller);
+    ModelStatus status = app_get_model_status(win->controller);
 
     double r, g, b;
     switch (status) {
-        case CONNECTION_LOADING:
+        case MODEL_LOADING:
             r = COLOR_LOADING_R;
             g = COLOR_LOADING_G;
             b = COLOR_LOADING_B;
             break;
-        case CONNECTION_CHECKING:
+        case MODEL_CHECKING:
             r = COLOR_CHECKING_R;
             g = COLOR_CHECKING_G;
             b = COLOR_CHECKING_B;
@@ -510,12 +510,12 @@ static void on_indicator_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
                 return;
             }
             break;
-        case CONNECTION_CONNECTED:
+        case MODEL_AVAILABLE:
             r = COLOR_CONNECTED_R;
             g = COLOR_CONNECTED_G;
             b = COLOR_CONNECTED_B;
             break;
-        case CONNECTION_DISCONNECTED:
+        case MODEL_UNAVAILABLE:
         default:
             r = COLOR_DISCONNECTED_R;
             g = COLOR_DISCONNECTED_G;
@@ -568,8 +568,8 @@ static gboolean on_indicator_check_connection(gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
     if (win && win->whisper_client) {
         bool connected = whisper_check_connection(win->whisper_client);
-        ConnectionStatus status = connected ? CONNECTION_CONNECTED : CONNECTION_DISCONNECTED;
-        app_window_set_connection_status(win, status);
+        ModelStatus status = connected ? MODEL_AVAILABLE : MODEL_UNAVAILABLE;
+        app_window_set_model_status(win, status);
     }
     return FALSE; /* One-shot */
 }
@@ -580,7 +580,7 @@ static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *eve
     (void)event;
 
     /* CRIT-001 fix: Trigger connection check on indicator click */
-    app_window_set_connection_status(win, CONNECTION_CHECKING);
+    app_window_set_model_status(win, MODEL_CHECKING);
 
     /* Schedule connection check on the main thread */
     g_idle_add(on_indicator_check_connection, win);
@@ -701,7 +701,7 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     /* Set window properties */
     gtk_window_set_title(win->window, "Transcriber");
     gtk_window_set_resizable(win->window, FALSE);
-    gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_NORMAL);
+    gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_UTILITY);
 
     /* Set the window icon (taskbar/dock icon) to the red mic */
     GdkPixbuf *window_icon = load_xpm(win, "redmic.xpm");
@@ -744,8 +744,8 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     win->gear_button = GTK_BUTTON(gtk_button_new());
     GdkPixbuf *gear_pixbuf = load_xpm(win, "gear.xpm");
     if (gear_pixbuf) {
-        /* Scale the gear icon to 16x16 per GNOME HIG for status bar icons */
-        int dest_size = 16;
+        /* Scale the gear icon to 8x8 per SRS FR-018 */
+        int dest_size = 8;
         GdkPixbuf *scaled = gdk_pixbuf_scale_simple(gear_pixbuf, dest_size, dest_size, GDK_INTERP_BILINEAR);
         GtkImage *gear_image = GTK_IMAGE(gtk_image_new_from_pixbuf(scaled));
         gtk_container_add(GTK_CONTAINER(win->gear_button), GTK_WIDGET(gear_image));
@@ -881,14 +881,14 @@ void app_window_set_state(MainWindow *win, AppState state) {
     }
 }
 
-void app_window_set_connection_status(MainWindow *win, ConnectionStatus status) {
+void app_window_set_model_status(MainWindow *win, ModelStatus status) {
     if (!win) return;
 
     /* Stop any existing blink animation */
     stop_checking_blink(win);
 
     /* Start blink animation for CHECKING status */
-    if (status == CONNECTION_CHECKING) {
+    if (status == MODEL_CHECKING) {
         start_checking_blink(win);
     }
 

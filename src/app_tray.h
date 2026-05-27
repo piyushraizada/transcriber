@@ -32,7 +32,7 @@
 
 #include <gtk/gtk.h>
 #include <stdbool.h>
-#include "app.h"  /* For AppState and ConnectionStatus enums */
+#include "app.h"  /* For AppState and ModelStatus enums */
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,9 +118,9 @@ void tray_set_state(SystemTray *tray, AppState state);
  * Call tray_set_state() for icon changes.
  *
  * @param tray   Pointer to a valid SystemTray. Must not be NULL.
- * @param status The new ConnectionStatus value.
+ * @param status The new ModelStatus value.
  */
-void tray_set_connection_status(SystemTray *tray, ConnectionStatus status);
+void tray_set_model_status(SystemTray *tray, ModelStatus status);
 
 /*---------------------------------------------------------------------------
  * Section 4: Window Integration

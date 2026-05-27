@@ -92,9 +92,7 @@
 /* ------------------------------------------------------------------ */
 /* Forward declarations for internal callbacks */
 static void on_transcription_result(const char *text, bool success, void *user_data);
-static void on_transcription_result_error(const char *error, bool success, void *user_data);
-static void on_connection_status_change(ConnectionStatus status, void *user_data);
-static void on_recording_stop(const char *wav_path, void *user_data);
+static void on_model_status_change(ModelStatus status, void *user_data);
 static void on_dbus_toggle(void *user_data);
 static void on_config_changed(void *user_data);
 static gboolean watchdog_timer_callback(gpointer user_data);
@@ -119,13 +117,13 @@ static gboolean on_transcription_result_idle(gpointer data) {
     return FALSE;
 }
 
-static gboolean on_transcription_result_error_idle(gpointer data) {
+static gboolean on_transcription_error_idle(gpointer data) {
     /* H-002 fix: Bail out early if application is shutting down */
     if (g_shutting_down) {
         g_free(data);
         return FALSE;
     }
-    on_transcription_result_error((const char *)data, false, NULL);
+    on_transcription_result((const char *)data, false, NULL);
     g_free(data);
     return FALSE;
 }
@@ -561,7 +559,7 @@ static gpointer transcribe_thread_func(gpointer data) {
                         ? response->error_message
                         : "Transcription returned empty result";
             }
-            g_idle_add(on_transcription_result_error_idle, g_strdup(error));
+            g_idle_add(on_transcription_error_idle, g_strdup(error));
         }
         if (response) {
             whisper_response_free(response);
@@ -581,8 +579,9 @@ static gpointer transcribe_thread_func(gpointer data) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Handle transcription result (success).
+ * Handle transcription result (success or error).
  * Called from the GTK main thread via g_idle_add().
+ * Either text or error may be non-NULL, but not both.
  */
 static void on_transcription_result(const char *text, bool success, void *user_data) {
     (void)user_data;
@@ -605,34 +604,10 @@ static void on_transcription_result(const char *text, bool success, void *user_d
         if (g_audio_recorder) {
             audio_recorder_delete_wav(g_audio_recorder);
         }
-    }
-
-    /* Transition back to IDLE */
-    app_transition_to(&g_controller, STATE_IDLE);
-    if (g_main_window) {
-        app_window_set_state(g_main_window, STATE_IDLE);
-    }
-
-    /* Update tray icon */
-    if (g_tray) {
-        tray_set_state(g_tray, STATE_IDLE);
-    }
-}
-
-/**
- * Handle transcription result (error).
- * Called from the GTK main thread via g_idle_add().
- */
-static void on_transcription_result_error(const char *error, bool success, void *user_data) {
-    (void)success;
-    (void)user_data;
-
-    /* MIN-012 fix: Stop transcription watchdog on error */
-    stop_transcription_watchdog();
-
-    if (error) {
+    } else if (!success && text) {
+        /* 'text' parameter holds the error message on failure */
         if (g_text_window) {
-            app_text_window_set_error(g_text_window, error);
+            app_text_window_set_error(g_text_window, text);
         }
     }
 
@@ -652,28 +627,15 @@ static void on_transcription_result_error(const char *error, bool success, void 
  * Handle connection status change.
  * Called from the GTK main thread.
  */
-static void on_connection_status_change(ConnectionStatus status, void *user_data) {
+static void on_model_status_change(ModelStatus status, void *user_data) {
     (void)user_data;
 
     if (g_main_window) {
-        app_window_set_connection_status(g_main_window, status);
+        app_window_set_model_status(g_main_window, status);
     }
 
     if (g_tray) {
-        tray_set_connection_status(g_tray, status);
-    }
-}
-
-/**
- * Handle recording stop.
- * Called when audio recording completes (either by watchdog or user stop).
- */
-static void on_recording_stop(const char *wav_path, void *user_data) {
-    (void)user_data;
-
-    /* Transition to TRANSCRIBING */
-    if (app_get_state(&g_controller) == STATE_LISTENING) {
-        handle_enter_transcribing(wav_path);
+        tray_set_model_status(g_tray, status);
     }
 }
 
@@ -723,12 +685,12 @@ static gboolean on_model_loaded_idle(gpointer data) {
     }
 
     /* Update connection status to connected */
-    app_set_connection_status(&g_controller, CONNECTION_CONNECTED);
+    app_set_model_status(&g_controller, MODEL_AVAILABLE);
     if (g_main_window) {
-        app_window_set_connection_status(g_main_window, CONNECTION_CONNECTED);
+        app_window_set_model_status(g_main_window, MODEL_AVAILABLE);
     }
     if (g_tray) {
-        tray_set_connection_status(g_tray, CONNECTION_CONNECTED);
+        tray_set_model_status(g_tray, MODEL_AVAILABLE);
     }
 
     /* If loading was triggered by user click, auto-transition to LISTENING */
@@ -753,12 +715,12 @@ static gboolean on_model_load_failed_idle(gpointer data) {
     }
 
     /* Reset connection status to disconnected */
-    app_set_connection_status(&g_controller, CONNECTION_DISCONNECTED);
+    app_set_model_status(&g_controller, MODEL_UNAVAILABLE);
     if (g_main_window) {
-        app_window_set_connection_status(g_main_window, CONNECTION_DISCONNECTED);
+        app_window_set_model_status(g_main_window, MODEL_UNAVAILABLE);
     }
     if (g_tray) {
-        tray_set_connection_status(g_tray, CONNECTION_DISCONNECTED);
+        tray_set_model_status(g_tray, MODEL_UNAVAILABLE);
     }
 
     /* Show non-modal, auto-closing warning dialog */
@@ -833,7 +795,7 @@ static void on_microphone_toggle(void *user_data) {
         /* Check that a valid GGUF model file is configured and accessible */
         const char *model_path = config_get_model_path(g_controller.config);
         if (!model_path || model_path[0] == '\0' ||
-            !config_dialog_validate_gguf_model(model_path)) {
+            !config_dialog_validate_model(model_path)) {
             show_auto_close_dialog("Model Not Found", GTK_MESSAGE_ERROR,
                 APP_ERROR_NO_VALID_MODEL ".\n\n"
                 "Please configure a valid Whisper model file in Settings.");
@@ -841,8 +803,8 @@ static void on_microphone_toggle(void *user_data) {
         }
 
         /* First check cached connection status */
-        ConnectionStatus conn = app_get_connection_status(&g_controller);
-        if (conn == CONNECTION_DISCONNECTED) {
+        ModelStatus conn = app_get_model_status(&g_controller);
+        if (conn == MODEL_UNAVAILABLE) {
             /* Do a live check to confirm if model is available */
             bool model_available = true;
             if (g_whisper_client) {
@@ -874,13 +836,13 @@ static void on_microphone_toggle(void *user_data) {
             whisper_client_set_model_path(g_whisper_client, model_path);
 
             /* Show LOADING indicator and "WAIT" overlay */
-            app_set_connection_status(&g_controller, CONNECTION_LOADING);
+            app_set_model_status(&g_controller, MODEL_LOADING);
             if (g_main_window) {
-                app_window_set_connection_status(g_main_window, CONNECTION_LOADING);
+                app_window_set_model_status(g_main_window, MODEL_LOADING);
                 app_window_set_model_loading(g_main_window, TRUE);
             }
             if (g_tray) {
-                tray_set_connection_status(g_tray, CONNECTION_LOADING);
+                tray_set_model_status(g_tray, MODEL_LOADING);
             }
 
             /* H-001 fix: Store model loading thread handle for clean shutdown */
@@ -936,9 +898,9 @@ static void perform_initial_model_load(void) {
         if (g_main_window) {
             app_window_set_model_loading(g_main_window, FALSE);
         }
-        app_set_connection_status(&g_controller, CONNECTION_DISCONNECTED);
+        app_set_model_status(&g_controller, MODEL_UNAVAILABLE);
         if (g_main_window) {
-            app_window_set_connection_status(g_main_window, CONNECTION_DISCONNECTED);
+            app_window_set_model_status(g_main_window, MODEL_UNAVAILABLE);
         }
         return;
     }
@@ -947,12 +909,12 @@ static void perform_initial_model_load(void) {
     whisper_client_set_model_path(g_whisper_client, model_path);
 
     /* Show LOADING indicator on the status bar */
-    app_set_connection_status(&g_controller, CONNECTION_LOADING);
+    app_set_model_status(&g_controller, MODEL_LOADING);
     if (g_main_window) {
-        app_window_set_connection_status(g_main_window, CONNECTION_LOADING);
+        app_window_set_model_status(g_main_window, MODEL_LOADING);
     }
     if (g_tray) {
-        tray_set_connection_status(g_tray, CONNECTION_LOADING);
+        tray_set_model_status(g_tray, MODEL_LOADING);
     }
 
     /* The "WAIT" overlay is already active (set to TRUE in app_window_create).
@@ -1032,8 +994,7 @@ int main(int argc, char *argv[]) {
     if (app_state_controller_init(&g_controller,
                                   &config,
                                   on_transcription_result,
-                                  on_connection_status_change,
-                                  on_recording_stop,
+                                  on_model_status_change,
                                   on_state_change,
                                   NULL) != 0) {
         return 1;

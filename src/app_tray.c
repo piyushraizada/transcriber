@@ -83,7 +83,7 @@ struct _SystemTray {
     GtkMenu *menu;                /* Right-click context menu */
     GtkWindow *main_window;       /* Reference to main window for "Show" */
     AppState current_state;       /* Current application state */
-    ConnectionStatus conn_status; /* Current connection status */
+    ModelStatus model_status; /* Current connection status */
     /* Toggle callback — invoked when "Toggle Recording" is selected */
     void (*on_toggle)(void *user_data);
     void *toggle_user_data;
@@ -315,9 +315,9 @@ static void update_tray_tooltip(SystemTray *tray) {
             break;
         case STATE_IDLE:
         default:
-            if (tray->conn_status == CONNECTION_LOADING) {
+            if (tray->model_status == MODEL_LOADING) {
                 tooltip = TOOLTIP_LOADING;
-            } else if (tray->conn_status == CONNECTION_CONNECTED) {
+            } else if (tray->model_status == MODEL_AVAILABLE) {
                 tooltip = TOOLTIP_IDLE_CONNECTED;
             } else {
                 tooltip = TOOLTIP_IDLE_DISCONNECTED;
@@ -344,7 +344,7 @@ SystemTray *tray_create(void) {
     }
 
     tray->current_state = STATE_IDLE;
-    tray->conn_status = CONNECTION_DISCONNECTED;
+    tray->model_status = MODEL_UNAVAILABLE;
     tray->main_window = NULL;
     tray->on_toggle = NULL;
     tray->toggle_user_data = NULL;
@@ -431,10 +431,10 @@ void tray_set_state(SystemTray *tray, AppState state) {
     update_tray_tooltip(tray);
 }
 
-void tray_set_connection_status(SystemTray *tray, ConnectionStatus status) {
+void tray_set_model_status(SystemTray *tray, ModelStatus status) {
     if (!tray) return;
 
-    tray->conn_status = status;
+    tray->model_status = status;
     /* Only update tooltip if in IDLE state (connection matters most then) */
     if (tray->current_state == STATE_IDLE) {
         update_tray_tooltip(tray);

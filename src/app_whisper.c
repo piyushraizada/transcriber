@@ -44,8 +44,6 @@
 
 #define MAX_PATH_LEN  PATH_MAX
 #define DEFAULT_THREADS 0  // 0 = use all available threads
-#define GPU_INDEX_AUTO    -1  // Auto-detect GPU
-#define GPU_INDEX_CPU_ONLY -2 // Force CPU-only
 
 /* Default model search directories (in order of preference) */
 static const char *DEFAULT_MODEL_DIRS[] = {
@@ -61,14 +59,13 @@ struct _WhisperClient {
     struct whisper_context *ctx;       // whisper.cpp context (loaded model)
     char model_path[MAX_PATH_LEN];
     int n_threads;
-    int gpu_index;                     // -1 = auto-detect, -2 = CPU-only, >=0 = specific GPU
+    int gpu_index;                     // -3 = auto by free mem, -2 = CPU-only, >=0 = specific GPU
     char error_message[256];
     int error_code;
     pthread_mutex_t mutex;
     atomic_int cancel_requested;
     bool model_loaded;
     bool model_loading;                // true while model load is in progress
-    bool using_gpu;                    // true if model is running on GPU
 };
 
 /* ===================================================================
@@ -176,19 +173,6 @@ bool whisper_gpu_available(void) {
 /* ===================================================================
  * Public: Get GPU usage status
  * =================================================================== */
-bool whisper_client_is_using_gpu(const WhisperClient *client) {
-    if (!client) return false;
-    return client->using_gpu;
-}
-
-/* ===================================================================
- * Public: Get backend description string
- * =================================================================== */
-const char *whisper_client_backend_description(const WhisperClient *client) {
-    if (!client || !client->model_loaded) return "Not loaded";
-    return client->using_gpu ? "GPU (CUDA)" : "CPU";
-}
-
 /* ===================================================================
  * Public: Check if model is loaded
  * =================================================================== */
@@ -203,23 +187,6 @@ bool whisper_client_is_model_loaded(const WhisperClient *client) {
 bool whisper_client_is_loading(const WhisperClient *client) {
     if (!client) return false;
     return client->model_loading;
-}
-
-/* ===================================================================
- * Public: Unload model from memory
- * =================================================================== */
-void whisper_client_unload_model(WhisperClient *client) {
-    if (!client) return;
-
-    pthread_mutex_lock(&client->mutex);
-    if (client->ctx) {
-        whisper_free(client->ctx);
-        client->ctx = NULL;
-    }
-    client->model_loaded = false;
-    client->model_loading = false;
-    client->using_gpu = false;
-    pthread_mutex_unlock(&client->mutex);
 }
 
 /* ===================================================================
@@ -272,9 +239,15 @@ static bool load_model_internal(WhisperClient *client) {
             try_gpu = false;
         }
     } else {
-        // Legacy auto-detect (GPU_INDEX_AUTO = -1): try first GPU
-        try_gpu = whisper_gpu_available();
-        gpu_idx = 0; // Default to first GPU for legacy auto-detect
+        // Fallback: treat as auto-select by free memory
+        int best_gpu = -1;
+        size_t free_mem = 0;
+        if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
+            if (free_mem >= ((size_t)(2UL * 1024 * 1024 * 1024))) {
+                try_gpu = true;
+                gpu_idx = best_gpu;
+            }
+        }
     }
 
     bool gpu_loaded = false;
@@ -325,7 +298,6 @@ static bool load_model_internal(WhisperClient *client) {
 
     client->ctx = ctx;
     client->model_loaded = true;
-    client->using_gpu = gpu_loaded;
 
     /* Release CUDA contexts on GPUs not used by the loaded model.
      * whisper_init_from_file_with_params() enumerates all CUDA devices
@@ -385,7 +357,6 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
             client->ctx = NULL;
         }
         client->model_loaded = false;
-        client->using_gpu = false;
     }
 
     // Set the GPU index preference
@@ -568,7 +539,7 @@ WhisperClient* whisper_client_create(void) {
     client->model_loaded = false;
     client->model_loading = false;
     client->n_threads = DEFAULT_THREADS;
-    client->gpu_index = GPU_INDEX_AUTO;  // Auto-detect by default
+    client->gpu_index = GPU_INDEX_AUTO_MEMORY;  // Auto-select by free memory
     client->model_path[0] = '\0';
     client->error_message[0] = '\0';
     client->error_code = 0;
@@ -903,14 +874,6 @@ bool whisper_check_connection(WhisperClient* client) {
 const char* whisper_client_get_error(WhisperClient* client) {
     if (!client) return "No client";
     return client->error_message[0] != '\0' ? client->error_message : "";
-}
-
-/* ===================================================================
- * Public API: whisper_client_get_error_code (returns error_code)
- * =================================================================== */
-int whisper_client_get_error_code(const WhisperClient* client) {
-    if (!client) return -1;
-    return client->error_code;
 }
 
 /* ===================================================================

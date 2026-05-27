@@ -42,7 +42,6 @@
 
 #include <gtk/gtk.h>
 #include <stdbool.h>
-#include "app_audio.h"  /* For AudioBackend enum */
 
 /* Forward declarations */
 struct _AppConfig;
@@ -130,7 +129,7 @@ bool config_dialog_show(GtkWindow* parent_window, struct _AppConfig* config);
 /**
  * Get the list of available audio devices for the config dialog dropdown.
  *
- * This function queries the audio backend for a list of available input
+ * This function queries ALSA for a list of available input
  * devices (microphones) and returns them as a GtkListStore suitable for
  * use with a GtkComboBox. The list includes a special "Default" entry
  * at the top, followed by the detected devices.
@@ -139,20 +138,16 @@ bool config_dialog_show(GtkWindow* parent_window, struct _AppConfig* config);
  * the device names. The caller takes ownership of the GtkListStore and
  * is responsible for_unref()ing it.
  *
- * @param backend The AudioBackend to query. If AUDIO_BACKEND_NONE, returns
- *                an empty list.
  * @return A newly referenced GtkListStore* containing device names, or
  *         NULL on error. The caller must call g_object_unref() when done.
  *
  * @see FR-020: Microphone Selection
  * @see AUD-008a: Microphone Selection Support
  */
-GtkListStore* config_dialog_get_audio_devices(AudioBackend backend);
-
-/* MIN-002 fix: Removed Section 4 (Language List) — language selection removed. */
+GtkListStore* config_dialog_get_audio_devices(void);
 
 /*---------------------------------------------------------------------------
- * Section 5: D-Bus Hotkey Display
+ * Section 4: D-Bus Hotkey Display
  *---------------------------------------------------------------------------
  * Functions for displaying the D-Bus hotkey command in the dialog.
  */
@@ -181,7 +176,7 @@ GtkListStore* config_dialog_get_audio_devices(AudioBackend backend);
 const char* config_dialog_get_hotkey_command(void);
 
 /*---------------------------------------------------------------------------
- * Section 7: Input Validation
+ * Section 5: Input Validation
  *---------------------------------------------------------------------------
  * Functions for validating user input in the dialog fields.
  */
@@ -210,7 +205,7 @@ bool config_dialog_validate_model_path(const char* path);
  *       should NOT be called from the GTK main thread for large models.
  *       Use this for quick validation (e.g., before starting recording).
  */
-bool config_dialog_validate_gguf_model(const char* path);
+bool config_dialog_validate_model(const char* path);
 
 /**
  * Get the default model file path (~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin).
@@ -254,7 +249,7 @@ void config_dialog_show_error(GtkLabel* error_label, const char* message);
 void config_dialog_clear_error(GtkLabel* error_label);
 
 /*---------------------------------------------------------------------------
- * Section 8: Window Position Reset
+ * Section 6: Window Position Reset
  *---------------------------------------------------------------------------
  * Function for the "Reset Window Position" button.
  */

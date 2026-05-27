@@ -62,7 +62,6 @@ extern "C" {
 
 #define GPU_INDEX_AUTO_MEMORY  -3  ///< Auto-select GPU with most free memory
 #define GPU_INDEX_CPU_ONLY     -2  ///< Force CPU-only processing
-#define GPU_INDEX_AUTO         -1  ///< Legacy auto (use first GPU)
 
 /*---------------------------------------------------------------------------
  * Section 1: GPU Availability and Discovery
@@ -70,16 +69,6 @@ extern "C" {
  * Functions to check if CUDA support is compiled in and discover available
  * GPU devices at runtime.
  */
-
-/**
- * Check if the application was compiled with CUDA support.
- *
- * This is a compile-time check. Returns true if HAVE_CUDA is defined,
- * false otherwise. Does NOT check if a GPU is actually present at runtime.
- *
- * @return true if CUDA support is compiled in, false otherwise
- */
-bool gpu_cuda_compiled_in(void);
 
 /**
  * Discover the number of available NVIDIA GPU devices at runtime.
@@ -153,19 +142,6 @@ bool gpu_get_memory_info(int device_idx, size_t *free_bytes, size_t *total_bytes
 bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes);
 
 /**
- * Select a GPU device with at least the specified amount of free memory.
- *
- * Similar to gpu_select_best_by_free_memory(), but only returns a device
- * that has at least min_free_bytes available. If no device meets the
- * threshold, returns false.
- *
- * @param best_device_idx Output parameter for the selected device index
- * @param min_free_bytes  Minimum free memory required in bytes
- * @return true if a suitable GPU was found, false otherwise
- */
-bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes);
-
-/**
  * Release CUDA contexts on all GPU devices except the one in use.
  *
  * When CUDA devices are enumerated or queried (via cudaSetDevice +
@@ -208,18 +184,6 @@ bool gpu_release_unused_devices(int used_device_idx);
  */
 bool gpu_mode_parse(const char *mode_str, int *gpu_index_out);
 
-/**
- * Format a GPU index back into a human-readable mode string.
- *
- * Reverse of gpu_mode_parse(). Useful for displaying the current setting
- * in the UI or logging.
- *
- * @param gpu_index   Internal GPU index value
- * @param mode_out    Output buffer for the mode string
- * @param mode_size   Size of mode_out buffer
- */
-void gpu_mode_format(int gpu_index, char *mode_out, size_t mode_size);
-
 /*---------------------------------------------------------------------------
  * Section 5: Default and Validation Helpers
  *---------------------------------------------------------------------------
@@ -243,14 +207,6 @@ const char *gpu_mode_get_default(void);
  * @return true if valid, false otherwise
  */
 bool gpu_mode_validate(const char *mode_str);
-
-/**
- * Get a description of the GPU mode for display/logging.
- *
- * @param mode_str GPU mode string
- * @return Static description string (do NOT free)
- */
-const char *gpu_mode_description(const char *mode_str);
 
 #ifdef __cplusplus
 }

@@ -33,17 +33,7 @@ extern "C" {
 #endif
 
 /*---------------------------------------------------------------------------
- * Section 1: Audio Backend Enum
- *---------------------------------------------------------------------------
- * Represents the audio capture backend. Only ALSA is supported.
- */
-typedef enum {
-    AUDIO_BACKEND_ALSA,  ///< ALSA — direct hardware access
-    AUDIO_BACKEND_NONE   ///< No backend available — recording disabled
-} AudioBackend;
-
-/*---------------------------------------------------------------------------
- * Section 2: Audio Configuration Structure
+ * Section 1: Audio Configuration Structure
  *---------------------------------------------------------------------------
  * Defines the fixed audio capture parameters.
  *
@@ -107,14 +97,6 @@ bool audio_recorder_set_device(AudioRecorder *recorder, const char *device);
  * @return Device name string (empty string = system default)
  */
 const char *audio_recorder_get_device(const AudioRecorder *recorder);
-
-/**
- * Get the currently selected audio backend.
- *
- * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
- * @return The selected AudioBackend enum value.
- */
-AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
  * Section 6: Recording Control

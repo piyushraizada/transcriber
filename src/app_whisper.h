@@ -242,14 +242,6 @@ void whisper_response_free(WhisperResponse* response);
 const char* whisper_client_get_error(WhisperClient* client);
 
 /**
- * Get the error code from the last operation.
- *
- * @param client Pointer to a valid WhisperClient. Must not be NULL.
- * @return The error code, or 0 if no error occurred.
- */
-int whisper_client_get_error_code(const WhisperClient* client);
-
-/**
  * Request graceful cancellation of an in-flight transcription request.
  *
  * This function sets an atomic cancellation flag that is checked during
@@ -263,7 +255,7 @@ int whisper_client_get_error_code(const WhisperClient* client);
 void whisper_client_cancel(WhisperClient* client);
 
 /*---------------------------------------------------------------------------
- * Section 11: Model Pre-loading and GPU Management
+ * Section 9: Model Pre-loading and GPU Management
  *---------------------------------------------------------------------------
  * Functions for pre-loading the model (before first transcription) and
  * managing GPU selection. Pre-loading allows the UI to show a loading
@@ -309,18 +301,8 @@ bool whisper_client_is_loading(const WhisperClient *client);
  */
 bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode);
 
-/**
- * Unload the whisper model from memory.
- *
- * Frees the loaded model context so it can be reloaded with
- * different parameters (e.g., different GPU).
- *
- * @param client Pointer to a valid WhisperClient. Must not be NULL.
- */
-void whisper_client_unload_model(WhisperClient *client);
-
 /*---------------------------------------------------------------------------
- * Section 9: GPU Support
+ * Section 10: GPU Support
  *---------------------------------------------------------------------------
  * Functions for GPU availability detection and status reporting.
  */
@@ -335,24 +317,8 @@ void whisper_client_unload_model(WhisperClient *client);
  */
 bool whisper_gpu_available(void);
 
-/**
- * Get the current GPU usage status of the loaded model.
- *
- * @param client WhisperClient instance
- * @return true if the model is currently running on GPU, false if CPU
- */
-bool whisper_client_is_using_gpu(const WhisperClient *client);
-
-/**
- * Get a human-readable description of the current compute backend.
- *
- * @param client WhisperClient instance
- * @return Static string describing the backend (e.g., "GPU (CUDA)" or "CPU")
- */
-const char *whisper_client_backend_description(const WhisperClient *client);
-
 /*---------------------------------------------------------------------------
- * Section 10: Model Path Resolution
+ * Section 11: Model Path Resolution
  *---------------------------------------------------------------------------
  * Utility for resolving model paths with tilde expansion and directory search.
  */

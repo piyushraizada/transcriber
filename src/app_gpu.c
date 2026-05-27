@@ -46,15 +46,6 @@
  * Section 1: GPU Availability and Discovery
  *---------------------------------------------------------------------------*/
 
-bool gpu_cuda_compiled_in(void)
-{
-#ifdef HAVE_CUDA
-    return true;
-#else
-    return false;
-#endif
-}
-
 bool gpu_get_device_count(int *count_out)
 {
     if (!count_out) return false;
@@ -327,30 +318,6 @@ bool gpu_mode_parse(const char *mode_str, int *gpu_index_out)
     return false;
 }
 
-void gpu_mode_format(int gpu_index, char *mode_out, size_t mode_size)
-{
-    if (!mode_out || mode_size == 0) return;
-
-    switch (gpu_index) {
-        case GPU_INDEX_AUTO_MEMORY:
-            snprintf(mode_out, mode_size, "auto");
-            break;
-        case GPU_INDEX_CPU_ONLY:
-            snprintf(mode_out, mode_size, "cpu");
-            break;
-        case GPU_INDEX_AUTO:
-            snprintf(mode_out, mode_size, "auto");
-            break;
-        default:
-            if (gpu_index >= 0) {
-                snprintf(mode_out, mode_size, "gpu:%d", gpu_index);
-            } else {
-                snprintf(mode_out, mode_size, "auto");
-            }
-            break;
-    }
-}
-
 /*---------------------------------------------------------------------------
  * Section 5: Default and Validation Helpers
  *---------------------------------------------------------------------------*/
@@ -376,21 +343,4 @@ bool gpu_mode_validate(const char *mode_str)
     }
 
     return false;
-}
-
-const char *gpu_mode_description(const char *mode_str)
-{
-    if (!mode_str) return "Unknown";
-
-    if (strcmp(mode_str, "auto") == 0) {
-        return "Auto-select GPU with most free memory";
-    }
-    if (strcmp(mode_str, "cpu") == 0) {
-        return "CPU-only processing";
-    }
-    if (strncmp(mode_str, "gpu:", 4) == 0) {
-        return "Specific GPU device";
-    }
-
-    return "Unknown mode";
 }

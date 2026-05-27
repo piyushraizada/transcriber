@@ -254,23 +254,23 @@ GtkWindow *app_window_get_gtk_window(MainWindow *win);
  */
 void app_window_set_state(MainWindow *win, AppState state);
 
-/* app_window_set_connection_status — Update the connection status indicator.
+/* app_window_set_model_status — Update the connection status indicator.
  *
  * Changes the color of the 8x8 circle in the status bar:
- *   • CONNECTION_DISCONNECTED → Red (#FF0000)
- *   • CONNECTION_CONNECTED    → Green (#00FF00)
- *   • CONNECTION_CHECKING     → Yellow (#FFFF00, blinking via timer)
+ *   • MODEL_UNAVAILABLE → Red (#FF0000)
+ *   • MODEL_AVAILABLE    → Green (#00FF00)
+ *   • MODEL_CHECKING     → Yellow (#FFFF00, blinking via timer)
  *
  * Queues a redraw on the indicator drawing area.
  *
  * Parameters:
  *   win    — The MainWindow handle.
- *   status — The new ConnectionStatus value.
+ *   status — The new ModelStatus value.
  *
  * SRS: UI-021, UI-022, FR-030, FR-037
  */
-void app_window_set_connection_status(MainWindow *win,
-                                      ConnectionStatus status);
+void app_window_set_model_status(MainWindow *win,
+                                      ModelStatus status);
 
 /* app_window_start_animation — Start the sine wave animation.
  *

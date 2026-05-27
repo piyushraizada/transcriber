@@ -174,7 +174,6 @@ bool audio_format_finalize_wav_header(FILE *file, gsize data_size) {
  * =================================================================== */
 
 struct _AudioRecorder {
-    AudioBackend backend;
     AudioFormat format;
     gchar device[256];
     gchar wav_path[512];
@@ -262,14 +261,6 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
 }
 
 /* ===================================================================
- * Backend probing
- * =================================================================== */
-
-static AudioBackend probe_backend(void) {
-    return AUDIO_BACKEND_ALSA;
-}
-
-/* ===================================================================
  * Lifecycle: create / destroy
  * =================================================================== */
 
@@ -281,13 +272,6 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
         recorder->format = *format;
     } else {
         recorder->format = audio_format_get_default();
-    }
-
-    recorder->backend = probe_backend();
-    if (recorder->backend == AUDIO_BACKEND_NONE) {
-        set_audio_error("No audio backend available");
-        free(recorder);
-        return NULL;
     }
 
     recorder->wav_fd = -1;
@@ -643,11 +627,6 @@ const char *audio_recorder_get_error(void) {
     local_buffer[sizeof(local_buffer) - 1] = '\0';
     pthread_mutex_unlock(&g_audio_error_mutex);
     return local_buffer;
-}
-
-AudioBackend audio_recorder_get_backend(const AudioRecorder *recorder) {
-    if (!recorder) return AUDIO_BACKEND_NONE;
-    return recorder->backend;
 }
 
 void audio_recorder_reset_error(void) {

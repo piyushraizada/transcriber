@@ -97,7 +97,7 @@ typedef enum {
 } AppState;
 
 /******************************************************************************
- * ConnectionStatus — Local Whisper Model Availability Indicator
+ * ModelStatus — Local Whisper Model Availability Indicator
  *
  * Tracks the availability of the local Whisper model. Displayed as
  * an 8x8 pixel circle in the MainWindow status bar (right side).
@@ -113,11 +113,11 @@ typedef enum {
  * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037
  *****************************************************************************/
 typedef enum {
-    CONNECTION_DISCONNECTED,  /* Red — no connection or check failed */
-    CONNECTION_CONNECTED,     /* Green — successful connection verified */
-    CONNECTION_CHECKING,      /* Yellow/blinking — check in progress */
-    CONNECTION_LOADING        /* Amber/orange — model being loaded */
-} ConnectionStatus;
+    MODEL_UNAVAILABLE,  /* Red — no connection or check failed */
+    MODEL_AVAILABLE,     /* Green — successful connection verified */
+    MODEL_CHECKING,      /* Yellow/blinking — check in progress */
+    MODEL_LOADING        /* Amber/orange — model being loaded */
+} ModelStatus;
 
 /******************************************************************************
  * AppConfig — Central Configuration Structure
@@ -185,33 +185,19 @@ typedef void (*transcription_result_callback)(const char *text,
                                               bool success,
                                               void *user_data);
 
-/* connection_status_callback — Invoked when the model availability check
+/* model_status_callback — Invoked when the model availability check
  * completes (either automatic on startup or manual via clicking
  * the status indicator).
  *
  * Parameters:
- *   status     — The new ConnectionStatus value.
+ *   status     — The new ModelStatus value.
  *   user_data  — Opaque pointer (typically the MainWindow pointer).
  *
  * Marshaled to the Presentation Thread to update the status bar indicator.
  *
  * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037 */
-typedef void (*connection_status_callback)(ConnectionStatus status,
+typedef void (*model_status_callback)(ModelStatus status,
                                            void *user_data);
-
-/* recording_stop_callback — Invoked by the Audio Thread when recording
- * naturally stops (watchdog timeout or user-initiated stop). Signals the
- * state controller to transition to TRANSCRIBING.
- *
- * Parameters:
- *   wav_path   — Path to the completed WAV file for upload.
- *   user_data  — Opaque pointer.
- *
- * Marshaled to the Presentation Thread.
- *
- * SRS: FR-006, FR-034, AUD-011 */
-typedef void (*recording_stop_callback)(const char *wav_path,
-                                         void *user_data);
 
 /* state_change_callback — Invoked directly by the state controller when
  * a state transition completes (inside app_transition_to / app_toggle_state).
@@ -240,7 +226,7 @@ typedef void (*state_change_callback)(AppState new_state,
  *   • A mutex protecting the current state variable.
  *   • An atomic sequence counter to prevent duplicate transitions
  *     (e.g., watchdog and user stop both firing at the same time).
- *   • The current AppState and ConnectionStatus.
+ *   • The current AppState and ModelStatus.
  *   • A pointer to the shared AppConfig.
  *   • Callback function pointers for cross-thread communication.
  *
@@ -266,10 +252,10 @@ typedef struct {
     AppState state;
 
     /* Current model availability status, protected by state_mutex. */
-    ConnectionStatus connection_status;
+    ModelStatus model_status;
 
     /* Mutex for all state transitions. Every read or write of state or
-     * connection_status must hold this mutex. */
+     * model_status must hold this mutex. */
     pthread_mutex_t state_mutex;
 
     /* Atomic sequence counter for preventing duplicate transitions.
@@ -289,11 +275,7 @@ typedef struct {
 
     /* Callback invoked when connection status changes.
      * Called from the Transcription Thread but marshaled to the Presentation Thread. */
-    connection_status_callback on_connection_status;
-
-    /* Callback invoked when audio recording stops.
-     * Called from the Audio Thread but marshaled to the Presentation Thread. */
-    recording_stop_callback on_recording_stop;
+    model_status_callback on_model_status;
 
     /* Callback invoked directly on state transition.
      * Replaces the polling-based state_monitor_callback pattern.
@@ -312,15 +294,14 @@ typedef struct {
 /* app_state_controller_init — Initialize the state controller.
  *
  * Sets the initial state to STATE_IDLE, connection status to
- * CONNECTION_DISCONNECTED, initializes the mutex and sequence counter,
+ * MODEL_UNAVAILABLE, initializes the mutex and sequence counter,
  * and stores the provided config and callback pointers.
  *
  * Parameters:
  *   controller — Pointer to an uninitialized AppStateController struct.
  *   config     — Pointer to the shared AppConfig (read-only after init).
  *   on_transcription_result — Callback for transcription results.
-  *   on_connection_status    — Callback for connection status changes.
-  *   on_recording_stop       — Callback for recording stop events.
+  *   on_model_status    — Callback for connection status changes.
   *   on_state_change         — Callback invoked on each state transition.
   *   user_data               — Opaque pointer passed to all callbacks.
   *
@@ -328,12 +309,11 @@ typedef struct {
   *
   * SRS: Section 2.1, Section 2.3 */
  int app_state_controller_init(AppStateController *controller,
-                            AppConfig *config,
-                            transcription_result_callback on_transcription_result,
-                            connection_status_callback on_connection_status,
-                            recording_stop_callback on_recording_stop,
-                            state_change_callback on_state_change,
-                            void *user_data);
+                        AppConfig *config,
+                        transcription_result_callback on_transcription_result,
+                        model_status_callback on_model_status,
+                        state_change_callback on_state_change,
+                        void *user_data);
 
 /* app_state_controller_cleanup — Destroy the state controller's mutex.
  *
@@ -359,15 +339,15 @@ void app_state_controller_cleanup(AppStateController *controller);
  * SRS: Section 2.3 */
 AppState app_get_state(AppStateController *controller);
 
-/* app_get_connection_status — Thread-safe read of connection status.
+/* app_get_model_status — Thread-safe read of connection status.
  *
  * Parameters:
  *   controller — Pointer to the initialized AppStateController.
  *
- * Returns: The current ConnectionStatus enum value.
+ * Returns: The current ModelStatus enum value.
  *
  * SRS: UI-021, UI-022 */
-ConnectionStatus app_get_connection_status(AppStateController *controller);
+ModelStatus app_get_model_status(AppStateController *controller);
 
 /* app_transition_to — Request a state transition.
  *
@@ -391,15 +371,15 @@ ConnectionStatus app_get_connection_status(AppStateController *controller);
  * SRS: Section 2.3, NR-019 */
 bool app_transition_to(AppStateController *controller, AppState target);
 
-/* app_set_connection_status — Thread-safe update of connection status.
+/* app_set_model_status — Thread-safe update of connection status.
  *
  * Parameters:
  *   controller — Pointer to the initialized AppStateController.
- *   status     — The new ConnectionStatus value.
+ *   status     — The new ModelStatus value.
  *
  * SRS: UI-021, UI-022, WHISPER-013 */
-void app_set_connection_status(AppStateController *controller,
-                               ConnectionStatus status);
+void app_set_model_status(AppStateController *controller,
+                               ModelStatus status);
 
 /* app_toggle_state — Convenience function to advance the state machine.
  *
