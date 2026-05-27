@@ -1,6 +1,18 @@
 # Transcriber
 
-Transcriber is a lightweight, offline voice-to-text application for Linux desktops. It provides a system tray icon with a single-click microphone toggle that captures audio from your configured microphone, transcribes it locally using OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp), and displays the result in a persistent text area. Transcribed text can be edited in-place and copied to the system clipboard for use in other applications. The application runs entirely offline with no external API dependencies, supports optional GPU (CUDA) acceleration, and enforces single-instance operation via D-Bus.
+Transcriber is a lightweight, offline voice-to-text application for Linux desktops. It allows users to capture audio from their microphone and transcribe it into text locally on their own machine, ensuring privacy and removing the need for an internet connection.
+
+### Core Functionality
+*   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
+*   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
+*   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard.
+*   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
+
+### Technical Highlights
+*   **Tech Stack:** Written in C using GTK3 for the GUI and ALSA (`libasound`) for audio capture.
+*   **Performance:** Supports NVIDIA GPU (CUDA) acceleration for faster transcription, with an automatic fallback to CPU.
+*   **Architecture:** Multi-threaded design (Presentation, Audio, and Transcription threads) to ensure a responsive user interface.
+*   **User Experience:** Features a real-time volume level bar, sine wave animation during recording, and a model availability status indicator.
 
 ## Prerequisites
 
