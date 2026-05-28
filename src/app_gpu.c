@@ -37,10 +37,11 @@
  * Constants
  *---------------------------------------------------------------------------*/
 
-/** Minimum free VRAM (in bytes) to consider a GPU suitable for model loading.
- *  Set to 2 GB as a conservative minimum — smaller models (tiny, base) need
- *  about 1-1.5 GB, but we leave headroom for CUDA context overhead. */
-#define MIN_FREE_VRAM_BYTES ((size_t)(2UL * 1024 * 1024 * 1024))
+/** Minimum free VRAM threshold is now defined in app_gpu.h as GPU_MIN_FREE_VRAM_BYTES.
+ *  This local definition is kept for backward compatibility with existing code in this file. */
+#ifndef MIN_FREE_VRAM_BYTES
+#define MIN_FREE_VRAM_BYTES GPU_MIN_FREE_VRAM_BYTES
+#endif
 
 /*---------------------------------------------------------------------------
  * Section 1: GPU Availability and Discovery

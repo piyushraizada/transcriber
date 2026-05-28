@@ -54,7 +54,7 @@ option(DOWNLOAD_DEFAULT_MODEL "Download the default Whisper model (large-v3-turb
 if(DOWNLOAD_DEFAULT_MODEL AND whisper_SOURCE_DIR)
     set(DEFAULT_MODEL_DIR "$ENV{HOME}/.cache/whisper")
     file(MAKE_DIRECTORY "${DEFAULT_MODEL_DIR}")
-    add_custom_target(download-default-model ALL
+    add_custom_target(download-default-model
         COMMAND "${whisper_SOURCE_DIR}/models/download-ggml-model.sh"
             "large-v3-turbo-q8_0"
             "${DEFAULT_MODEL_DIR}"

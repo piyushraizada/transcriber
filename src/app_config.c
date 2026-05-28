@@ -283,8 +283,8 @@ bool config_load_from_path(AppConfig* config, const char* path)
     off_t fsize = ftello(fp);
     fseeko(fp, 0, SEEK_SET);
 
-    if (fsize <= 0 || fsize > (off_t)(1024 * 1024)) {
-        /* File too small or too large */
+    if (fsize <= 0 || fsize > (off_t)(64 * 1024)) {
+        /* File too small or too large (max 64 KB) */
         fclose(fp);
         set_error("Config file has invalid size");
         return false;
@@ -470,14 +470,19 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     /* Flush and sync */
     fflush(fp);
     fsync(fileno(fp));
-    fclose(fp);
 
-    /* Set permissions before rename (NR-008) */
-    if (chmod(tmp_path, 0600) != 0) {
+    /* Set permissions on the open file descriptor before closing (NR-008).
+     * Using fchmod() on the descriptor is more atomic than chmod() on the
+     * path, eliminating a brief window where the file exists with default
+     * permissions. */
+    if (fchmod(fileno(fp), 0600) != 0) {
+        fclose(fp);
         unlink(tmp_path);
         set_error("Failed to set config file permissions");
         return false;
     }
+
+    fclose(fp);
 
     /* Atomic rename */
     if (rename(tmp_path, path) != 0) {

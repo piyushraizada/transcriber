@@ -64,7 +64,7 @@ struct _ConfigDialog {
  * Returns a statically allocated buffer (do NOT free).
  */
 const char* config_dialog_get_default_model_path(void) {
-    static char path[1024];
+    static __thread char path[1024];
     const char *home = getenv("HOME");
     if (home) {
         snprintf(path, sizeof(path), "%s/.cache/whisper/%s", home, DEFAULT_MODEL_FILE);

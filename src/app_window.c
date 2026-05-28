@@ -174,6 +174,7 @@ struct _TextWindow {
     GtkWindow *window;
     GtkTextView *text_view;
     GtkTextBuffer *buffer;
+    gboolean auto_position;  /* TRUE = auto-position on next show; FALSE = respect user position */
 };
 
 /* ------------------------------------------------------------------ */
@@ -232,9 +233,9 @@ static void get_asset_dir(MainWindow *win) {
  * Returns a new GdkPixbuf on success, NULL on failure.
  */
 static GdkPixbuf *load_xpm(MainWindow *win, const char *filename) {
-    (void)win;
 #ifdef XPM_STATICALLY_EMBEDDED
     /* Use embedded XPM arrays */
+    (void)win;
     if (strcmp(filename, "gear.xpm") == 0) {
         return gdk_pixbuf_new_from_xpm_data(GEAR_XPM);
     } else if (strcmp(filename, "greenmic.xpm") == 0) {
@@ -245,7 +246,6 @@ static GdkPixbuf *load_xpm(MainWindow *win, const char *filename) {
     return NULL;  /* Unknown XPM filename */
 #else
     /* Fallback: load from disk */
-    (void)win;
     char path[PATH_MAX];
     g_snprintf(path, sizeof(path), "%s/%s", win->asset_dir, filename);
 
@@ -608,8 +608,11 @@ static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpoin
  * Hides the window instead of destroying it.
  */
 static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
+    TextWindow *tw = (TextWindow *)user_data;
+    if (tw) {
+        tw->auto_position = TRUE;  /* Re-enable auto-position for next transcription */
+    }
     gtk_widget_hide(widget);
-    (void)user_data;
     (void)event;
     return TRUE; /* Prevent the window from being destroyed */
 }
@@ -617,7 +620,7 @@ static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, 
 /* MIN-007 fix: Reposition TextWindow when MainWindow moves */
 static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
     TextWindow *tw = (TextWindow *)user_data;
-    if (!tw || !tw->window || !gtk_widget_get_visible(GTK_WIDGET(tw->window))) {
+    if (!tw || !tw->window || !gtk_widget_get_visible(GTK_WIDGET(tw->window)) || !tw->auto_position) {
         return FALSE;
     }
     (void)event;
@@ -655,6 +658,10 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
     }
 
     gtk_window_move(tw->window, tx, ty);
+
+    /* After auto-positioning, disable auto_position so user can move the window freely.
+     * It will be re-enabled when the window is hidden (on delete-event). */
+    tw->auto_position = FALSE;
 
     return FALSE;
 }
@@ -1011,6 +1018,10 @@ void app_window_set_config_changed_callback(MainWindow *win,
 
 TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
     TextWindow *tw = (TextWindow *)calloc(1, sizeof(TextWindow));
+    if (!tw) {
+        return NULL;
+    }
+    tw->auto_position = TRUE;  /* Auto-position on first show; skip after user moves it */
     if (!tw) {
         return NULL;
     }

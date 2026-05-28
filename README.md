@@ -81,14 +81,33 @@ make -j$(nproc)
 The build process will:
 
 - Download and compile [whisper.cpp](https://github.com/ggml-org/whisper.cpp) via CMake FetchContent
-- Download the default Whisper model (`large-v3-turbo-q8_0`, ~1.1 GiB) to `~/.cache/whisper/`
 - Detect CUDA (if available) and enable GPU acceleration automatically
 
-To skip the model download during build:
+#### Download the Whisper model
+
+The default Whisper model (`large-v3-turbo-q8_0`, ~1.1 GiB) is **not** downloaded automatically during build. Obtain it with:
+
+```bash
+make download-default-model
+```
+
+This places the model in `~/.cache/whisper/`. You can also download any GGML/GGUF Whisper model manually and configure its path in the application settings.
+
+To disable the download target entirely:
 
 ```bash
 cmake -DDOWNLOAD_DEFAULT_MODEL=OFF ..
 ```
+
+#### CMake Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `DOWNLOAD_DEFAULT_MODEL` | `ON` | Create the `download-default-model` target |
+| `ENABLE_ASAN` | `OFF` | Enable AddressSanitizer for memory error detection |
+| `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer for data race detection |
+
+> **Note:** `ENABLE_ASAN` and `ENABLE_TSAN` are mutually exclusive.
 
 ### 3. Install (optional)
 

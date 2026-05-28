@@ -64,6 +64,16 @@ extern "C" {
 #define GPU_INDEX_CPU_ONLY     -2  ///< Force CPU-only processing
 
 /*---------------------------------------------------------------------------
+ * GPU Memory Thresholds
+ *---------------------------------------------------------------------------
+ * Minimum free VRAM (in bytes) to consider a GPU suitable for model loading.
+ * Set to 2 GB as a conservative minimum — smaller models (tiny, base) need
+ * about 1-1.5 GB, but we leave headroom for CUDA context overhead.
+ * Used by both app_gpu.c and app_whisper.c for consistent threshold checking.
+ */
+#define GPU_MIN_FREE_VRAM_BYTES ((size_t)(2UL * 1024 * 1024 * 1024))
+
+/*---------------------------------------------------------------------------
  * Section 1: GPU Availability and Discovery
  *---------------------------------------------------------------------------
  * Functions to check if CUDA support is compiled in and discover available

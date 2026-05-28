@@ -223,7 +223,7 @@ static bool load_model_internal(WhisperClient *client) {
         size_t free_mem = 0;
         if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
             // Check if free memory meets minimum threshold (2 GB)
-            if (free_mem >= ((size_t)(2UL * 1024 * 1024 * 1024))) {
+            if (free_mem >= GPU_MIN_FREE_VRAM_BYTES) {
                 try_gpu = true;
                 gpu_idx = best_gpu;
             } else {
@@ -243,7 +243,7 @@ static bool load_model_internal(WhisperClient *client) {
         int best_gpu = -1;
         size_t free_mem = 0;
         if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
-            if (free_mem >= ((size_t)(2UL * 1024 * 1024 * 1024))) {
+            if (free_mem >= GPU_MIN_FREE_VRAM_BYTES) {
                 try_gpu = true;
                 gpu_idx = best_gpu;
             }
@@ -256,12 +256,15 @@ static bool load_model_internal(WhisperClient *client) {
     if (try_gpu && gpu_idx >= 0) {
         char gpu_name[256];
         if (gpu_get_device_name(gpu_idx, gpu_name, sizeof(gpu_name))) {
-            fprintf(stderr, "[whisper] Using GPU device %d: %s\n", gpu_idx, gpu_name);
+            g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+                  "[whisper] Using GPU device %d: %s", gpu_idx, gpu_name);
         } else {
-            fprintf(stderr, "[whisper] Using GPU device %d\n", gpu_idx);
+            g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+                  "[whisper] Using GPU device %d", gpu_idx);
         }
     } else if (!try_gpu) {
-        fprintf(stderr, "[whisper] Using CPU (no GPU)\n");
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+              "[whisper] Using CPU (no GPU)");
     }
 
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -788,7 +791,7 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
                 i + 1, max_retries, whisper_client_get_error(client));
 
         // Brief delay before retry
-        usleep(100000 * (i + 1));  // 100ms, 200ms, ...
+        g_usleep(100000 * (size_t)(i + 1));  // 100ms, 200ms, ...
     }
 
     return last_response;

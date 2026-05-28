@@ -182,7 +182,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
             snprintf(info->error_message, sizeof(info->error_message),
                 "Failed to read GGML hparams");
             fclose(f);
-            return true;
+            return false;
         }
 
         uint32_t n_vocab = read_u32_le(hparams + 0);
