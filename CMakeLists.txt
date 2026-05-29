@@ -91,36 +91,14 @@ set(SOURCES
 )
 
 # Embed XPM assets as static C data for GdkPixbuf loading
-# gdk_pixbuf_new_from_xpm_data() accepts null-terminated char arrays
-set(XPM_SOURCES)
-foreach(xpm_file gear.xpm greenmic.xpm redmic.xpm)
-    set(xpm_path "${CMAKE_CURRENT_SOURCE_DIR}/assets/${xpm_file}")
-    string(REPLACE ".xpm" "" xpm_name "${xpm_file}")
-    string(TOUPPER "${xpm_name}" xpm_upper)
-    set(out_file "${CMAKE_CURRENT_BINARY_DIR}/assets/${xpm_name}.h")
-    file(READ "${xpm_path}" xpm_content)
-    # Strip trailing whitespace/newlines from the file content
-    string(STRIP "${xpm_content}" xpm_content)
-    # Ensure the last line ends with a comma for valid C array syntax
-    string(REGEX REPLACE "([^,])$" "\\1," xpm_content "${xpm_content}")
-    file(GENERATE
-        OUTPUT "${out_file}"
-        CONTENT "#ifndef EMBEDDED_${xpm_upper}_H
-#define EMBEDDED_${xpm_upper}_H
-static const char *${xpm_upper}_XPM[] = {
-${xpm_content}
-NULL
-};
-#endif
-"
-    )
-    list(APPEND XPM_SOURCES "${out_file}")
-endforeach()
+# Each .xpm file is a valid C source defining: static const char *NAME_XPM[] = { ... };
+# Symbols: GEAR_XPM, GREENMIC_XPM, REDMIC_XPM
 
 add_executable(transcriber ${SOURCES})
 
 # 1. ADD INCLUDE DIRECTORIES
 target_include_directories(transcriber PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     src
     ${CMAKE_CURRENT_BINARY_DIR}
     ${GTK3_INCLUDE_DIRS}
