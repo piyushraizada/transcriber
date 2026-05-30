@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build
+
+override_dh_auto_install:
+	dh_auto_install
+	# Install bundled Whisper model
+	install -d $(CURDIR)/debian/transcriber/usr/share/transcriber/models
+	if [ -f $(CURDIR)/models/ggml-large-v3-turbo-q8_0.bin ]; then \
+		install -m 644 $(CURDIR)/models/ggml-large-v3-turbo-q8_0.bin \
+			$(CURDIR)/debian/transcriber/usr/share/transcriber/models/; \
+	fi

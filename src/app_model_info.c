@@ -32,6 +32,7 @@
 #include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "app.h"  /* For UNUSED macro */
 
 /* Forward declaration - implemented in app_whisper.c */
 extern int whisper_resolve_model_path(const char *input, char *output, size_t out_size);
@@ -193,7 +194,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
         const uint32_t GGML_QNT_VERSION_FACTOR = 1000;
         uint32_t qntvr = ftype_raw / GGML_QNT_VERSION_FACTOR;
         int file_type = (int)(ftype_raw % GGML_QNT_VERSION_FACTOR);
-        (void)qntvr;
+        UNUSED(qntvr);
 
         /* Determine model type from n_audio_layer */
         char model_name_buf[64] = "whisper";
@@ -249,7 +250,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
     uint64_t tensor_count = read_u64_le(header + 4);
     uint64_t metadata_kv_count = read_u64_le(header + 4 + 8);
 
-    (void)tensor_count; /* Not needed for metadata extraction */
+    UNUSED(tensor_count); /* Not needed for metadata extraction */
 
     /* Params we'll extract from metadata */
     char architecture[64] = {0};

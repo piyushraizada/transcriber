@@ -45,6 +45,7 @@ struct _ConfigDialog {
     GtkComboBox *gpu_mode_combo;
     /* MIN-002 fix: Removed language_combo - multilingual models only */
     GtkSpinButton *duration_spin;
+    GtkCheckButton *append_text_checkbox;
     GtkLabel *model_path_error;
     GtkLabel *duration_error;
     GtkLabel *hotkey_label;
@@ -250,7 +251,7 @@ void config_dialog_reset_window_position(struct _AppConfig *config) {
  * =================================================================== */
 
 static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
+    UNUSED(button);
 
     gboolean valid = TRUE;
 
@@ -340,6 +341,10 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         }
     }
 
+    /* Set append transcription text mode from checkbox */
+    config_set_append_transcription_text(dlg->config,
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->append_text_checkbox)));
+
     /* Save config to file */
     config_save(dlg->config);
 
@@ -348,13 +353,13 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
 }
 
 static void on_cancel_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
+    UNUSED(button);
     gtk_dialog_response(dlg->dialog, GTK_RESPONSE_CANCEL);
 }
 
 
 static void on_reset_position_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
+    UNUSED(button);
     config_dialog_reset_window_position(dlg->config);
     gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
 }
@@ -436,7 +441,7 @@ static void update_model_info_label(ConfigDialog *dlg, const char *path) {
 }
 
 static void on_model_path_changed(GtkEntry *entry, ConfigDialog *dlg) {
-    (void)entry;
+    UNUSED(entry);
     config_dialog_clear_error(dlg->model_path_error);
 
     const char *path = gtk_entry_get_text(dlg->model_path_entry);
@@ -450,7 +455,7 @@ static void on_model_path_changed(GtkEntry *entry, ConfigDialog *dlg) {
 }
 
 static void on_browse_model_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
+    UNUSED(button);
 
     GtkWidget *chooser = gtk_file_chooser_dialog_new(
         "Select Whisper Model File",
@@ -505,7 +510,7 @@ static void on_browse_model_clicked(GtkButton *button, ConfigDialog *dlg) {
 }
 
 static void on_duration_changed(GtkSpinButton *spin, ConfigDialog *dlg) {
-    (void)spin;
+    UNUSED(spin);
     config_dialog_clear_error(dlg->duration_error);
 }
 
@@ -527,8 +532,8 @@ static gboolean reset_copy_button_label_callback(gpointer user_data) {
 
 /* MIN-003 fix: Copy hotkey command to clipboard */
 static void on_copy_hotkey_clicked(GtkButton *button, ConfigDialog *dlg) {
-    (void)button;
-    (void)dlg;
+    UNUSED(button);
+    UNUSED(dlg);
     const char *hotkey_cmd = config_dialog_get_hotkey_command();
     GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(clipboard, hotkey_cmd, -1);
@@ -849,6 +854,29 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     }
 
     gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+
+    /* ---- Transcription Text Mode ---- */
+    {
+        GtkWidget *text_mode_label = gtk_label_new("Transcription Text Mode:");
+        gtk_label_set_xalign(GTK_LABEL(text_mode_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), text_mode_label, FALSE, FALSE, 0);
+
+        dlg->append_text_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
+            "Append new transcriptions to existing text"));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->append_text_checkbox),
+                                     config_get_append_transcription_text(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->append_text_checkbox), FALSE, FALSE, 0);
+
+        GtkWidget *text_mode_help = gtk_label_new(
+            "When enabled, new text is added below previous transcriptions.\n"
+            "When disabled, the text window is cleared before each new transcription.");
+        gtk_label_set_xalign(GTK_LABEL(text_mode_help), 0);
+        gtk_widget_set_opacity(text_mode_help, 0.6);
+        gtk_label_set_line_wrap(GTK_LABEL(text_mode_help), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), text_mode_help, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+    }
 
     /* ---- Hotkey Command ---- */
     GtkWidget *hotkey_title = gtk_label_new("D-Bus Hotkey Command:");

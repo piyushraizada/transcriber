@@ -24,6 +24,7 @@
  */
 
 #include "app_audio.h"
+#include "app.h"  /* For UNUSED macro */
 #include "app_config.h"
 
 #include <glib.h>
@@ -119,20 +120,31 @@ static bool audio_format_write_wav_header(FILE *file, const AudioFormat *format)
         0, 0, 0, 0                     /* Data size (placeholder) */
     };
 
-    header[22] = (unsigned char)(channels & 0xFF);
-    header[23] = (unsigned char)((channels >> 8) & 0xFF);
-    header[24] = (unsigned char)(sample_rate & 0xFF);
-    header[25] = (unsigned char)((sample_rate >> 8) & 0xFF);
-    header[26] = (unsigned char)((sample_rate >> 16) & 0xFF);
-    header[27] = (unsigned char)((sample_rate >> 24) & 0xFF);
-    header[28] = (unsigned char)(byte_rate & 0xFF);
-    header[29] = (unsigned char)((byte_rate >> 8) & 0xFF);
-    header[30] = (unsigned char)((byte_rate >> 16) & 0xFF);
-    header[31] = (unsigned char)((byte_rate >> 24) & 0xFF);
-    header[32] = (unsigned char)(block_align & 0xFF);
-    header[33] = (unsigned char)((block_align >> 8) & 0xFF);
-    header[34] = (unsigned char)(bits_per_sample & 0xFF);
-    header[35] = (unsigned char)((bits_per_sample >> 8) & 0xFF);
+    unsigned char tmp[4];
+
+    pack32(tmp, (uint32_t)channels);
+    header[22] = tmp[0];
+    header[23] = tmp[1];
+
+    pack32(tmp, sample_rate);
+    header[24] = tmp[0];
+    header[25] = tmp[1];
+    header[26] = tmp[2];
+    header[27] = tmp[3];
+
+    pack32(tmp, byte_rate);
+    header[28] = tmp[0];
+    header[29] = tmp[1];
+    header[30] = tmp[2];
+    header[31] = tmp[3];
+
+    pack32(tmp, (uint32_t)block_align);
+    header[32] = tmp[0];
+    header[33] = tmp[1];
+
+    pack32(tmp, (uint32_t)bits_per_sample);
+    header[34] = tmp[0];
+    header[35] = tmp[1];
 
     size_t written = fwrite(header, 1, WAV_HEADER_SIZE, file);
     return (written == WAV_HEADER_SIZE);
@@ -212,6 +224,9 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
 
     err = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE,
+              "[audio] Failed to open ALSA device '%s': %s\n",
+              device_name, snd_strerror(err));
         return false;
     }
 
@@ -461,7 +476,10 @@ static void *capture_thread_func(void *arg) {
         recorder->alsa_pcm = NULL;
     }
 
-    /* M-008 fix: Set is_recording = FALSE under mutex for thread safety */
+    /* M-008 fix: Set is_recording = FALSE under mutex for thread safety.
+     * The main thread only reads is_recording after pthread_join() returns,
+     * which provides a happens-before guarantee. The mutex here ensures
+     * correctness if any other path reads is_recording concurrently. */
     pthread_mutex_lock(&recorder->mutex);
     recorder->is_recording = false;
     pthread_mutex_unlock(&recorder->mutex);
@@ -663,7 +681,7 @@ static bool test_capture_device(const char *device_name) {
 }
 
 AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
-    (void)recorder;
+    UNUSED(recorder);
 
     void **hints = NULL;
     int err = snd_device_name_hint(-1, "pcm", &hints);

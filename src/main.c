@@ -68,7 +68,7 @@
  *     eliminating file-scope static globals and improving testability.
  */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 
 #include "app.h"
 #include "app_audio.h"
@@ -146,6 +146,7 @@ typedef struct TranscriberApp {
 static void on_transcription_result(TranscriberApp *app, const char *text, bool success);
 static void on_model_status_change(TranscriberApp *app, ModelStatus status);
 static void on_dbus_toggle(void *user_data);
+static void on_dbus_activate(void *user_data);
 static void on_config_changed(void *user_data);
 static gboolean watchdog_timer_callback(gpointer user_data);
 static gpointer transcribe_thread_func(gpointer data);
@@ -286,7 +287,12 @@ static void show_auto_close_dialog(TranscriberApp *app, const char *title,
         "%s", message));
     gtk_window_set_title(GTK_WINDOW(dialog), title);
     g_timeout_add_seconds(DIALOG_AUTO_CLOSE_SECONDS, auto_close_dialog, dialog);
-    gtk_window_present(GTK_WINDOW(dialog));
+    /* Show without triggering GNOME desktop notifications.
+     * gtk_window_present() causes GNOME Shell to display a transient
+     * notification bubble in the top panel, so we use show_all + deiconify
+     * instead for a quieter experience, consistent with TextWindow behavior. */
+    gtk_widget_show_all(GTK_WIDGET(dialog));
+    gtk_window_deiconify(GTK_WINDOW(dialog));
 }
 
 /* ------------------------------------------------------------------ */
@@ -475,14 +481,22 @@ static void on_config_changed(void *user_data) {
  * Starts audio recording and the watchdog timer.
  */
 static void handle_enter_listening(TranscriberApp *app) {
+    /* Clear the TextWindow buffer at the start of a new transcription session
+     * if the user has disabled append mode (overwrite mode). This prevents
+     * unbounded memory growth over many transcription sessions. */
+    if (app->text_window && !config_get_append_transcription_text(app->controller.config)) {
+        app_text_window_clear_text(app->text_window);
+    }
+
     /* Update the UI */
     if (app->main_window) {
         app_window_set_state(app->main_window, STATE_LISTENING);
     }
 
-    /* Update tray icon */
+    /* Update tray icon (tray now sets ATTENTION status for pulse in dock) */
     if (app->tray) {
         tray_set_state(app->tray, STATE_LISTENING);
+        tray_start_animation(app->tray);
     }
 
     /* Start audio recording */
@@ -539,8 +553,9 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
         app_window_set_state(app->main_window, STATE_TRANSCRIBING);
     }
 
-    /* Update tray icon */
+    /* Update tray icon (tray now sets ATTENTION status for pulse in dock) */
     if (app->tray) {
+        tray_stop_animation(app->tray);
         tray_set_state(app->tray, STATE_TRANSCRIBING);
     }
 
@@ -573,9 +588,16 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
         /* MIN-012 fix: Start transcription watchdog (30s constant timeout) */
         start_transcription_watchdog(app);
 
-        /* HI-04 fix: Store thread handle for clean shutdown */
-        /* Perform transcription (blocking call in background thread) */
+        /* HI-04 fix: Store thread handle for clean shutdown.
+         * Memory leak fix: Join any previous transcription thread before
+         * overwriting the handle, preventing zombie threads from accumulating. */
         pthread_mutex_lock(&app->transcribe_thread_mutex);
+        if (app->transcribe_thread) {
+            /* Cancel the in-flight transcription to free its resources */
+            whisper_client_cancel(app->whisper_client);
+            g_thread_join(app->transcribe_thread);
+            app->transcribe_thread = NULL;
+        }
         app->transcribe_thread = g_thread_new("transcribe",
                         (GThreadFunc)transcribe_thread_func,
                         app);
@@ -688,8 +710,9 @@ static void on_transcription_result(TranscriberApp *app, const char *text, bool 
         app_window_set_state(app->main_window, STATE_IDLE);
     }
 
-    /* Update tray icon */
+    /* Update tray icon (tray now sets ACTIVE status — no pulse when idle) */
     if (app->tray) {
+        tray_stop_animation(app->tray);
         tray_set_state(app->tray, STATE_IDLE);
     }
 }
@@ -747,6 +770,11 @@ static gpointer model_loading_thread_func(gpointer data) {
 static gboolean on_model_loaded_idle(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
+    /* H-002 fix: Bail out early if application is shutting down */
+    if (app->shutting_down) {
+        return FALSE;
+    }
+
     /* Capture and clear the flag atomically before any potential re-entry */
     bool from_toggle = atomic_exchange(&app->model_loading_from_toggle, 0) != 0;
 
@@ -781,6 +809,13 @@ static gboolean on_model_load_failed_idle(gpointer data) {
     ModelLoadFailedData *mlfd = (ModelLoadFailedData *)data;
     TranscriberApp *app = mlfd->app;
     char *error_msg = mlfd->error_msg;
+
+    /* H-002 fix: Bail out early if application is shutting down */
+    if (app->shutting_down) {
+        g_free(error_msg);
+        g_free(mlfd);
+        return FALSE;
+    }
 
     /* Clear the "WAIT" overlay from the icon */
     if (app->main_window) {
@@ -919,8 +954,13 @@ static void on_microphone_toggle(void *user_data) {
                 tray_set_model_status(app->tray, MODEL_LOADING);
             }
 
-            /* H-001 fix: Store model loading thread handle for clean shutdown */
+            /* H-001 fix: Store model loading thread handle for clean shutdown.
+             * Memory leak fix: Join any previous model load thread before overwriting. */
             pthread_mutex_lock(&app->model_load_thread_mutex);
+            if (app->model_load_thread) {
+                g_thread_join(app->model_load_thread);
+                app->model_load_thread = NULL;
+            }
             app->model_load_thread = g_thread_new("model_loading",
                                   model_loading_thread_func, app);
             pthread_mutex_unlock(&app->model_load_thread_mutex);
@@ -948,6 +988,21 @@ static void on_microphone_toggle(void *user_data) {
  */
 static void on_dbus_toggle(void *user_data) {
     on_microphone_toggle(user_data);
+}
+
+/**
+ * Handle GNOME Shell Activate request from D-Bus.
+ * Called when the user clicks the application icon in the GNOME Dash/Dock.
+ * Presents or raises the main window to bring it to the user's attention.
+ */
+static void on_dbus_activate(void *user_data) {
+    TranscriberApp *app = (TranscriberApp *)user_data;
+    if (app && app->main_window) {
+        GtkWindow *win = app_window_get_gtk_window(app->main_window);
+        if (win) {
+            gtk_window_present(win);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -993,10 +1048,15 @@ static void perform_initial_model_load(TranscriberApp *app) {
 
     /* The "WAIT" overlay is already active (set to TRUE in app_window_create).
      * Start background thread to load the model. */
-    /* H-001 fix: Store model loading thread handle for clean shutdown */
+    /* H-001 fix: Store model loading thread handle for clean shutdown.
+     * Memory leak fix: Join any previous model load thread before overwriting. */
     pthread_mutex_lock(&app->model_load_thread_mutex);
+    if (app->model_load_thread) {
+        g_thread_join(app->model_load_thread);
+        app->model_load_thread = NULL;
+    }
     app->model_load_thread = g_thread_new("startup_model_load",
-                                       model_loading_thread_func, app);
+                                        model_loading_thread_func, app);
     pthread_mutex_unlock(&app->model_load_thread_mutex);
 }
 
@@ -1150,7 +1210,7 @@ static TranscriberApp *app_create(void) {
     /* Start D-Bus service */
     app->dbus_service = dbus_service_create();
     if (app->dbus_service) {
-        if (!dbus_service_start(app->dbus_service, on_dbus_toggle, app)) {
+        if (!dbus_service_start(app->dbus_service, on_dbus_toggle, on_dbus_activate, app)) {
             /* Continue without D-Bus — single-instance not enforced */
             dbus_service_destroy(app->dbus_service);
             app->dbus_service = NULL;
@@ -1265,6 +1325,9 @@ static void app_destroy(TranscriberApp *app) {
 int main(int argc, char *argv[]) {
     /* Initialize GTK */
     gtk_init(&argc, &argv);
+
+    /* Set the default application icon name for icon theme resolution. */
+    gtk_window_set_default_icon_name("redmic");
 
     /* Suppress whisper.cpp library internal log output */
     whisper_log_set(NULL, NULL);

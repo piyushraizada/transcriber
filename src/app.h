@@ -58,6 +58,12 @@
 #include "app_config.h"  /* For AppConfig definition */
 
 /******************************************************************************
+ * Utility Macros
+ *****************************************************************************/
+/** Suppress unused parameter warnings consistently across the codebase. */
+#define UNUSED(x) ((void)(x))
+
+/******************************************************************************
  * Centralized Error Messages
  *
  * L-002 fix: Shared error strings to avoid duplication across modules.

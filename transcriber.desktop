@@ -7,3 +7,11 @@ Icon=redmic
 Terminal=false
 Categories=AudioVideo;Audio;
 Keywords=voice;transcription;speech;whisper;dictation;
+
+# GNOME Dock / Dash integration
+# DBusActivatable tells GNOME Shell that the app is already running when
+# the D-Bus name is owned, so clicking the dock icon activates the existing
+# instance instead of launching a new one.
+DBusActivatable=true
+StartupNotify=false
+StartupWMClass=transcriber

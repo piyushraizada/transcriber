@@ -186,12 +186,8 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
     size_t best_free = 0;
 
     for (int i = 0; i < device_count; i++) {
-        /* MED-8 fix: Removed unused total_mem variable */
         size_t free_mem = 0;
         if (gpu_get_memory_info(i, &free_mem, NULL)) {
-            char name[128] = {"Unknown"};
-            gpu_get_device_name(i, name, sizeof(name));
-
             if (best_idx < 0 || free_mem > best_free) {
                 best_free = free_mem;
                 best_idx = i;

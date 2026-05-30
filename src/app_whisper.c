@@ -65,7 +65,7 @@ struct _WhisperClient {
     pthread_mutex_t mutex;
     atomic_int cancel_requested;
     bool model_loaded;
-    bool model_loading;                // true while model load is in progress
+    atomic_bool model_loading;         // true while model load is in progress (atomic for cross-thread safety)
 };
 
 /* ===================================================================
@@ -186,7 +186,7 @@ bool whisper_client_is_model_loaded(const WhisperClient *client) {
  * =================================================================== */
 bool whisper_client_is_loading(const WhisperClient *client) {
     if (!client) return false;
-    return client->model_loading;
+    return atomic_load(&client->model_loading);
 }
 
 /* ===================================================================
@@ -318,13 +318,13 @@ static bool load_model_internal(WhisperClient *client) {
 static bool load_model(WhisperClient *client) {
     if (!client || client->model_loaded) return true;
 
-    // Mark as loading
-    client->model_loading = true;
+    // Mark as loading (atomic for cross-thread visibility)
+    atomic_store(&client->model_loading, true);
 
     bool result = load_model_internal(client);
 
     // Clear loading flag
-    client->model_loading = false;
+    atomic_store(&client->model_loading, false);
 
     return result;
 }
@@ -365,10 +365,10 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
     // Set the GPU index preference
     client->gpu_index = gpu_index;
 
-    // Load the model
-    client->model_loading = true;
+    // Load the model (atomic for cross-thread visibility)
+    atomic_store(&client->model_loading, true);
     bool result = load_model_internal(client);
-    client->model_loading = false;
+    atomic_store(&client->model_loading, false);
 
     pthread_mutex_unlock(&client->mutex);
 
@@ -756,7 +756,9 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
 /* ===================================================================
  * Public API: whisper_transcribe_with_retry
  * =================================================================== */
-/* ME-03 fix: Restructured retry loop to avoid unconditional extra call. */
+/* ME-03 fix: Restructured retry loop to avoid unconditional extra call.
+ * Memory leak fix: Free failed responses on each retry iteration to prevent
+ * accumulating orphaned WhisperResponse structs when retries are exhausted. */
 WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char* wav_path, int max_retries) {
     if (!client || !wav_path) return NULL;
 
@@ -770,6 +772,10 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
         }
 
         if (response->success) {
+            /* Free any previous failed response before returning success */
+            if (last_response) {
+                whisper_response_free(last_response);
+            }
             return response;
         }
 
@@ -777,12 +783,18 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
 
         // Only retry on certain error codes (4=read error, 5=decode error, 7=memory)
         if (code != 4 && code != 5 && code != 7) {
-            // Non-retryable error -- return immediately
+            // Non-retryable error -- free previous and return this one
+            if (last_response) {
+                whisper_response_free(last_response);
+            }
             last_response = response;
             break;
         }
 
-        // Save as last response in case this is the final attempt
+        // Free previous failed response before saving the new one
+        if (last_response) {
+            whisper_response_free(last_response);
+        }
         last_response = response;
 
         if (i == attempts - 1) break;  // Last attempt

@@ -119,6 +119,7 @@ target_link_libraries(transcriber PRIVATE
     whisper
     pthread
     m
+    X11
 )
 
 # 3. DEFINITIONS
@@ -159,6 +160,19 @@ elseif(ENABLE_TSAN)
     target_link_options(transcriber PRIVATE -fsanitize=thread)
 endif()
 
+# Link Time Optimization for release builds
+option(ENABLE_LTO "Enable Link Time Optimization (LTO)" OFF)
+if(ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT lto_supported OUTPUT lto_error)
+    if(lto_supported)
+        set_property(TARGET transcriber PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        message(STATUS "LTO enabled for release build optimization")
+    else()
+        message(WARNING "LTO requested but not supported: ${lto_error}")
+    endif()
+endif()
+
 if(ALSA_FOUND)
     target_compile_definitions(transcriber PRIVATE HAVE_ALSA)
 endif()
@@ -173,6 +187,43 @@ endif()
 # Install rules
 install(TARGETS transcriber RUNTIME DESTINATION bin)
 install(FILES transcriber.desktop DESTINATION share/applications)
-# Install themed icon for application menu integration
-install(FILES assets/redmic.xpm DESTINATION share/pixmaps RENAME redmic.xpm)
+# Install D-Bus activation service file for GNOME dock integration.
+# This enables DBusActivatable=true in the .desktop file, so GNOME Shell
+# recognizes that clicking the dock icon activates the existing instance
+# (via the org.xvoice.Controller D-Bus name) rather than launching a new one.
+install(FILES org.xvoice.Controller.service DESTINATION share/dbus-1/services)
+# Install themed icons for application menu integration and runtime fallback
+# When XPM_STATICALLY_EMBEDDED is undefined, the application loads these from disk
+install(FILES assets/redmic.xpm   DESTINATION share/pixmaps RENAME redmic.xpm)
+install(FILES assets/greenmic.xpm DESTINATION share/pixmaps RENAME greenmic.xpm)
+install(FILES assets/gear.xpm     DESTINATION share/pixmaps RENAME gear.xpm)
+# Install PNG icons in hicolor theme for reliable GNOME dock/dash resolution
+install(FILES assets/hicolor/redmic.png  DESTINATION share/icons/hicolor/apps RENAME redmic.png)
+install(FILES assets/hicolor/greenmic.png DESTINATION share/icons/hicolor/apps RENAME greenmic.png)
+install(FILES assets/hicolor/gear.png    DESTINATION share/icons/hicolor/apps RENAME gear.png)
+# Update the icon cache after installing PNG icons so the theme picks them up
+find_program(GTK_UPDATE_ICON_CACHE gtk-update-icon-cache)
+if(GTK_UPDATE_ICON_CACHE)
+    install(CODE "execute_process(COMMAND ${GTK_UPDATE_ICON_CACHE} \$ENV{HOME}/.local/share/icons/hicolor/ RESULT_VARIABLE RET_VAR)")
+endif()
 
+# Custom target to build a .deb package with bundled Whisper turbo model
+# Usage: make build-deb  (builds transcriber_<version>_<arch>.deb in project root)
+# The deb package includes the binary, desktop file, D-Bus service, icons,
+# and the Whisper large-v3-turbo-q8_0 model (~1.1 GiB).
+add_custom_target(build-deb
+    COMMAND ${CMAKE_COMMAND} -E echo "Building .deb package..."
+    COMMAND bash ${CMAKE_SOURCE_DIR}/packaging/build-deb.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Creating .deb package with bundled Whisper turbo model"
+    USES_TERMINAL
+)
+
+# Custom target to uninstall files installed by CMake 'make install'
+# Usage: make uninstall  (removes all files from /usr/local)
+add_custom_target(uninstall
+    COMMAND bash ${CMAKE_SOURCE_DIR}/packaging/build-deb.sh --uninstall
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Removing files installed by 'make install'"
+    USES_TERMINAL
+)

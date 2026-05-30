@@ -41,7 +41,11 @@
 #include "app.h"
 
 #include <glib.h>
+#include <gdk/gdkx.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <libayatana-appindicator/app-indicator.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +99,14 @@ struct _SystemTray {
     /* Track which temp icon files were created for cleanup */
     bool icon_idle_created;
     bool icon_listening_created;
+    /* Sine wave animation state */
+    guint animation_source_id;    /* Timer source ID (0 = not running) */
+    guint animation_frame;        /* Current frame index */
+    char anim_icon_paths[8][PATH_MAX];  /* Animated frame file paths */
+    char anim_icon_names[8][64];   /* Animated frame icon names */
+    GdkPixbuf *anim_pixbufs[8];   /* Pre-loaded pixbufs for each frame (avoids disk I/O in timer) */
+    guint num_anim_frames;        /* Number of animation frames created */
+    bool anim_icons_created;      /* TRUE if animation frames were generated */
 };
 
 /* ------------------------------------------------------------------ */
@@ -112,6 +124,11 @@ static void build_context_menu(SystemTray *tray);
 static void on_menu_toggle(GtkMenuItem *item, gpointer user_data);
 static void on_menu_show(GtkMenuItem *item, gpointer user_data);
 static void on_menu_quit(GtkMenuItem *item, gpointer user_data);
+
+/* Animation helpers */
+static void ensure_animation_frames(SystemTray *tray);
+static gboolean animation_tick_tray(gpointer user_data);
+static void set_dock_icon_from_pixbuf(GtkWindow *win, GdkPixbuf *pixbuf);
 
 /* ------------------------------------------------------------------ */
 /* Icon loading and PNG conversion                                     */
@@ -244,7 +261,7 @@ static void build_context_menu(SystemTray *tray) {
 /* ------------------------------------------------------------------ */
 
 static void on_menu_toggle(GtkMenuItem *item, gpointer user_data) {
-    (void)item;
+    UNUSED(item);
     SystemTray *tray = (SystemTray *)user_data;
     if (tray->on_toggle) {
         tray->on_toggle(tray->toggle_user_data);
@@ -252,7 +269,7 @@ static void on_menu_toggle(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_menu_show(GtkMenuItem *item, gpointer user_data) {
-    (void)item;
+    UNUSED(item);
     SystemTray *tray = (SystemTray *)user_data;
     if (tray->main_window) {
         gtk_window_present(tray->main_window);
@@ -260,8 +277,8 @@ static void on_menu_show(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_menu_quit(GtkMenuItem *item, gpointer user_data) {
-    (void)item;
-    (void)user_data;
+    UNUSED(item);
+    UNUSED(user_data);
     gtk_main_quit();
 }
 
@@ -303,13 +320,19 @@ static void update_tray_icon(SystemTray *tray) {
  */
 static void update_tray_tooltip(SystemTray *tray) {
     const char *tooltip;
+    AppIndicatorStatus status;
 
     switch (tray->current_state) {
         case STATE_LISTENING:
             tooltip = TOOLTIP_LISTENING;
+            /* Use ACTIVE status so the dock icon stays still, allowing the
+             * sine wave animation frames to be visible without pulse/bounce. */
+            status = APP_INDICATOR_STATUS_ACTIVE;
             break;
         case STATE_TRANSCRIBING:
             tooltip = TOOLTIP_TRANSCRIBING;
+            /* ACTIVE status — icon remains steady during transcription. */
+            status = APP_INDICATOR_STATUS_ACTIVE;
             break;
         case STATE_IDLE:
         default:
@@ -320,6 +343,8 @@ static void update_tray_tooltip(SystemTray *tray) {
             } else {
                 tooltip = TOOLTIP_IDLE_DISCONNECTED;
             }
+            /* Normal active status when idle — no pulse. */
+            status = APP_INDICATOR_STATUS_ACTIVE;
             break;
     }
 
@@ -327,8 +352,9 @@ static void update_tray_tooltip(SystemTray *tray) {
      * The third argument (secondary_label) is NULL — we only need the main label. */
     app_indicator_set_label(tray->indicator, tooltip, NULL);
 
-    /* Ensure the indicator is visible in the system tray */
-    app_indicator_set_status(tray->indicator, APP_INDICATOR_STATUS_ACTIVE);
+    /* Set status: ACTIVE for normal display, ATTENTION for pulse/bounce in dock.
+     * This is what makes the GNOME dock icon visibly indicate recording state. */
+    app_indicator_set_status(tray->indicator, status);
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,12 +374,19 @@ SystemTray *tray_create(void) {
     tray->toggle_user_data = NULL;
     tray->icon_idle_created = false;
     tray->icon_listening_created = false;
+    tray->animation_source_id = 0;
+    tray->animation_frame = 0;
+    tray->num_anim_frames = 0;
+    tray->anim_icons_created = false;
+    for (guint i = 0; i < 8; i++) {
+        tray->anim_pixbufs[i] = NULL;
+    }
 
     /* Create a temp directory for icon files so app_indicator_new_with_path()
      * can find them. This is required because app_indicator_set_icon() expects
      * an icon name (not a full path) and searches the icon theme path. */
-    g_snprintf(tray->icon_dir, sizeof(tray->icon_dir),
-               "%s/transcriber_icons_%d", g_get_tmp_dir(), getpid());
+    snprintf(tray->icon_dir, sizeof(tray->icon_dir),
+             "%s/transcriber_icons_%d", g_get_tmp_dir(), getpid());
     mkdir(tray->icon_dir, 0755);
 
     /* Build icon file paths within the temp directory */
@@ -365,6 +398,14 @@ SystemTray *tray_create(void) {
     /* Icon names (basename without extension) for app_indicator_set_icon() */
     snprintf(tray->icon_idle_name, sizeof(tray->icon_idle_name), "%s", TRAY_ICON_IDLE_NAME);
     snprintf(tray->icon_listening_name, sizeof(tray->icon_listening_name), "%s", TRAY_ICON_LISTENING_NAME);
+
+    /* Build animation frame paths (after icon_dir is set) */
+    for (guint i = 0; i < 8; i++) {
+        g_snprintf(tray->anim_icon_paths[i], sizeof(tray->anim_icon_paths[i]),
+                   "%s/transcriber_anim_%d.png", tray->icon_dir, i);
+        g_snprintf(tray->anim_icon_names[i], sizeof(tray->anim_icon_names[i]),
+                   "transcriber_anim_%d", i);
+    }
 
     /* Create the icon PNG files BEFORE app_indicator_new_with_path().
      * The AppIndicator constructor attempts to load the initial icon
@@ -397,12 +438,31 @@ SystemTray *tray_create(void) {
 void tray_destroy(SystemTray *tray) {
     if (!tray) return;
 
+    /* Stop animation timer if running */
+    if (tray->animation_source_id != 0) {
+        g_source_remove(tray->animation_source_id);
+        tray->animation_source_id = 0;
+    }
+
     /* Remove temporary icon files */
     if (tray->icon_idle_created) {
         unlink(tray->icon_idle_path);
     }
     if (tray->icon_listening_created) {
         unlink(tray->icon_listening_path);
+    }
+
+    /* Free pre-loaded animation pixbufs */
+    for (guint i = 0; i < tray->num_anim_frames; i++) {
+        if (tray->anim_pixbufs[i]) {
+            g_object_unref(tray->anim_pixbufs[i]);
+            tray->anim_pixbufs[i] = NULL;
+        }
+    }
+
+    /* Remove animation frame files */
+    for (guint i = 0; i < tray->num_anim_frames; i++) {
+        unlink(tray->anim_icon_paths[i]);
     }
 
     /* Remove temporary icon directory */
@@ -450,4 +510,211 @@ void tray_set_toggle_callback(SystemTray *tray,
     if (!tray) return;
     tray->on_toggle = callback;
     tray->toggle_user_data = user_data;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sine wave animation on dock icon                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Animation constants — match the MainWindow sine wave for visual consistency.
+ */
+#define TRAY_ANIM_FRAMES       8
+#define TRAY_ANIM_INTERVAL_MS  33  /* ~30 fps */
+#define TRAY_WAVE_AMPLITUDE    20.0
+#define TRAY_WAVE_FREQUENCY    0.05
+#define TRAY_WAVE_COLOR_R      0.165
+#define TRAY_WAVE_COLOR_G      0.655
+#define TRAY_WAVE_COLOR_B      0.259
+#define TRAY_WAVE_COLOR_A      0.7
+#define TRAY_WAVE_LINE_WIDTH   6.0
+
+/**
+ * Timer callback for the tray icon sine wave animation.
+ * Cycles through pre-generated frames, updating both tray and window (dock) icon.
+ */
+static gboolean animation_tick_tray(gpointer user_data) {
+    SystemTray *tray = (SystemTray *)user_data;
+    tray->animation_frame = (tray->animation_frame + 1) % tray->num_anim_frames;
+    app_indicator_set_icon(tray->indicator, tray->anim_icon_names[tray->animation_frame]);
+    /* Update the window (dock) icon with the current animation frame.
+     * Use pre-loaded pixbuf to avoid slow disk I/O on every timer tick.
+     * Use set_dock_icon_from_pixbuf() which sets _NET_WM_ICON via Xlib,
+     * ensuring the dock sees the animated frames. */
+    if (tray->main_window && tray->anim_pixbufs[tray->animation_frame]) {
+        set_dock_icon_from_pixbuf(tray->main_window, tray->anim_pixbufs[tray->animation_frame]);
+    }
+    return TRUE; /* Continue the timer */
+}
+
+/**
+ * Set the dock/taskbar icon from a GdkPixbuf by writing the _NET_WM_ICON
+ * X11 property directly. This is required because gtk_window_set_icon()
+ * may be cached or ignored by some desktop environments (e.g., GNOME Shell
+ * dock) for already-running applications.
+ */
+static void set_dock_icon_from_pixbuf(GtkWindow *win, GdkPixbuf *pixbuf) {
+    GdkWindow *gdk_win = gtk_widget_get_window(GTK_WIDGET(win));
+    if (!gdk_win || !GDK_IS_X11_WINDOW(gdk_win)) return;
+
+    Window xwin = gdk_x11_window_get_xid(gdk_win);
+    Display *dpy = GDK_DISPLAY_XDISPLAY(gdk_window_get_display(gdk_win));
+    Atom net_wm_icon = XInternAtom(dpy, "_NET_WM_ICON", True);
+    if (net_wm_icon == None) return;
+
+    int w = gdk_pixbuf_get_width(pixbuf);
+    int h = gdk_pixbuf_get_height(pixbuf);
+    int n_channels = gdk_pixbuf_get_n_channels(pixbuf);
+    guint8 *pixels = gdk_pixbuf_get_pixels(pixbuf);
+    guint rowstride = gdk_pixbuf_get_rowstride(pixbuf);
+
+    /* _NET_WM_ICON format: [width, height, pixel_data...] as CARDINAL (32-bit) values.
+     * Each pixel is a single 32-bit value in ARGB format: 0xAARRGGBB. */
+    long *data = g_new(long, 2 + w * h);
+    gint i, j, k = 0;
+    data[k++] = w;
+    data[k++] = h;
+    for (i = 0; i < h; i++) {
+        for (j = 0; j < w; j++) {
+            guint8 *p = pixels + i * rowstride + j * n_channels;
+            if (n_channels == 4) {
+                data[k++] = ((long)p[3] << 24) | ((long)p[0] << 16) | ((long)p[1] << 8) | (long)p[2];
+            } else {
+                /* 3 channels (RGB) — assume fully opaque */
+                data[k++] = 0xFF000000UL | ((long)p[0] << 16) | ((long)p[1] << 8) | (long)p[2];
+            }
+        }
+    }
+
+    XChangeProperty(dpy, xwin, net_wm_icon, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)data, k);
+    XFlush(dpy);
+    g_free(data);
+}
+
+/**
+ * Pre-generate animation frames by compositing a sine wave onto the green mic.
+ * Each frame uses a different phase offset of the sine wave.
+ */
+static void ensure_animation_frames(SystemTray *tray) {
+    if (tray->anim_icons_created) {
+        return;
+    }
+
+    /* Load the green mic as base */
+    GdkPixbuf *base = load_xpm_for_tray("greenmic.xpm");
+    if (!base) {
+        return;
+    }
+
+    int w = gdk_pixbuf_get_width(base);
+    int h = gdk_pixbuf_get_height(base);
+    guint n_channels = gdk_pixbuf_get_n_channels(base); /* 3 or 4 */
+
+    /* Phase increment per frame: full cycle over TRAY_ANIM_FRAMES frames */
+    double phase_inc = (2.0 * G_PI) / TRAY_ANIM_FRAMES;
+    guint frames_created = 0;
+
+    for (guint f = 0; f < TRAY_ANIM_FRAMES; f++) {
+        double phase = f * phase_inc;
+
+        /* Create a mutable copy of the base icon */
+        GdkPixbuf *frame = gdk_pixbuf_copy(base);
+        guint8 *fp = gdk_pixbuf_get_pixels(frame);
+        guint f_rowstride = gdk_pixbuf_get_rowstride(frame);
+
+        /* Draw sine wave onto the frame pixels */
+        double center_y = h / 2.0;
+        guint wave_half = (guint)(TRAY_WAVE_LINE_WIDTH / 2);
+
+        for (int x = 0; x < w; x++) {
+            double y = center_y + TRAY_WAVE_AMPLITUDE * sin(TRAY_WAVE_FREQUENCY * x + phase);
+
+            /* Draw line segment around the sine wave */
+            for (int dy = -(int)wave_half; dy <= (int)wave_half; dy++) {
+                int py = (int)y + dy;
+                if (py >= 0 && py < h) {
+                    guint offset = py * f_rowstride + x * n_channels;
+                    /* Apply wave color with alpha blending over existing pixel */
+                    guint8 r = fp[offset];
+                    guint8 g = fp[offset + 1];
+                    guint8 b = fp[offset + 2];
+                    double a = TRAY_WAVE_COLOR_A;
+                    fp[offset]     = (guint8)(r * (1.0 - a) + TRAY_WAVE_COLOR_R * 255.0 * a);
+                    fp[offset + 1] = (guint8)(g * (1.0 - a) + TRAY_WAVE_COLOR_G * 255.0 * a);
+                    fp[offset + 2] = (guint8)(b * (1.0 - a) + TRAY_WAVE_COLOR_B * 255.0 * a);
+                }
+            }
+        }
+
+        /* Save frame to temp PNG (needed for tray icon via app_indicator_set_icon) */
+        if (save_pixbuf_as_png(frame, tray->anim_icon_paths[f])) {
+            /* Pre-load the pixbuf into memory to avoid disk I/O on every timer tick.
+             * gdk_pixbuf_copy() creates a new reference we own. */
+            tray->anim_pixbufs[frames_created] = gdk_pixbuf_copy(frame);
+            frames_created++;
+        }
+        g_object_unref(frame);
+    }
+
+    g_object_unref(base);
+
+    if (frames_created > 0) {
+        tray->num_anim_frames = frames_created;
+        tray->anim_icons_created = true;
+    }
+}
+
+/**
+ * Start the sine wave animation on the tray icon.
+ * Pre-generates frames then starts the timer.
+ */
+void tray_start_animation(SystemTray *tray) {
+    if (!tray) return;
+
+    /* Don't start if already running */
+    if (tray->animation_source_id != 0) {
+        return;
+    }
+
+    ensure_animation_frames(tray);
+    if (tray->num_anim_frames == 0) {
+        return; /* No frames generated, skip animation */
+    }
+
+    tray->animation_frame = 0;
+    /* Show first frame immediately on both tray and window (dock) icon.
+     * Use pre-loaded pixbuf + set_dock_icon_from_pixbuf() for dock visibility. */
+    app_indicator_set_icon(tray->indicator, tray->anim_icon_names[0]);
+    if (tray->main_window && tray->anim_pixbufs[0]) {
+        set_dock_icon_from_pixbuf(tray->main_window, tray->anim_pixbufs[0]);
+    }
+    tray->animation_source_id = g_timeout_add(TRAY_ANIM_INTERVAL_MS,
+                                               animation_tick_tray,
+                                               tray);
+}
+
+/**
+ * Stop the sine wave animation on the tray icon.
+ * Stops the timer and reverts to the static green mic icon.
+ */
+void tray_stop_animation(SystemTray *tray) {
+    if (!tray) return;
+
+    if (tray->animation_source_id != 0) {
+        g_source_remove(tray->animation_source_id);
+        tray->animation_source_id = 0;
+    }
+
+    /* Revert to static green mic on both tray and window (dock) icon */
+    if (tray->icon_listening_created) {
+        app_indicator_set_icon(tray->indicator, tray->icon_listening_name);
+    }
+    if (tray->main_window) {
+        GdkPixbuf *green = gdk_pixbuf_new_from_file(tray->icon_listening_path, NULL);
+        if (green) {
+            set_dock_icon_from_pixbuf(tray->main_window, green);
+            g_object_unref(green);
+        }
+    }
 }

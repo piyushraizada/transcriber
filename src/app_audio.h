@@ -145,9 +145,8 @@ const char *audio_recorder_get_wav_path(const AudioRecorder *recorder);
  * It represents the root-mean-square amplitude of the most recent PCM buffer,
  * normalized to the full range of 16-bit signed samples (32768).
  *
- * Thread-safe: the field is volatile and accessed via simple load/store.
- * On x86/x64, double-width loads are atomic. Callers should treat this as
- * a snapshot that may be slightly stale.
+ * Thread-safe: protected by volume_mutex in the AudioRecorder struct.
+ * Callers should treat this as a snapshot that may be slightly stale.
  *
  * @param recorder Pointer to a valid AudioRecorder. Must not be NULL.
  * @return RMS volume level in range [0.0, 1.0], or 0.0 if not recording.

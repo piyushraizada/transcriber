@@ -233,7 +233,7 @@ static void get_asset_dir(MainWindow *win) {
 static GdkPixbuf *load_xpm(MainWindow *win, const char *filename) {
 #ifdef XPM_STATICALLY_EMBEDDED
     /* Use embedded XPM arrays */
-    (void)win;
+    UNUSED(win);
     if (strcmp(filename, "gear.xpm") == 0) {
         return gdk_pixbuf_new_from_xpm_data(GEAR_XPM);
     } else if (strcmp(filename, "greenmic.xpm") == 0) {
@@ -536,8 +536,8 @@ static void on_indicator_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
  */
 static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
-    (void)widget;
-    (void)event;
+    UNUSED(widget);
+    UNUSED(event);
     if (win->on_toggle) {
         win->on_toggle(win->toggle_user_data);
     }
@@ -549,7 +549,7 @@ static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, g
  * Opens the configuration dialog.
  */
 static void on_gear_button_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
+    UNUSED(button);
     MainWindow *win = (MainWindow *)user_data;
     bool saved = config_dialog_show(win->window, win->config);
     if (saved && win->on_config_changed) {
@@ -574,8 +574,8 @@ static gboolean on_indicator_check_connection(gpointer user_data) {
 
 static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
-    (void)widget;
-    (void)event;
+    UNUSED(widget);
+    UNUSED(event);
 
     /* CRIT-001 fix: Trigger connection check on indicator click */
     app_window_set_model_status(win, MODEL_CHECKING);
@@ -593,8 +593,8 @@ static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *eve
  * main() handles cleanup after gtk_main() returns.
  */
 static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
-    (void)widget;
-    (void)event;
+    UNUSED(widget);
+    UNUSED(event);
     MainWindow *win = (MainWindow *)user_data;
     app_window_save_position(win);
     gtk_main_quit();
@@ -611,7 +611,7 @@ static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, 
         tw->auto_position = TRUE;  /* Re-enable auto-position for next transcription */
     }
     gtk_widget_hide(widget);
-    (void)event;
+    UNUSED(event);
     return TRUE; /* Prevent the window from being destroyed */
 }
 
@@ -621,7 +621,7 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
     if (!tw || !tw->window || !gtk_widget_get_visible(GTK_WIDGET(tw->window)) || !tw->auto_position) {
         return FALSE;
     }
-    (void)event;
+    UNUSED(event);
 
     /* Use gdk_window_get_frame_extents to get the outer frame rectangle
      * (including title bar and borders). gtk_window_get_position() returns
@@ -705,8 +705,9 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
 
     /* Set window properties */
     gtk_window_set_title(win->window, "Transcriber");
+    gtk_window_set_wmclass(win->window, "transcriber", "Transcriber");
     gtk_window_set_resizable(win->window, FALSE);
-    gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_UTILITY);
+    gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_NORMAL);
 
     /* Set the window icon (taskbar/dock icon) to the red mic */
     GdkPixbuf *window_icon = load_xpm(win, "redmic.xpm");
@@ -1129,9 +1130,12 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
     gtk_text_buffer_insert(tw->buffer, &end, text, -1);
     gtk_text_buffer_insert(tw->buffer, &end, "\n", 1);
 
-    /* Show and raise the window */
+    /* Show the window without triggering GNOME desktop notifications.
+     * gtk_window_present() causes GNOME Shell to display a transient
+     * notification bubble in the top panel, so we use show_all + deiconify
+     * instead for a quieter experience. */
     gtk_widget_show_all(GTK_WIDGET(tw->window));
-    gtk_window_present(tw->window);
+    gtk_window_deiconify(tw->window);
 
     /* Scroll to the end */
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
@@ -1148,9 +1152,28 @@ void app_text_window_set_error(TextWindow *tw, const char *error) {
     gtk_text_buffer_insert(tw->buffer, &end, error, -1);
     gtk_text_buffer_insert(tw->buffer, &end, "\n", 1);
 
-    /* Show and raise the window */
+    /* Show the window without triggering GNOME desktop notifications.
+     * gtk_window_present() causes GNOME Shell to display a transient
+     * notification bubble in the top panel, so we use show_all + deiconify
+     * instead for a quieter experience. */
     gtk_widget_show_all(GTK_WIDGET(tw->window));
-    gtk_window_present(tw->window);
+    gtk_window_deiconify(tw->window);
+}
+
+void app_text_window_clear_text(TextWindow *tw) {
+    if (!tw || !tw->buffer) return;
+
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(tw->buffer, &start);
+    gtk_text_buffer_get_end_iter(tw->buffer, &end);
+    gtk_text_buffer_delete(tw->buffer, &start, &end);
+
+    /* Show the window without triggering GNOME desktop notifications.
+     * gtk_window_present() causes GNOME Shell to display a transient
+     * notification bubble in the top panel, so we use show_all + deiconify
+     * instead for a quieter experience. */
+    gtk_widget_show_all(GTK_WIDGET(tw->window));
+    gtk_window_deiconify(tw->window);
 }
 
 /* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */

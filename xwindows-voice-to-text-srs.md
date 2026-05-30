@@ -1,7 +1,7 @@
 # Software Requirements Specification (SRS)
 ## X-Windows Voice-to-Text Application
 
-**Document Version:** 2.1
+**Document Version:** 2.2
 **Date:** 2026-05-25
 **Author:** System Architecture Team
 **Status:** Production-Ready
@@ -10,6 +10,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.2 | 2026-05-30 | Updated to match actual implementation: D-Bus Toggle returns boolean (was "no return value"), GDBus native main loop integration (was timer-based polling), FR-039 uses gdk_display_beep() (was ASCII BEL), FR-041 uses g_log() with snd_strerror(), WHISPER-013 parses GGUF/GGML headers directly (was loading full model), DEP-010 uses volatile pointer loop (was explicit_bzero), CFG-014 max clamped to 30 (was 120), added CFG-TEXT-001 (append mode), added build system options table, added tray sine wave animation docs, added UNUSED macro to app.h, standardized _POSIX_C_SOURCE to 200809L, added ENABLE_LTO option |
 | 2.1 | 2026-05-25 | Added requirements for: Volume Level Monitoring (FR-051, UI-028, AUD-016), Audio Device Display Name (CFG-AUDIO-002), Loading State Indicator (UI-023), Transcription Watchdog (NR-019 updated), Model Loading Background Thread (WHISPER-014), GPU Discovery Module (FR-049d), enhanced Model Metadata Extraction (WHISPER-013) |
 | 2.0 | 2026-05-25 | Major update: Replaced VLLM server with local whisper.cpp, added System Tray Icon, added GPU (CUDA) support, added Model Info module, updated configuration parameters |
 | 1.0 | 2026-05-17 | Initial SRS with VLLM server integration |
@@ -306,10 +307,11 @@ dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/
 
 The application responds by toggling between IDLE and LISTENING/TRANSCRIBING states, with all UI updates (icon change, animation, text area) behaving identically to a mouse-click-triggered toggle.
 
-#### D-Bus Polling Mechanism
+#### D-Bus Integration Mechanism
 
-- The GTK main loop in the Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch integrated into the GLib main context.
-- This design eliminates the need for a dedicated D-Bus thread, reducing complexity and resource usage.
+- The application uses GDBus (GIO) which integrates natively with the GLib/GTK main loop, processing D-Bus messages without polling or a dedicated thread.
+- Bus name ownership is requested via `g_bus_own_name()` with callbacks for bus acquired/name acquired/name lost.
+- Single-instance enforcement is implemented by checking `GetNameOwner` before claiming the bus name.
 - D-Bus bus name ownership (`org.xvoice.Controller`) enforces single-instance semantics, eliminating the need for lock files.
 - Since the application does not register global keyboard shortcuts itself (hotkeys are configured externally in the compositor/DE), it avoids Wayland's security restrictions on applications attempting to capture global key events. The D-Bus interface works identically under X11 and Wayland.
 
@@ -505,7 +507,9 @@ The application shall display a countdown timer in the **center of the MainWindo
 **Traceability**: FR-038 → UI-025
 
 #### FR-039: Audio Recording Completion Beep
-The application shall emit an audible beep (ASCII BEL character, 0x07) when audio recording completes and transitions to `STATE_TRANSCRIBING`. The beep shall be triggered regardless of whether the recording was stopped by user action or watchdog timeout.
+The application shall emit an audible beep when audio recording completes and transitions to `STATE_TRANSCRIBING`. The beep is implemented using `gdk_display_beep()` (GTK window bell), which works reliably in modern desktop environments (both X11 and Wayland). The beep shall be triggered regardless of whether the recording was stopped by user action or watchdog timeout.
+
+**Implementation**: `gdk_display_beep()` called on the MainWindow's GdkDisplay in `handle_enter_transcribing()` (main.c).
 
 **Traceability**: FR-039 → UI-026
 
@@ -515,7 +519,9 @@ Changes to the audio device configuration made through the Configuration Dialog 
 **Traceability**: FR-040 → CFG-010
 
 #### FR-041: Recording Device Logging
-Before starting audio recording, the application shall log the name of the audio device being used to stderr in the format: `[audio] Using recording device: <device_name>`.
+Before starting audio recording, the application shall log the name of the audio device being used using `g_log()` with domain "app-audio" and level `G_LOG_LEVEL_MESSAGE`. ALSA device open failures are also logged with the specific error from `snd_strerror()`.
+
+**Implementation**: `g_log("app-audio", G_LOG_LEVEL_MESSAGE, ...)` in `capture_thread_func()` (app_audio.c).
 
 **Traceability**: FR-041 → AUD-006
 
@@ -1041,13 +1047,15 @@ The "connection check" is repurposed as model file verification. `whisper_check_
 **Traceability**: WHISPER-012 → FR-037
 
 #### WHISPER-013: Model Metadata Extraction
-The application provides a ModelInfo module (`app_model_info.c/h`) that temporarily loads a Whisper model to extract metadata and immediately frees the context, allowing the configuration dialog to display model information without permanently loading the model. The module shall extract:
+The application provides a ModelInfo module (`app_model_info.c/h`) that parses the GGUF/GGML file header directly to extract metadata WITHOUT loading the full whisper model context. This avoids the expensive and potentially crash-prone `whisper_init_from_file_with_params()` call. The GGUF format stores all metadata as key-value pairs in the file header (typically only a few KB).
+
+The module shall extract:
 - **Model name**: Human-readable model identifier (e.g., "large v3", "base.en") derived from the GGML/GGUF header
 - **Quantization type**: Quantization scheme used (e.g., "q8_0", "q5_1", "f16", "none")
 - **Multilingual support**: Boolean flag indicating whether the model supports multiple languages (derived from vocabulary size and language token count)
 - **Model file size**: File size in bytes, formatted as a human-readable string (e.g., "873.6 MB")
 
-The metadata extraction is performed by briefly loading the model via `whisper_init_from_file_with_params()` with GPU disabled, reading the metadata fields, and immediately calling `whisper_free()` to release the context.
+**Implementation**: Direct binary parsing of GGUF header (magic bytes, key-value pairs) and GGML header (hparams struct). Supports both GGUF (modern) and GGML (legacy) formats.
 
 **Traceability**: WHISPER-013 → app_model_info.c, app_model_info.h
 
@@ -1268,7 +1276,7 @@ The application registers the following D-Bus interface on startup using GDBus (
 | **Interface** | `org.xvoice.Actions` |
 | **Method** | `Toggle` |
 
-The `Toggle` method takes no parameters and returns no values. It simply toggles the recording state of the application.
+The `Toggle` method takes no parameters and returns a boolean `(b)` indicating success (`true` when the toggle callback was executed, `false` when no callback was registered). It toggles the recording state of the application.
 
 ### 8.3 D-Bus Registration Requirements
 
@@ -1421,6 +1429,24 @@ The `gpu_mode` parameter shall specify the GPU acceleration mode for Whisper mod
 
 **Traceability**: CFG-GPU-001 → FR-049a, FR-049b, FR-049c
 
+#### CFG-TEXT-001: Append Transcription Text Mode
+The `append_transcription_text` parameter controls whether new transcription results are appended to or replace the existing text in the TextWindow.
+
+| Value | Behavior |
+|-------|----------|
+| `true` (default) | New transcription text is appended to the existing content in the TextWindow |
+| `false` | The TextWindow is cleared at the start of each new transcription session (before recording begins) |
+
+**Format**: `"append_transcription_text": true`
+
+**Widget**: Check box in Configuration Dialog labeled "Append new transcriptions to existing text".
+
+**Default Value**: `true` (append mode, for backward compatibility)
+
+**Rationale**: Append mode prevents loss of previous transcription results. Overwrite mode (false) prevents unbounded memory growth over many transcription sessions.
+
+**Traceability**: CFG-TEXT-001 → `config->append_transcription_text` in app_config.h
+
 #### CFG-014: Max Recording Duration
 The `max_duration` parameter shall specify the maximum recording duration in seconds for each transcription session. The value must be an integer between 5 and 30 (inclusive). Values outside this range shall be clamped to the nearest boundary on save.
 
@@ -1428,7 +1454,7 @@ The `max_duration` parameter shall specify the maximum recording duration in sec
 
 **Widget**: Numeric input field with spin buttons in Configuration Dialog. Unit label: "seconds".
 **Default Value**: `30`
-**Validation**: Integer, min=5, max=120
+**Validation**: Integer, min=5, max=30. Values outside this range are clamped to the nearest boundary on load.
 
 **Traceability**: CFG-014 → FR-024, FR-007, FR-007a
 
@@ -1453,6 +1479,7 @@ The following settings have fixed defaults and are **not exposed** in the Config
 | Transcription Watchdog | Scaled: max_duration × 1.5, clamped [30, 120]s | Allows longer transcriptions for longer recordings |
 | Retry Count | 3 (with progressive backoff: 100ms, 200ms, ...) | Retrys retryable whisper.cpp errors only |
 | Audio Format | 16000 Hz, 1 channel, 16-bit PCM | Required for Whisper model compatibility |
+| Append Mode | `true` (default) | Appends new transcriptions to existing text |
 
 ### 9.5 Hotkey Configuration
 
@@ -1606,23 +1633,18 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Name**: Memory Buffer Scrubbing Implementation
 - **Minimum Version**: N/A (compiler/runtime feature)
 - **Purpose**: Securely overwrite memory buffers containing raw PCM audio data to prevent sensitive data leakage into swap space
-- **Required Functions**:
-  - **Primary**: `explicit_bzero()` (natively supported in glibc 2.25+)
-  - **Fallback**: Volatile memory barrier pointer loop (for non-glibc environments)
+- **Implementation**: Volatile memory barrier pointer loop (`scrub_memory()` in app_audio.c)
 - **Implementation Pattern**:
   ```c
-  // glibc 2.25+ (Linux distributions: Ubuntu 16.04+, Fedora 24+, Arch Linux)
-  explicit_bzero(buffer, size);
-  
-  // Fallback for non-glibc or older environments
-  void secure_zero(void *s, size_t n) {
-      volatile unsigned char *p = (volatile unsigned char *)s;
-      while (n--) {
+  static void scrub_memory(void *ptr, size_t len) {
+      volatile unsigned char *p = (volatile unsigned char *)ptr;
+      while (len--) {
           *p++ = 0;
       }
   }
   ```
-- **Rationale**: glibc does not implement C11 Annex K (which includes `memset_s()`), and attempting to link `memset_s()` will cause linker failures on standard Ubuntu, Fedora, and Arch Linux distributions. The `explicit_bzero()` function is the glibc-native solution for secure memory scrubbing and is guaranteed to not be optimized away by the compiler.
+- **Usage**: PCM capture buffers are scrubbed before `free()` in `capture_thread_func()`. WAV file paths and device names are scrubbed in `audio_recorder_destroy()`.
+- **Rationale**: The volatile pointer loop prevents compiler optimization from eliminating the scrub operation, ensuring the memory is actually overwritten. This approach is portable across all compilers and does not depend on glibc-specific functions.
 - **Traceability**: DEP-010 → NR-010, AUD-005
 
 #### DEP-011: JSON Library
@@ -1631,11 +1653,23 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Purpose**: JSON parsing
 - **Required Functions**: `cJSON_Parse`
 
-#### DEP-013: D-Bus Library
+#### DEP-013: D-Bus Library (GDBus/GIO)
 - **Name**: GDBus (GIO)
-- **Minimum Version**: 1.12
-- **Purpose**: D-Bus IPC for hotkey toggle interface
-- **Required Functions**: `dbus_bus_get`, `dbus_connection_send`
+- **Minimum Version**: 1.12 (GLib 2.32+)
+- **Purpose**: D-Bus IPC for hotkey toggle interface and GNOME Shell dock integration
+- **Required Functions**: `g_bus_own_name()`, `g_dbus_connection_call_sync()`, `g_dbus_connection_register_object()`, `g_dbus_method_invocation_return_value()`
+- **Integration**: Native GLib main loop integration (no polling required). Implements `org.xvoice.Actions.Toggle` and `org.gnome.Shell.Application.Activate` interfaces.
+
+### 11.2.1 Build System Options
+
+The CMake build system supports the following optional features:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ENABLE_ASAN` | OFF | Enable AddressSanitizer for memory error detection |
+| `ENABLE_TSAN` | OFF | Enable ThreadSanitizer for data race detection (mutually exclusive with ASan) |
+| `ENABLE_LTO` | OFF | Enable Link Time Optimization for release builds (requires compiler support) |
+| `DOWNLOAD_DEFAULT_MODEL` | ON | Download the default Whisper model (large-v3-turbo-q8_0, ~1.1 GiB) during build |
 
 ### 11.3 System Dependencies
 
@@ -2041,6 +2075,15 @@ The application resolves model paths in the following order:
 
 Transcription can be cancelled via `whisper_client_cancel()`, which sets an atomic flag checked periodically by whisper.cpp's `abort_callback` mechanism during `whisper_full()` execution.
 
+### 14.3a Append Transcription Text Mode
+
+The application supports two modes for handling transcription text in the TextWindow:
+
+- **Append Mode** (default): New transcription results are appended to the existing text, preserving previous results.
+- **Overwrite Mode**: The TextWindow is cleared at the start of each new transcription session.
+
+This is controlled by the `append_transcription_text` configuration parameter (CFG-TEXT-001).
+
 ### 14.4 System Tray Icon
 
 The System Tray module (`app_tray.c`) provides notification area presence via libappindicator (Ayatana fork preferred).
@@ -2063,7 +2106,14 @@ Right-click context menu items:
 
 #### Icon Handling
 
-Embedded XPM arrays (from CMake build) are converted to GdkPixbuf, then saved as temporary PNG files in the system temp directory for AppIndicator consumption. Temp files are cleaned up on destroy.
+Embedded XPM arrays (from CMake build) are converted to GdkPixbuf, then saved as temporary PNG files in a per-process temp directory (`$TMPDIR/transcriber_icons_<pid>/`) for AppIndicator consumption. Temp directory and files are cleaned up on destroy.
+
+#### Sine Wave Animation on Tray Icon
+
+During `STATE_LISTENING`, the tray icon displays an animated sine wave overlay. The animation:
+- Pre-generates 8 frames by compositing a sine wave at different phases onto the green mic icon
+- Cycles through frames at ~30fps (33ms interval) using `g_timeout_add()`
+- Is started via `tray_start_animation()` and stopped via `tray_stop_animation()`
 
 #### Dependencies
 

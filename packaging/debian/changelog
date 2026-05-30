@@ -1,0 +1,11 @@
+transcriber (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Offline voice-to-text transcription using Whisper large-v3-turbo model.
+  * Bundled turbo model (ggml-large-v3-turbo-q8_0.bin) in package.
+  * GTK3-based GUI with system tray support.
+  * D-Bus activation for GNOME dock integration.
+  * ALSA audio capture.
+  * Optional CUDA GPU acceleration.
+
+ -- Piyush Raizada <piyush.raizada@gmail.com>  Mon, 29 Jun 2026 00:00:00 +0000

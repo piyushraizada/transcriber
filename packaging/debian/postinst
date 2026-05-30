@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+# postinst script for transcriber
+# Creates symlink for bundled model so the application can find it by default.
+
+case "$1" in
+    configure)
+        MODEL_SRC="/usr/share/transcriber/models/ggml-large-v3-turbo-q8_0.bin"
+        MODEL_DIR="/usr/share/transcriber/models"
+
+        # Update icon cache
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache /usr/share/icons/hicolor/ >/dev/null 2>&1 || true
+        fi
+
+        # Notify user about bundled model location
+        if [ -f "$MODEL_SRC" ]; then
+            echo "transcriber: Whisper turbo model installed at $MODEL_SRC"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

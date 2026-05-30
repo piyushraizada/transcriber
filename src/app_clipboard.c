@@ -19,6 +19,7 @@
  */
 
 #include "app_clipboard.h"
+#include "app.h"  /* For UNUSED macro */
 
 #include <pthread.h>
 #include <string.h>
@@ -77,7 +78,7 @@ static bool is_wayland(void)
 
 bool clipboard_copy_text(GdkDisplay* display, const char* text)
 {
-    (void)display; /* not required for CLIPBOARD selection */
+    UNUSED(display); /* not required for CLIPBOARD selection */
     if (!text) {
         set_error("NULL text parameter");
         return false;
@@ -99,7 +100,7 @@ bool clipboard_copy_text(GdkDisplay* display, const char* text)
 
 bool clipboard_copy_text_both(GdkDisplay* display, const char* text)
 {
-    (void)display; /* not required for clipboard operations */
+    UNUSED(display); /* not required for clipboard operations */
     if (!text) {
         set_error("NULL text parameter");
         return false;
@@ -137,7 +138,7 @@ bool clipboard_copy_text_both(GdkDisplay* display, const char* text)
 
 bool clipboard_is_available(GdkDisplay* display)
 {
-    (void)display; /* Reserved for future display-specific clipboard logic */
+    UNUSED(display); /* Reserved for future display-specific clipboard logic */
     GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     if (!clipboard) {
         set_error("Clipboard is unavailable");

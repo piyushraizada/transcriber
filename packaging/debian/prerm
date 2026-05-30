@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# prerm script for transcriber
+
+case "$1" in
+    remove)
+        # Remove icon cache update on removal
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache /usr/share/icons/hicolor/ >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

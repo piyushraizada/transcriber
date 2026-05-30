@@ -1,0 +1,5 @@
+[D-Bus Service]
+Name=org.xvoice.Controller
+Exec=transcriber
+User=
+Group=

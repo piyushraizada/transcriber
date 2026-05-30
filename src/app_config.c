@@ -225,6 +225,9 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->gpu_mode, gpu_mode_get_default(), sizeof(config->gpu_mode) - 1);
     config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
 
+    /* Transcription text mode — default to append (true) for backward compatibility */
+    config->append_transcription_text = true;
+
     set_error(NULL);
 }
 
@@ -375,6 +378,12 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
+    /* Transcription text mode */
+    item = cJSON_GetObjectItemCaseSensitive(root, "append_transcription_text");
+    if (item && cJSON_IsBool(item)) {
+        config->append_transcription_text = cJSON_IsTrue(item);
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -437,6 +446,8 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddItemToObject(root, "window_position", window_pos);
 
     cJSON_AddStringToObject(root, "gpu_mode", config->gpu_mode);
+
+    cJSON_AddBoolToObject(root, "append_transcription_text", config->append_transcription_text);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -663,5 +674,17 @@ const char* config_get_gpu_mode(const AppConfig* config)
 {
     if (!config) return "";
     return config->gpu_mode;
+}
+
+void config_set_append_transcription_text(AppConfig* config, bool append)
+{
+    if (!config) return;
+    config->append_transcription_text = append;
+}
+
+bool config_get_append_transcription_text(const AppConfig* config)
+{
+    if (!config) return true;
+    return config->append_transcription_text;
 }
 

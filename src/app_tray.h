@@ -123,7 +123,36 @@ void tray_set_state(SystemTray *tray, AppState state);
 void tray_set_model_status(SystemTray *tray, ModelStatus status);
 
 /*---------------------------------------------------------------------------
- * Section 4: Window Integration
+ * Section 4: Sine Wave Animation on Dock Icon
+ *---------------------------------------------------------------------------
+ * Functions for animating the tray icon with a sine wave overlay during
+ * recording. Pre-generates multiple frames of the green mic with sine wave
+ * at different phases, then cycles through them at ~30fps.
+ */
+
+/**
+ * Start the sine wave animation on the tray icon.
+ *
+ * Pre-generates animated frames by compositing a sine wave onto the green
+ * microphone icon, then starts a timer that cycles through these frames.
+ * Call this when entering STATE_LISTENING.
+ *
+ * @param tray  Pointer to a valid SystemTray. Must not be NULL.
+ */
+void tray_start_animation(SystemTray *tray);
+
+/**
+ * Stop the sine wave animation on the tray icon.
+ *
+ * Stops the timer and reverts to the static green mic icon.
+ * Call this when leaving STATE_LISTENING.
+ *
+ * @param tray  Pointer to a valid SystemTray. Must not be NULL.
+ */
+void tray_stop_animation(SystemTray *tray);
+
+/*---------------------------------------------------------------------------
+ * Section 5: Window Integration
  *---------------------------------------------------------------------------
  * Functions for linking the tray icon to the main application window.
  */

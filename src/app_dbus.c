@@ -22,6 +22,7 @@
  */
 
 #include "app_dbus.h"
+#include "app.h"  /* For UNUSED macro */
 #include <gio/gio.h>
 #include <glib.h>
 #include <stdio.h>
@@ -34,18 +35,20 @@
 /**
  * Internal D-Bus service state.
  *
- * introspection: Parsed D-Bus introspection XML (describes our interface)
- * owner_id:      Return value from g_bus_own_name() (0 = not owned)
- * callback:      Function pointer for toggle method handler
- * user_data:     User data passed to callback
- * error_msg:     Human-readable error message buffer
+ * introspection:  Parsed D-Bus introspection XML (describes our interfaces)
+ * owner_id:       Return value from g_bus_own_name() (0 = not owned)
+ * callback:       Function pointer for toggle method handler
+ * activate_cb:    Function pointer for GNOME Shell Activate method handler
+ * user_data:      User data passed to callbacks
+ * error_msg:      Human-readable error message buffer
  */
 struct _DBusService {
-    GDBusNodeInfo    *introspection;
-    guint             owner_id;
-    dbus_toggle_callback callback;
-    void             *user_data;
-    char              error_msg[256];
+    GDBusNodeInfo        *introspection;
+    guint                 owner_id;
+    dbus_toggle_callback  callback;
+    dbus_activate_callback activate_cb;
+    void                 *user_data;
+    char                  error_msg[256];
 };
 
 /* ------------------------------------------------------------------ */
@@ -55,19 +58,19 @@ struct _DBusService {
 static void dbus_service_set_error(DBusService *service, const char *msg);
 static GDBusNodeInfo *parse_introspection(void);
 
-/* GDBus method handler — forward declaration for vtable below */
-static void on_toggle_method(GDBusConnection       *connection,
-                              const gchar           *sender,
-                              const gchar           *object_path,
-                              const gchar           *interface_name,
-                              const gchar           *method_name,
-                              GVariant              *parameters,
-                              GDBusMethodInvocation *invocation,
-                              gpointer               user_data);
+/* Unified GDBus method handler — forward declaration for vtable below */
+static void on_method_call(GDBusConnection       *connection,
+                           const gchar           *sender,
+                           const gchar           *object_path,
+                           const gchar           *interface_name,
+                           const gchar           *method_name,
+                           GVariant              *parameters,
+                           GDBusMethodInvocation *invocation,
+                           gpointer               user_data);
 
 /* D-Bus interface vtable — defined at file scope to avoid static inside function */
 static const GDBusInterfaceVTable g_dbus_vtable = {
-    .method_call = on_toggle_method,
+    .method_call = on_method_call,
 };
 
 /* GDBus name ownership callbacks */
@@ -80,16 +83,6 @@ static void on_name_acquired(GDBusConnection *connection,
 static void on_name_lost(GDBusConnection *connection,
                          const gchar     *name,
                          gpointer         user_data);
-
-/* GDBus method handler */
-static void on_toggle_method(GDBusConnection       *connection,
-                             const gchar           *sender,
-                             const gchar           *object_path,
-                             const gchar           *interface_name,
-                             const gchar           *method_name,
-                             GVariant              *parameters,
-                             GDBusMethodInvocation *invocation,
-                             gpointer               user_data);
 
 /* ------------------------------------------------------------------ */
 /* Error management                                                    */
@@ -116,10 +109,13 @@ const char* dbus_service_get_error(const DBusService *service) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Parse the D-Bus introspection XML that describes our service interface.
+ * Parse the D-Bus introspection XML that describes our service interfaces.
  *
- * This XML defines the org.xvoice.Actions interface with a single Toggle
- * method that takes no parameters and returns no value.
+ * This XML defines two interfaces:
+ *   1. org.xvoice.Actions — Custom interface with Toggle method for hotkey support.
+ *   2. org.gnome.Shell.Application — GNOME Shell interface with Activate method
+ *      for dock/dash integration. When the user clicks the app icon in the
+ *      GNOME Dash, Shell calls Activate() to bring the window to focus.
  *
  * @return Parsed GDBusNodeInfo on success, NULL on failure.
  */
@@ -130,6 +126,9 @@ static GDBusNodeInfo *parse_introspection(void) {
         "    <method name=\"" DBUS_METHOD_TOGGLE "\">"
         "      <arg direction=\"out\" type=\"b\" name=\"success\"/>"
         "    </method>"
+        "  </interface>"
+        "  <interface name=\"" DBUS_SHELL_INTERFACE "\">"
+        "    <method name=\"" DBUS_METHOD_ACTIVATE "\"/>"
         "  </interface>"
         "</node>";
 
@@ -158,31 +157,66 @@ static GDBusNodeInfo *parse_introspection(void) {
  * toggle callback (which performs the state machine transition), then
  * sends a success reply.
  */
-static void on_toggle_method(GDBusConnection       *connection,
-                             const gchar           *sender,
-                             const gchar           *object_path,
-                             const gchar           *interface_name,
-                             const gchar           *method_name,
-                             GVariant              *parameters,
-                             GDBusMethodInvocation *invocation,
-                             gpointer               user_data)
+/**
+ * Unified method handler for all D-Bus interfaces.
+ *
+ * Routes incoming method calls to the appropriate handler based on
+ * interface name and method name. Supports:
+ *   - org.xvoice.Actions.Toggle      → toggle callback
+ *   - org.gnome.Shell.Application.Activate → activate callback
+ */
+/**
+ * Unified method handler for all D-Bus interfaces.
+ *
+ * Routes incoming method calls to the appropriate handler based on
+ * interface name and method name. Supports:
+ *   - org.xvoice.Actions.Toggle      → toggle callback
+ *   - org.gnome.Shell.Application.Activate → activate callback
+ */
+static void on_method_call(GDBusConnection       *connection,
+                            const gchar           *sender,
+                            const gchar           *object_path,
+                            const gchar           *interface_name,
+                            const gchar           *method_name,
+                            GVariant              *parameters,
+                            GDBusMethodInvocation *invocation,
+                            gpointer               user_data)
 {
-    (void)connection;
-    (void)sender;
-    (void)object_path;
-    (void)interface_name;
-    (void)method_name;
-    (void)parameters;
+    UNUSED(connection);
+    UNUSED(sender);
+    UNUSED(object_path);
+    UNUSED(parameters);
 
     DBusService *service = (DBusService *)user_data;
 
-    /* Invoke the toggle callback if registered */
-    if (service && service->callback) {
-        service->callback(service->user_data);
+    /* Route to org.xvoice.Actions.Toggle */
+    if (g_strcmp0(interface_name, DBUS_INTERFACE) == 0 &&
+        g_strcmp0(method_name, DBUS_METHOD_TOGGLE) == 0)
+    {
+        bool success = false;
+        if (service && service->callback) {
+            service->callback(service->user_data);
+            success = true;
+        }
+        g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", success));
+        return;
     }
 
-    /* Send success reply with explicit return type matching introspection XML */
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", true));
+    /* Route to org.gnome.Shell.Application.Activate */
+    if (g_strcmp0(interface_name, DBUS_SHELL_INTERFACE) == 0 &&
+        g_strcmp0(method_name, DBUS_METHOD_ACTIVATE) == 0)
+    {
+        if (service && service->activate_cb) {
+            service->activate_cb(service->user_data);
+        }
+        g_dbus_method_invocation_return_value(invocation, g_variant_new("( )"));
+        return;
+    }
+
+    /* Unknown method — return error */
+    g_dbus_method_invocation_return_error(invocation,
+        G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD,
+        "Unknown method %s on interface %s", method_name, interface_name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,13 +225,13 @@ static void on_toggle_method(GDBusConnection       *connection,
 
 /**
  * Called when the D-Bus connection is acquired and our name is ready.
- * This is where we register the method handler for our interface.
+ * This is where we register the method handlers for all interfaces.
  */
 static void on_bus_acquired(GDBusConnection *connection,
                             const gchar     *name,
                             gpointer         user_data)
 {
-    (void)name;
+    UNUSED(name);
 
     DBusService *service = (DBusService *)user_data;
 
@@ -205,32 +239,39 @@ static void on_bus_acquired(GDBusConnection *connection,
         return;
     }
 
-    /* Get the interface definition from parsed introspection */
-    GDBusInterfaceInfo *iface = service->introspection->interfaces[0];
-    if (!iface) {
-        g_warning("GDBus: No interface found in introspection data");
-        return;
+    /* Register each interface defined in the introspection XML individually.
+     * The introspection contains both org.xvoice.Actions and
+     * org.gnome.Shell.Application interfaces. GDBus will dispatch
+     * method calls to the single vtable handler, which routes based
+     * on interface_name and method_name. */
+    GDBusInterfaceInfo **ifaces = service->introspection->interfaces;
+    guint count = 0;
+
+    for (guint i = 0; ifaces[i] != NULL; i++) {
+        GError *error = NULL;
+        gboolean registered = g_dbus_connection_register_object(
+            connection,
+            DBUS_OBJECT_PATH,
+            ifaces[i],
+            &g_dbus_vtable,
+            service,
+            NULL,   // GDestroyNotify
+            &error
+        );
+
+        if (!registered) {
+            g_critical("GDBus: Failed to register interface %s at %s: %s",
+                       ifaces[i]->name, DBUS_OBJECT_PATH, error->message);
+            g_error_free(error);
+        } else {
+            count++;
+            g_message("GDBus: Registered interface %s at %s",
+                      ifaces[i]->name, DBUS_OBJECT_PATH);
+        }
     }
 
-    /* Register our object at /org/xvoice/App */
-    GError *error = NULL;
-    gboolean registered = g_dbus_connection_register_object(
-        connection,
-        DBUS_OBJECT_PATH,
-        iface,
-        &g_dbus_vtable,
-        service,
-        NULL,   // GDestroyNotify
-        &error
-    );
-
-    if (!registered) {
-        g_critical("GDBus: Failed to register object at %s: %s",
-                   DBUS_OBJECT_PATH, error->message);
-        g_error_free(error);
-    } else {
-        g_message("GDBus: Registered object at %s with interface %s",
-                  DBUS_OBJECT_PATH, iface->name);
+    if (count == 0) {
+        g_warning("GDBus: No interfaces were registered successfully");
     }
 }
 
@@ -241,8 +282,8 @@ static void on_name_acquired(GDBusConnection *connection,
                              const gchar     *name,
                              gpointer         user_data)
 {
-    (void)connection;
-    (void)user_data;
+    UNUSED(connection);
+    UNUSED(user_data);
     g_message("GDBus: Acquired bus name '%s'", name);
 }
 
@@ -253,8 +294,8 @@ static void on_name_lost(GDBusConnection *connection,
                          const gchar     *name,
                          gpointer         user_data)
 {
-    (void)connection;
-    (void)user_data;
+    UNUSED(connection);
+    UNUSED(user_data);
     g_warning("GDBus: Lost bus name '%s'", name);
 }
 
@@ -305,6 +346,7 @@ void dbus_service_destroy(DBusService *service) {
  */
 bool dbus_service_start(DBusService *service,
                         dbus_toggle_callback callback,
+                        dbus_activate_callback activate_cb,
                         void *user_data)
 {
     if (!service) return false;
@@ -315,8 +357,9 @@ bool dbus_service_start(DBusService *service,
         return false;
     }
 
-    /* Store callback and user data */
+    /* Store callbacks and user data */
     service->callback = callback;
+    service->activate_cb = activate_cb;
     service->user_data = user_data;
 
     /* Parse introspection XML */
@@ -355,7 +398,7 @@ bool dbus_service_start(DBusService *service,
         g_variant_new("(s)", DBUS_BUS_NAME),
         NULL,  // expected_return_type — NULL skips type validation
         G_DBUS_CALL_FLAGS_NONE,
-        -1,    // no timeout
+        5000,  // 5-second timeout to prevent hanging on unresponsive D-Bus
         NULL,  // cancellable
         &call_error
     );

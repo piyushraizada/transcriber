@@ -97,6 +97,12 @@ typedef struct _AppConfig {
                                    ///< "gpu:N" = use specific GPU device N
                                    ///< @see CFG-GPU-001: GPU Mode
 
+    /* Transcription Text Mode */
+    bool append_transcription_text;  ///< true = append new text to existing, false = clear before new transcription
+                                       ///< When false, the text window is cleared at the start of each new transcription
+                                       ///< session to prevent unbounded growth. When true, new text is appended.
+                                       ///< Default: true (append mode for backward compatibility).
+
     /* NOTE: Language field removed.
      * M-001 fix: The SRS originally specified a language configuration field
      * (CFG-007, WHISPER-005), but this was removed in favor of using
@@ -432,6 +438,20 @@ bool config_set_gpu_mode(AppConfig* config, const char* mode);
  * @return The gpu_mode string (internal, must NOT be freed or modified).
  */
 const char* config_get_gpu_mode(const AppConfig* config);
+
+/**
+ * Set the transcription text mode (append vs. overwrite).
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param append  true = append new text to existing, false = clear text window before new transcription.
+ */
+void config_set_append_transcription_text(AppConfig* config, bool append);
+
+/**
+ * Get the transcription text mode.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if append mode, false if overwrite (clear) mode.
+ */
+bool config_get_append_transcription_text(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

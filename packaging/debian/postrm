@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# postrm script for transcriber
+
+case "$1" in
+    purge)
+        # Remove bundled model directory on purge
+        rm -rf /usr/share/transcriber/models
+        rm -rf /usr/share/transcriber
+        ;;
+esac
+
+exit 0

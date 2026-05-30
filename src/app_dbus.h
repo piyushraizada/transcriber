@@ -79,6 +79,12 @@ extern "C" {
 /** D-Bus method name for toggling the microphone. */
 #define DBUS_METHOD_TOGGLE   "Toggle"
 
+/** GNOME Shell D-Bus interface for dock/dash integration. */
+#define DBUS_SHELL_INTERFACE "org.gnome.Shell.Application"
+
+/** GNOME Shell Activate method name. */
+#define DBUS_METHOD_ACTIVATE "Activate"
+
 /*---------------------------------------------------------------------------
  * Section 2: D-Bus Service Handle (Opaque)
  *---------------------------------------------------------------------------
@@ -116,6 +122,18 @@ typedef struct _DBusService DBusService;
  * @param user_data User-provided data pointer (set during dbus_service_start()).
  */
 typedef void (*dbus_toggle_callback)(void* user_data);
+
+/**
+ * Callback function invoked when the GNOME Shell Activate D-Bus method is called.
+ *
+ * This callback is invoked in the GTK main thread when GNOME Shell (or another
+ * desktop environment) calls org.gnome.Shell.Application.Activate, typically
+ * when the user clicks the application icon in the dock/dash. The callback
+ * should present or raise the application window.
+ *
+ * @param user_data User-provided data pointer (set during dbus_service_start()).
+ */
+typedef void (*dbus_activate_callback)(void* user_data);
 
 /*---------------------------------------------------------------------------
  * Section 4: Service Initialization and Lifecycle
@@ -157,7 +175,7 @@ void dbus_service_destroy(DBusService* service);
  *      D-Bus call to org.freedesktop.DBus.GetNameOwner
  *   2. If name is already owned: log a warning and return false
  *   3. Register for bus name ownership via g_bus_own_name() with callbacks:
- *      - on_bus_acquired: Register the Toggle method handler
+ *      - on_bus_acquired: Register the Toggle and Activate method handlers
  *      - on_name_acquired: Log success
  *      - on_name_lost: Log warning
  *   4. GDBus integrates with the default GLib main context automatically,
@@ -165,7 +183,8 @@ void dbus_service_destroy(DBusService* service);
  *
  * @param service    Pointer to a valid DBusService. Must not be NULL.
  * @param callback   The callback function to invoke on Toggle calls.
- * @param user_data  User data pointer passed to the callback.
+ * @param activate_cb The callback function to invoke on GNOME Shell Activate calls.
+ * @param user_data  User data pointer passed to the callbacks.
  *
  * @return true if the service started successfully (bus name acquired),
  *         false if:
@@ -182,6 +201,7 @@ void dbus_service_destroy(DBusService* service);
 bool dbus_service_start(
     DBusService* service,
     dbus_toggle_callback callback,
+    dbus_activate_callback activate_cb,
     void* user_data);
 
 /**

@@ -439,6 +439,18 @@ void app_text_window_append_text(TextWindow *tw, const char *text);
  */
 void app_text_window_set_error(TextWindow *tw, const char *error);
 
+/* app_text_window_clear_text — Clear all text from the TextWindow buffer.
+ *
+ * Removes all content from the GtkTextBuffer to prevent unbounded memory
+ * growth over many transcription sessions. Shows and raises the window.
+ *
+ * Parameters:
+ *   tw — The TextWindow handle.
+ *
+ * SRS: Memory management best practice.
+ */
+void app_text_window_clear_text(TextWindow *tw);
+
 /* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
 
 /* app_window_set_volume_level — Update the volume level bar.
