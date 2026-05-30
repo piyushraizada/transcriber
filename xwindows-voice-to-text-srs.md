@@ -1,7 +1,7 @@
 # Software Requirements Specification (SRS)
 ## X-Windows Voice-to-Text Application
 
-**Document Version:** 2.2
+**Document Version:** 2.3
 **Date:** 2026-05-25
 **Author:** System Architecture Team
 **Status:** Production-Ready
@@ -10,6 +10,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.3 | 2026-05-30 | Added requirements for: D-Bus Activation Service File (DEPLOY-009), Hicolor Icon Theme Assets (DEPLOY-010), Debian Packaging (DEPLOY-011 through DEPLOY-017), Model Download Script (DEPLOY-018), Desktop Entry File (DEPLOY-019), updated Table of Contents and traceability matrix |
 | 2.2 | 2026-05-30 | Updated to match actual implementation: D-Bus Toggle returns boolean (was "no return value"), GDBus native main loop integration (was timer-based polling), FR-039 uses gdk_display_beep() (was ASCII BEL), FR-041 uses g_log() with snd_strerror(), WHISPER-013 parses GGUF/GGML headers directly (was loading full model), DEP-010 uses volatile pointer loop (was explicit_bzero), CFG-014 max clamped to 30 (was 120), added CFG-TEXT-001 (append mode), added build system options table, added tray sine wave animation docs, added UNUSED macro to app.h, standardized _POSIX_C_SOURCE to 200809L, added ENABLE_LTO option |
 | 2.1 | 2026-05-25 | Added requirements for: Volume Level Monitoring (FR-051, UI-028, AUD-016), Audio Device Display Name (CFG-AUDIO-002), Loading State Indicator (UI-023), Transcription Watchdog (NR-019 updated), Model Loading Background Thread (WHISPER-014), GPU Discovery Module (FR-049d), enhanced Model Metadata Extraction (WHISPER-013) |
 | 2.0 | 2026-05-25 | Major update: Replaced VLLM server with local whisper.cpp, added System Tray Icon, added GPU (CUDA) support, added Model Info module, updated configuration parameters |
@@ -31,6 +32,11 @@
 10. [Error Handling and Fallbacks](#10-error-handling-and-fallbacks)
 11. [Dependency Specifications](#11-dependency-specifications)
 12. [Deployment and Startup Procedures](#12-deployment-and-startup-procedures)
+   - [12.4 D-Bus Activation Service File](#124-d-bus-activation-service-file)
+   - [12.5 Desktop Entry File](#125-desktop-entry-file)
+   - [12.6 Hicolor Icon Theme Assets](#126-hicolor-icon-theme-assets)
+   - [12.7 Debian Package Distribution](#127-debian-package-distribution)
+   - [12.8 Model Download Script](#128-model-download-script)
 13. [Testing and Validation Criteria](#13-testing-and-validation-criteria)
 14. [Appendix](#14-appendix)
 
@@ -1736,6 +1742,188 @@ Configuration files shall have permissions `600` (rw-------).
 
 **Traceability**: DEPLOY-008 → CFG-001
 
+### 12.4 D-Bus Activation Service File
+
+#### DEPLOY-009: D-Bus Activation Service File
+The application shall install a D-Bus activation service file (`org.xvoice.Controller.service`) to enable on-demand launching by the D-Bus session daemon. The service file shall:
+- Be installed to `/usr/share/dbus-1/services/org.xvoice.Controller.service` (or `${prefix}/share/dbus-1/services/`)
+- Define the service name as `org.xvoice.Controller`
+- Specify `Exec=transcriber` as the activation executable
+- Leave `User=` and `Group=` empty to run under the calling user's credentials
+
+**Service File Format:**
+```ini
+[D-Bus Service]
+Name=org.xvoice.Controller
+Exec=transcriber
+User=
+Group=
+```
+
+**Purpose:** Enables GNOME Shell dock integration and D-Bus autolaunch — when a client sends a message to `org.xvoice.Controller` and no instance is running, the D-Bus daemon automatically starts the `transcriber` binary. This works in conjunction with the `DBusActivatable=true` key in the desktop entry file.
+
+**Traceability**: DEPLOY-009 → Section 2.5 (D-Bus Integration), HK-002
+
+### 12.5 Desktop Entry File
+
+#### DEPLOY-019: Desktop Entry File
+The application shall install a `.desktop` file (`transcriber.desktop`) for desktop environment integration. The desktop entry shall:
+- Be installed to `/usr/share/applications/transcriber.desktop` (or `${prefix}/share/applications/`)
+- Set `Type=Application` and `Name=Transcriber`
+- Set `Exec=transcriber` as the launch command
+- Set `Icon=redmic` to reference the hicolor icon theme entry
+- Set `Terminal=false` and `Categories=AudioVideo;Audio;`
+- Include `Keywords=voice;transcription;speech;whisper;dictation;` for search
+- Set `DBusActivatable=true` for GNOME Shell dock integration (prevents spawning duplicate instances)
+- Set `StartupNotify=false` to avoid startup notification flicker
+- Set `StartupWMClass=transcriber` for window manager matching
+
+**Desktop Entry Format:**
+```ini
+[Desktop Entry]
+Type=Application
+Name=Transcriber
+Comment=Voice-to-text transcription application using Whisper
+Exec=transcriber
+Icon=redmic
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=voice;transcription;speech;whisper;dictation;
+DBusActivatable=true
+StartupNotify=false
+StartupWMClass=transcriber
+```
+
+**Traceability**: DEPLOY-019 → DEPLOY-009
+
+### 12.6 Hicolor Icon Theme Assets
+
+#### DEPLOY-010: Hicolor Icon Theme PNG Assets
+The application shall install PNG icon files conforming to the freedesktop.org hicolor icon theme specification. The icons shall:
+- Be installed to `/usr/share/icons/hicolor/apps/` (or `${prefix}/share/icons/hicolor/apps/`)
+- Include the following files:
+  - `redmic.png` — Idle state microphone icon (used as the application icon in launchers and docks)
+  - `greenmic.png` — Listening/active state microphone icon
+  - `gear.png` — Settings/configuration icon
+- Follow the hicolor naming convention so desktop environments can locate them by name (matching the `Icon=redmic` reference in the desktop entry)
+- Have read permissions (644)
+
+After installation, the icon cache shall be updated via `gtk-update-icon-cache /usr/share/icons/hicolor/` to ensure the new icons are immediately available to the desktop environment.
+
+**Traceability**: DEPLOY-010 → DEPLOY-019
+
+### 12.7 Debian Package Distribution
+
+#### DEPLOY-011: Debian Package Structure
+The application shall support distribution as a Debian `.deb` package. The packaging directory (`packaging/debian/`) shall contain the following files:
+
+| File | Purpose |
+|------|---------|
+| `control` | Package metadata (source name, section, priority, maintainer, build/runtime dependencies, description) |
+| `changelog` | Version history in Debian changelog format |
+| `rules` | Build rules (debhelper-based, with CMake integration and model bundling) |
+| `postinst` | Post-installation maintainer script (icon cache update, model notification) |
+| `prerm` | Pre-removal maintainer script (icon cache refresh on removal) |
+| `postrm` | Post-removal maintainer script (model directory cleanup on purge) |
+| `install` | File installation mapping for maintainer scripts |
+| `compat` | Debhelper compatibility level (set to 12) |
+| `source/format` | Source package format (set to `3.0 (native)`) |
+
+**Traceability**: DEPLOY-011 → DEPLOY-002
+
+#### DEPLOY-012: Package Metadata
+The Debian control file shall define the following package metadata:
+- **Source**: `transcriber`
+- **Section**: `sound`
+- **Priority**: `optional`
+- **Architecture**: `any`
+- **Standards-Version**: 4.6.0
+- **Rules-Requires-Root**: `no`
+
+**Build Dependencies:**
+- `debhelper (>= 12)`, `cmake (>= 3.16)`, `build-essential`
+- `libgtk-3-dev`, `libasound2-dev`, `libcjson-dev`
+- `libayatana-appindicator3-dev | libappindicator3-dev`
+- `git`, `pkg-config`
+
+**Runtime Dependencies:**
+- `libgtk-3-0`, `libasound2`, `libcjson1`
+- `libayatana-appindicator3-1 | libappindicator1`
+- Recommends: `curl`
+
+**Traceability**: DEPLOY-012 → DEP-001 through DEP-014
+
+#### DEPLOY-013: Build Rules
+The `rules` file shall:
+- Use debhelper (`dh $@`) as the build framework
+- Override `dh_auto_install` to install the bundled Whisper model to `/usr/share/transcriber/models/` within the package tree
+- Conditionally include the model file (`ggml-large-v3-turbo-q8_0.bin`) only if present in the build directory
+
+**Traceability**: DEPLOY-013 → DEPLOY-011
+
+#### DEPLOY-014: Maintainer Scripts
+The maintainer scripts shall perform the following operations:
+
+**postinst (configure):**
+- Update the hicolor icon cache via `gtk-update-icon-cache`
+- Notify the user about the bundled model location at `/usr/share/transcriber/models/ggml-large-v3-turbo-q8_0.bin`
+
+**prerm (remove):**
+- Refresh the hicolor icon cache after icon files are removed
+
+**postrm (purge):**
+- Remove the bundled model directory (`/usr/share/transcriber/models`) and application data directory (`/usr/share/transcriber`) on purge
+
+**Traceability**: DEPLOY-014 → DEPLOY-010, DEPLOY-013
+
+#### DEPLOY-015: Build Script
+The application shall provide a build automation script (`packaging/build-deb.sh`) that:
+- Checks for required build dependencies
+- Downloads the Whisper model if not present (via `download-model.sh`)
+- Builds the application via CMake
+- Creates the `.deb` package
+- Supports the following options:
+  - `--download-model` — Force download of the Whisper model
+  - `--cuda` — Enable CUDA GPU acceleration in the build
+  - `--uninstall` — Remove files installed by CMake `make install`
+  - `--help, -h` — Display usage information
+
+**Traceability**: DEPLOY-015 → DEPLOY-011
+
+#### DEPLOY-016: Package Version and Changelog
+The Debian changelog shall record:
+- Package version (e.g., `1.0.0-1`)
+- Distribution target (`unstable`)
+- Urgency level (`medium`)
+- Release notes summarizing key features
+- Maintainer name and email
+- Timestamp
+
+**Traceability**: DEPLOY-016 → DEPLOY-011
+
+#### DEPLOY-017: Source Package Format
+The source package format shall be `3.0 (native)` as specified in `packaging/debian/source/format`, indicating a native Debian package without upstream tarball separation. The debhelper compatibility level shall be `12` as specified in `packaging/debian/compat`.
+
+**Traceability**: DEPLOY-017 → DEPLOY-011
+
+### 12.8 Model Download Script
+
+#### DEPLOY-018: Model Download Script
+The application shall provide a model download script (`packaging/download-model.sh`) that automates obtaining the Whisper model file. The script shall:
+- Download the `ggml-large-v3-turbo-q8_0.bin` model (~1.1 GiB) from `https://huggingface.co/ggml-org/models/resolve/main/whisper.cpp/ggml-large-v3-turbo-q8_0.bin`
+- Store the model in a `models/` directory (configurable via command-line argument)
+- Check if the model already exists before downloading (skip if present)
+- Support both `wget` and `curl` as download backends (preferring `wget`, falling back to `curl`)
+- Display download progress and verify the file after completion
+- Exit with an error code if the download fails
+
+**Usage:**
+```bash
+./packaging/download-model.sh [output_directory]
+```
+
+**Traceability**: DEPLOY-018 → WHISPER-001, DEP-007
+
 ---
 
 ## 13. Testing and Validation Criteria
@@ -2009,6 +2197,17 @@ Configuration files shall have permissions `600` (rw-------).
 | DEPLOY-006 | Configuration File Creation | 12.2 |
 | DEPLOY-007 | Binary Permissions | 12.3 |
 | DEPLOY-008 | Config Permissions | 12.3 |
+| DEPLOY-009 | D-Bus Activation Service File | 12.4 |
+| DEPLOY-019 | Desktop Entry File | 12.5 |
+| DEPLOY-010 | Hicolor Icon Theme PNG Assets | 12.6 |
+| DEPLOY-011 | Debian Package Structure | 12.7 |
+| DEPLOY-012 | Package Metadata | 12.7 |
+| DEPLOY-013 | Build Rules | 12.7 |
+| DEPLOY-014 | Maintainer Scripts | 12.7 |
+| DEPLOY-015 | Build Script | 12.7 |
+| DEPLOY-016 | Package Version and Changelog | 12.7 |
+| DEPLOY-017 | Source Package Format | 12.7 |
+| DEPLOY-018 | Model Download Script | 12.8 |
 | TEST-001 | Configuration Loading | 13.1 |
 | TEST-002 | Audio Recording | 13.1 |
 | TEST-003 | TextWindow Display | 13.1 |

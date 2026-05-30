@@ -106,6 +106,7 @@ cmake -DDOWNLOAD_DEFAULT_MODEL=OFF ..
 | `DOWNLOAD_DEFAULT_MODEL` | `ON` | Create the `download-default-model` target |
 | `ENABLE_ASAN` | `OFF` | Enable AddressSanitizer for memory error detection |
 | `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer for data race detection |
+| `ENABLE_LTO` | `OFF` | Enable Link Time Optimization for release builds |
 
 > **Note:** `ENABLE_ASAN` and `ENABLE_TSAN` are mutually exclusive.
 
@@ -115,7 +116,33 @@ cmake -DDOWNLOAD_DEFAULT_MODEL=OFF ..
 sudo make install
 ```
 
-This installs the `transcriber` binary to `/usr/local/bin` and the `.desktop` file to `/usr/local/share/applications`.
+This installs:
+- `transcriber` binary to `/usr/local/bin`
+- Desktop entry to `/usr/local/share/applications/transcriber.desktop`
+- D-Bus activation service to `/usr/local/share/dbus-1/services/org.xvoice.Controller.service`
+- Hicolor PNG icons to `/usr/local/share/icons/hicolor/apps/`
+- XPM pixmap icons to `/usr/local/share/pixmaps/`
+
+### Alternative: Build a Debian Package
+
+To build a `.deb` package with the bundled Whisper model:
+
+```bash
+./packaging/build-deb.sh
+```
+
+Options:
+- `--download-model` — Force download of the Whisper model (~1.1 GiB)
+- `--cuda` — Enable CUDA GPU acceleration in the build
+- `--uninstall` — Remove files installed by `make install`
+
+To download the model separately:
+
+```bash
+./packaging/download-model.sh [output_directory]
+```
+
+The model is downloaded from Hugging Face (`ggml-org/models`) and stored in `models/` by default.
 
 ## Running
 
@@ -140,8 +167,19 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **Model path** — path to a GGML Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`)
 - **Audio device** — ALSA capture device (default: system default)
 - **Max session duration** — maximum recording time in seconds (default: 30, range: 5–30)
+- **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 
-A configuration dialog is available from the system tray context menu.
+A configuration dialog is available from the system tray context menu or the gear icon in the main window's status bar.
+
+## Global Hotkey
+
+Transcriber exposes a D-Bus method for toggling recording, which can be bound to a global hotkey in your desktop environment:
+
+```bash
+dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle
+```
+
+Configure this command as a custom shortcut in your desktop environment's keyboard settings (e.g., GNOME Settings → Keyboard → Custom Shortcuts). The D-Bus activation service file (`org.xvoice.Controller.service`) also enables the application to autolaunch from the dock when no instance is running.
 
 ## License
 
