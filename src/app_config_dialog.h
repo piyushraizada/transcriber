@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -19,8 +19,7 @@
  *
  *   - Whisper model path (text entry)
  *   - Audio device selection (combo box dropdown)
- *   - Language selection (combo box dropdown — ISO 639-1 codes)
- *   - Maximum recording duration (spin button — 5 to 30 seconds)
+ *   - Maximum recording duration (spin button — 5 to 120 seconds)
  *   - Window position reset (button)
  *   - D-Bus hotkey command display (read-only label)
  *

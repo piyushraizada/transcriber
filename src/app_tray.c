@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -41,9 +41,11 @@
 #include "app.h"
 
 #include <glib.h>
+#ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#endif
 #include <libayatana-appindicator/app-indicator.h>
 #include <math.h>
 #include <stdio.h>
@@ -128,7 +130,9 @@ static void on_menu_quit(GtkMenuItem *item, gpointer user_data);
 /* Animation helpers */
 static void ensure_animation_frames(SystemTray *tray);
 static gboolean animation_tick_tray(gpointer user_data);
+#ifdef GDK_WINDOWING_X11
 static void set_dock_icon_from_pixbuf(GtkWindow *win, GdkPixbuf *pixbuf);
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Icon loading and PNG conversion                                     */
@@ -148,14 +152,14 @@ static GdkPixbuf *load_xpm_for_tray(const char *filename) {
         pixbuf = gdk_pixbuf_new_from_xpm_data(REDMIC_XPM);
     }
 #else
-    /* Fallback: load from disk */
+    /* Fallback: load from disk using GLib's portable program path API */
     char path[PATH_MAX];
-    /* Try relative to executable */
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-        char *dir = dirname(exe_path);
+    const char *prgname = g_get_prgname();
+    if (prgname && strchr(prgname, '/')) {
+        /* prgname contains a path component */
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", prgname);
+        char *dir = dirname(tmp);
         snprintf(path, sizeof(path), "%s/assets/%s", dir, filename);
         pixbuf = gdk_pixbuf_new_from_file(path, NULL);
     }
@@ -178,7 +182,7 @@ static gboolean save_pixbuf_as_png(GdkPixbuf *pixbuf, const char *path) {
     GError *error = NULL;
     gboolean ok = gdk_pixbuf_save(pixbuf, path, "png", &error, NULL);
     if (!ok) {
-        /* CR-02 fix: 'error' may be NULL if gdk_pixbuf_save fails without setting GError */
+        /* 'error' may be NULL if gdk_pixbuf_save fails without setting GError */
         g_warning("[tray] Failed to save icon to %s: %s",
                   path, error ? error->message : "unknown error");
         g_error_free(error);
@@ -362,7 +366,7 @@ static void update_tray_tooltip(SystemTray *tray) {
 /* ------------------------------------------------------------------ */
 
 SystemTray *tray_create(void) {
-    SystemTray *tray = calloc(1, sizeof(SystemTray));
+    SystemTray *tray = g_malloc0(sizeof(SystemTray));
     if (!tray) {
         return NULL;
     }
@@ -382,12 +386,17 @@ SystemTray *tray_create(void) {
         tray->anim_pixbufs[i] = NULL;
     }
 
-    /* Create a temp directory for icon files so app_indicator_new_with_path()
-     * can find them. This is required because app_indicator_set_icon() expects
-     * an icon name (not a full path) and searches the icon theme path. */
+    /* Create a secure temp directory for icon files so app_indicator_new_with_path()
+     * can find them. Uses mkdtemp() for atomic, race-free directory creation,
+     * preventing symlink attacks on predictable temp paths. */
     snprintf(tray->icon_dir, sizeof(tray->icon_dir),
-             "%s/transcriber_icons_%d", g_get_tmp_dir(), getpid());
-    mkdir(tray->icon_dir, 0755);
+             "%s/transcriber_icons_XXXXXX", g_get_tmp_dir());
+    if (!mkdtemp(tray->icon_dir)) {
+        g_log("app-tray", G_LOG_LEVEL_MESSAGE,
+              "[tray] Failed to create temp icon directory: %s\n", strerror(errno));
+        g_free(tray);
+        return NULL;
+    }
 
     /* Build icon file paths within the temp directory */
     g_snprintf(tray->icon_idle_path, sizeof(tray->icon_idle_path),
@@ -421,7 +430,7 @@ SystemTray *tray_create(void) {
     if (!tray->indicator) {
         g_log("app-tray", G_LOG_LEVEL_MESSAGE, "[tray] Failed to create AppIndicator\n");
         rmdir(tray->icon_dir);
-        free(tray);
+        g_free(tray);
         return NULL;
     }
 
@@ -452,8 +461,11 @@ void tray_destroy(SystemTray *tray) {
         unlink(tray->icon_listening_path);
     }
 
-    /* Free pre-loaded animation pixbufs */
-    for (guint i = 0; i < tray->num_anim_frames; i++) {
+    /* Free pre-loaded animation pixbufs.
+     * Iterate all 8 slots (not just num_anim_frames) to handle the case
+     * where ensure_animation_frames() failed partway through, leaving some
+     * pixbufs allocated but num_anim_frames not updated. */
+    for (guint i = 0; i < G_N_ELEMENTS(tray->anim_pixbufs); i++) {
         if (tray->anim_pixbufs[i]) {
             g_object_unref(tray->anim_pixbufs[i]);
             tray->anim_pixbufs[i] = NULL;
@@ -478,7 +490,7 @@ void tray_destroy(SystemTray *tray) {
         g_object_unref(tray->indicator);
     }
 
-    free(tray);
+    g_free(tray);
 }
 
 void tray_set_state(SystemTray *tray, AppState state) {
@@ -541,9 +553,11 @@ static gboolean animation_tick_tray(gpointer user_data) {
      * Use pre-loaded pixbuf to avoid slow disk I/O on every timer tick.
      * Use set_dock_icon_from_pixbuf() which sets _NET_WM_ICON via Xlib,
      * ensuring the dock sees the animated frames. */
+#ifdef GDK_WINDOWING_X11
     if (tray->main_window && tray->anim_pixbufs[tray->animation_frame]) {
         set_dock_icon_from_pixbuf(tray->main_window, tray->anim_pixbufs[tray->animation_frame]);
     }
+#endif
     return TRUE; /* Continue the timer */
 }
 
@@ -552,7 +566,9 @@ static gboolean animation_tick_tray(gpointer user_data) {
  * X11 property directly. This is required because gtk_window_set_icon()
  * may be cached or ignored by some desktop environments (e.g., GNOME Shell
  * dock) for already-running applications.
+ * Only available on X11 displays — no-op on Wayland.
  */
+#ifdef GDK_WINDOWING_X11
 static void set_dock_icon_from_pixbuf(GtkWindow *win, GdkPixbuf *pixbuf) {
     GdkWindow *gdk_win = gtk_widget_get_window(GTK_WIDGET(win));
     if (!gdk_win || !GDK_IS_X11_WINDOW(gdk_win)) return;
@@ -591,6 +607,7 @@ static void set_dock_icon_from_pixbuf(GtkWindow *win, GdkPixbuf *pixbuf) {
     XFlush(dpy);
     g_free(data);
 }
+#endif /* GDK_WINDOWING_X11 */
 
 /**
  * Pre-generate animation frames by compositing a sine wave onto the green mic.
@@ -686,9 +703,11 @@ void tray_start_animation(SystemTray *tray) {
     /* Show first frame immediately on both tray and window (dock) icon.
      * Use pre-loaded pixbuf + set_dock_icon_from_pixbuf() for dock visibility. */
     app_indicator_set_icon(tray->indicator, tray->anim_icon_names[0]);
+#ifdef GDK_WINDOWING_X11
     if (tray->main_window && tray->anim_pixbufs[0]) {
         set_dock_icon_from_pixbuf(tray->main_window, tray->anim_pixbufs[0]);
     }
+#endif
     tray->animation_source_id = g_timeout_add(TRAY_ANIM_INTERVAL_MS,
                                                animation_tick_tray,
                                                tray);
@@ -710,6 +729,7 @@ void tray_stop_animation(SystemTray *tray) {
     if (tray->icon_listening_created) {
         app_indicator_set_icon(tray->indicator, tray->icon_listening_name);
     }
+#ifdef GDK_WINDOWING_X11
     if (tray->main_window) {
         GdkPixbuf *green = gdk_pixbuf_new_from_file(tray->icon_listening_path, NULL);
         if (green) {
@@ -717,4 +737,5 @@ void tray_stop_animation(SystemTray *tray) {
             g_object_unref(green);
         }
     }
+#endif
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -104,7 +104,9 @@ bool app_transition_to(AppStateController *controller, AppState target) {
             allowed = (target == STATE_TRANSCRIBING);
             break;
         case STATE_TRANSCRIBING:
-            allowed = (target == STATE_IDLE);
+            /* Allow TRANSCRIBING → LISTENING for continuous mode,
+             * and TRANSCRIBING → IDLE for normal mode */
+            allowed = (target == STATE_IDLE || target == STATE_LISTENING);
             break;
     }
 
@@ -116,8 +118,13 @@ bool app_transition_to(AppStateController *controller, AppState target) {
     pthread_mutex_unlock(&controller->state_mutex);
 
     /* Invoke state change callback directly on successful transition.
-     * Callback is invoked outside the mutex to prevent deadlocks.
-     * Note: Called from whichever thread invoked this function. */
+      * Callback is invoked outside the mutex to prevent deadlocks.
+      * Note: Called from whichever thread invoked this function.
+      *
+      * Thread safety: callback_user_data was captured inside the mutex above.
+      * In practice, callback_user_data is set once during init and never
+      * modified, so there is no race. If future code modifies it, a ref
+      * count or copy would be needed here. */
     if (allowed && controller->on_state_change) {
         controller->on_state_change(target, controller->callback_user_data);
     }
@@ -136,7 +143,7 @@ void app_set_model_status(AppStateController *controller, ModelStatus status) {
 bool app_toggle_state(AppStateController *controller) {
     if (!controller) return false;
 
-    /* CR-03 fix: Make the toggle decision and transition atomic in a single
+    /* Make the toggle decision and transition atomic in a single
      * mutex acquisition to prevent race conditions from double-increment
      * of sequence_counter and non-atomic state determination. */
     pthread_mutex_lock(&controller->state_mutex);

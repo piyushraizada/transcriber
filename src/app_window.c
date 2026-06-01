@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -19,8 +19,9 @@
  *                          default; if it would extend past the bottom of the
  *                          display monitor, it is positioned above instead.
  *   3. Sine Wave Animation — Cairo-driven animation on GtkDrawingArea during
- *                          STATE_LISTENING only. Rendered in blue (RGB 0,0,1)
- *                          with a line width of 6.0 pixels. Hidden during
+ *                          STATE_LISTENING only. Rendered in green
+ *                          (RGB 0.165, 0.655, 0.259) with a line width of
+ *                          6.0 pixels and 70% opacity. Hidden during
  *                          STATE_IDLE and STATE_TRANSCRIBING.
  *   4. Countdown Timer  — GtkLabel in the center of the status bar that counts
  *                          down from max_duration to 0 during STATE_LISTENING.
@@ -84,7 +85,7 @@
 #define COLOR_CONNECTED_G 0.655
 #define COLOR_CONNECTED_B 0.259
 #define COLOR_CHECKING_R 1.0
-#define COLOR_CHECKING_G 1.0
+#define COLOR_CHECKING_G 0.85
 #define COLOR_CHECKING_B 0.0
 #define COLOR_LOADING_R 1.0
 #define COLOR_LOADING_G 0.65
@@ -139,7 +140,7 @@ struct _MainWindow {
     int icon_width;
     int icon_height;
     char asset_dir[PATH_MAX];
-    /* Cached window icons to avoid repeated XPM parsing (M2-002 fix) */
+    /* Cached window icons to avoid repeated XPM parsing */
     GdkPixbuf *cached_red_icon;
     GdkPixbuf *cached_green_icon;
     bool checking_blink;
@@ -150,8 +151,7 @@ struct _MainWindow {
     /* Countdown timer */
     guint countdown_source_id;
     int countdown_seconds;
-    /* MED-9 fix: Volume level tracking moved from global to struct
-     * to avoid fragile global mutable state. */
+    /* Volume level tracking moved from global to struct for encapsulation. */
     double last_volume_level;
     /* Toggle callback — invoked when the mic icon is clicked */
     void (*on_toggle)(void *user_data);
@@ -210,17 +210,15 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
  * then falls back to the current directory.
  */
 static void get_asset_dir(MainWindow *win) {
-    /* Try to get the directory of the executable */
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-        char *dir = dirname(exe_path);
-        snprintf(win->asset_dir, sizeof(win->asset_dir), "%s/assets", dir);
-    } else {
+    /* Try to get the directory of the executable using GLib's portable API.
+     * g_get_prgname() returns the program name set by g_set_prgname() or
+     * derived from argv[0]. We use the compiled-in prefix path as fallback. */
+#ifdef ASSET_DIR_PATH
+        snprintf(win->asset_dir, sizeof(win->asset_dir), "%s", ASSET_DIR_PATH);
+#else
         /* Fallback: look for assets/ relative to current directory */
         snprintf(win->asset_dir, sizeof(win->asset_dir), "./assets");
-    }
+#endif
 }
 
 /**
@@ -259,7 +257,7 @@ static GdkPixbuf *load_xpm(MainWindow *win, const char *filename) {
 /**
  * Get a cached GdkPixbuf for the given icon name.
  * Loads and caches the pixbuf on first access, then returns a ref'd copy.
- * (M2-002 fix — avoids repeated XPM parsing on state transitions)
+ * (avoids repeated XPM parsing on state transitions)
  */
 static GdkPixbuf *get_cached_icon(MainWindow *win, const char *icon_name) {
     if (strcmp(icon_name, "redmic.xpm") == 0) {
@@ -339,7 +337,7 @@ static void on_icon_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
         return;
     }
 
-    // L-010 fix: Use cached icon instead of loading XPM every draw call
+    // Use cached icon instead of loading XPM every draw call
     GdkPixbuf *pixbuf = get_cached_icon(win, icon_name);
     if (!pixbuf) {
         return;
@@ -426,12 +424,23 @@ static void on_animation_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
     cairo_set_source_rgba(cr, WAVE_COLOR_R, WAVE_COLOR_G, WAVE_COLOR_B, WAVE_COLOR_A);
     cairo_set_line_width(cr, WAVE_LINE_WIDTH);
 
-    /* Draw the sine wave */
-    cairo_move_to(cr, 0, center_y);
-    for (int x = 0; x < width; x++) {
+    /* Draw the sine wave using batched line segments for better performance.
+     * Instead of per-pixel cairo_line_to() calls, we sample at ~8px intervals
+     * and use straight line segments between samples. This reduces Cairo calls
+     * by ~8x while maintaining visual quality (the human eye cannot distinguish
+     * the difference at this resolution). */
+    const int step = 8;  /* Sample every 8 pixels */
+    cairo_move_to(cr, 0, center_y + WAVE_AMPLITUDE * sin(win->wave_phase));
+    for (int x = step; x < width; x += step) {
         double y = center_y + WAVE_AMPLITUDE *
                    sin(WAVE_FREQUENCY * x + win->wave_phase);
         cairo_line_to(cr, x, y);
+    }
+    /* Ensure we reach the right edge */
+    if (width > 0) {
+        double y = center_y + WAVE_AMPLITUDE *
+                   sin(WAVE_FREQUENCY * (width - 1) + win->wave_phase);
+        cairo_line_to(cr, width - 1, y);
     }
     cairo_stroke(cr);
 }
@@ -561,7 +570,7 @@ static void on_gear_button_clicked(GtkButton *button, gpointer user_data) {
  * Handle button press on the microphone indicator area.
  * Toggles the recording state: IDLE → LISTENING → TRANSCRIBING → IDLE.
  */
-/* CRIT-001 fix: Wrapper to run connection check and update UI */
+/* Wrapper to run connection check and update UI */
 static gboolean on_indicator_check_connection(gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
     if (win && win->whisper_client) {
@@ -577,7 +586,7 @@ static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *eve
     UNUSED(widget);
     UNUSED(event);
 
-    /* CRIT-001 fix: Trigger connection check on indicator click */
+    /* Trigger connection check on indicator click */
     app_window_set_model_status(win, MODEL_CHECKING);
 
     /* Schedule connection check on the main thread */
@@ -615,7 +624,7 @@ static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, 
     return TRUE; /* Prevent the window from being destroyed */
 }
 
-/* MIN-007 fix: Reposition TextWindow when MainWindow moves */
+/* Reposition TextWindow when MainWindow moves */
 static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
     TextWindow *tw = (TextWindow *)user_data;
     if (!tw || !tw->window || !gtk_widget_get_visible(GTK_WIDGET(tw->window)) || !tw->auto_position) {
@@ -670,7 +679,7 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
 
 MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
                                WhisperClient *whisper_client) {
-    MainWindow *win = (MainWindow *)calloc(1, sizeof(MainWindow));
+    MainWindow *win = (MainWindow *)g_malloc0(sizeof(MainWindow));
     if (!win) {
         return NULL;
     }
@@ -705,7 +714,6 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
 
     /* Set window properties */
     gtk_window_set_title(win->window, "Transcriber");
-    gtk_window_set_wmclass(win->window, "transcriber", "Transcriber");
     gtk_window_set_resizable(win->window, FALSE);
     gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_NORMAL);
 
@@ -830,7 +838,7 @@ void app_window_destroy(MainWindow *win) {
         gtk_widget_destroy(GTK_WIDGET(win->window));
     }
 
-    /* Free cached icons (M2-002 fix) */
+    /* Free cached icons */
     if (win->cached_red_icon) {
         g_object_unref(win->cached_red_icon);
     }
@@ -839,7 +847,7 @@ void app_window_destroy(MainWindow *win) {
     }
 
     /* Free the structure */
-    free(win);
+    g_free(win);
 }
 
 GtkWindow *app_window_get_gtk_window(MainWindow *win) {
@@ -857,16 +865,17 @@ void app_window_set_state(MainWindow *win, AppState state) {
     switch (state) {
         case STATE_IDLE:
             render_icon(win, "redmic.xpm");
-            /* Update taskbar icon to red mic (cached, M2-002 fix) */
+            /* Update taskbar icon to red mic (cached) */
             { GdkPixbuf *icon = get_cached_icon(win, "redmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
             app_window_stop_animation(win);
+            app_window_stop_countdown(win);
             gtk_widget_hide(GTK_WIDGET(win->volume_level_bar));
             gtk_level_bar_set_value(win->volume_level_bar, 0.0);
             break;
         case STATE_LISTENING:
             render_icon(win, "greenmic.xpm");
-            /* Update taskbar icon to green mic (cached, M2-002 fix) */
+            /* Update taskbar icon to green mic (cached) */
             { GdkPixbuf *icon = get_cached_icon(win, "greenmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
             gtk_widget_show(GTK_WIDGET(win->animation_area));
@@ -876,7 +885,7 @@ void app_window_set_state(MainWindow *win, AppState state) {
             break;
         case STATE_TRANSCRIBING:
             render_icon(win, "greenmic.xpm");
-            /* Update taskbar icon to green mic (cached, M2-002 fix) */
+            /* Update taskbar icon to green mic (cached) */
             { GdkPixbuf *icon = get_cached_icon(win, "greenmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
             app_window_stop_animation(win);
@@ -1102,7 +1111,7 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
     g_signal_connect(tw->window, "delete-event",
                       G_CALLBACK(on_text_window_delete_event), tw);
 
-    /* MIN-007 fix: Listen for MainWindow position changes */
+    /* Listen for MainWindow position changes */
     if (main_window_gtk) {
         g_signal_connect(main_window_gtk, "configure-event",
                          G_CALLBACK(on_main_window_configure_event), tw);
@@ -1124,11 +1133,18 @@ void app_text_window_destroy(TextWindow *tw) {
 void app_text_window_append_text(TextWindow *tw, const char *text) {
     if (!tw || !text) return;
 
-    /* Append text to the buffer */
-    GtkTextIter end;
+    /* Append text to the buffer on the same line — no automatic newlines.
+     * Insert a single space separator only when existing content is present,
+     * ensuring continuous horizontal text flow across all transcription segments. */
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(tw->buffer, &start);
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
+    gboolean has_content = !gtk_text_iter_equal(&start, &end);
+
+    if (has_content) {
+        gtk_text_buffer_insert(tw->buffer, &end, " ", 1);
+    }
     gtk_text_buffer_insert(tw->buffer, &end, text, -1);
-    gtk_text_buffer_insert(tw->buffer, &end, "\n", 1);
 
     /* Show the window without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
@@ -1176,7 +1192,7 @@ void app_text_window_clear_text(TextWindow *tw) {
     gtk_window_deiconify(tw->window);
 }
 
-/* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
+/* Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
 
 void app_window_set_volume_level(MainWindow *win, double level) {
     if (!win || !win->volume_level_bar) return;

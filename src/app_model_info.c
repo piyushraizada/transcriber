@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -22,9 +22,10 @@
  * GGUF spec: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "app_model_info.h"
 
-#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -127,7 +128,7 @@ void model_info_init(ModelInfo *info) {
     info->error_message[0] = '\0';
 }
 
-/* HIGH-7 fix: model_info_load() now returns false on I/O errors and true
+/* model_info_load() returns false on I/O errors and true
  * only when metadata was successfully parsed. Callers should check the
  * return value first, then check info.valid for format validation. */
 bool model_info_load(const char *model_path, ModelInfo *info) {
@@ -138,7 +139,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
     /* Resolve the path (handle tilde expansion and directory search) */
     char resolved[PATH_MAX];
     int path_result = whisper_resolve_model_path(model_path, resolved, sizeof(resolved));
-    /* LOW-17 fix: Use distinct return codes for better error messages */
+    /* Use distinct return codes for better error messages */
     if (path_result == -2) {
         /* Path resolution failed (invalid input, no HOME, etc.) */
         snprintf(info->error_message, sizeof(info->error_message),
@@ -244,7 +245,7 @@ bool model_info_load(const char *model_path, ModelInfo *info) {
         snprintf(info->error_message, sizeof(info->error_message),
             "Failed to read GGUF header");
         fclose(f);
-        return true;
+        return false;
     }
 
     uint64_t tensor_count = read_u64_le(header + 4);

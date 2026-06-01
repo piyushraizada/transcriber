@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -175,6 +175,50 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
  *         The caller MUST free the response using whisper_response_free().
  */
 WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char* wav_path, int max_retries);
+
+/*---------------------------------------------------------------------------
+ * Section 5b: In-Memory Transcription (Ring Buffer Support)
+ *---------------------------------------------------------------------------
+ * Transcribe audio directly from memory without writing to disk.
+ * Used for continuous transcription with VAD-based silence detection.
+ */
+
+/**
+ * Transcribe PCM audio samples directly from memory.
+ *
+ * This function bypasses WAV file I/O and feeds int16_t PCM samples
+ * directly to whisper.cpp. The samples must be 16kHz mono 16-bit PCM.
+ *
+ * @param client      Pointer to a valid WhisperClient. Must not be NULL.
+ * @param samples     Pointer to int16_t PCM samples (16kHz, mono).
+ * @param n_samples   Number of samples.
+ *
+ * @return A pointer to a WhisperResponse struct (allocated by this function).
+ *         The caller MUST free the response using whisper_response_free().
+ *         Returns NULL on critical failure.
+ */
+WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
+                                             const int16_t *samples,
+                                             int n_samples);
+
+/**
+ * Transcribe PCM audio samples directly from memory with automatic retry.
+ *
+ * Provides protection against transient errors (memory allocation failures,
+ * decode errors) during in-memory transcription.
+ *
+ * @param client      Pointer to a valid WhisperClient. Must not be NULL.
+ * @param samples     Pointer to int16_t PCM samples (16kHz, mono).
+ * @param n_samples   Number of samples.
+ * @param max_retries Maximum number of retry attempts (0 = no retry).
+ *
+ * @return A pointer to a WhisperResponse struct (allocated by this function).
+ *         The caller MUST free the response using whisper_response_free().
+ */
+WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
+                                                        const int16_t *samples,
+                                                        int n_samples,
+                                                        int max_retries);
 
 /*---------------------------------------------------------------------------
  * Section 6: Connection Health Check (Model Availability)

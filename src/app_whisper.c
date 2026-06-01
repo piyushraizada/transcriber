@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -17,7 +17,6 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE  /* For usleep on glibc >= 2.37 */
 
 #include "app_whisper.h"
 
@@ -64,7 +63,7 @@ struct _WhisperClient {
     int error_code;
     pthread_mutex_t mutex;
     atomic_int cancel_requested;
-    bool model_loaded;
+    atomic_bool model_loaded;          // atomic for portable cross-thread visibility
     atomic_bool model_loading;         // true while model load is in progress (atomic for cross-thread safety)
 };
 
@@ -81,7 +80,7 @@ static bool whisper_abort_callback(void *data) {
 /* ===================================================================
  * Public: resolve model path with tilde expansion and directory search
  * =================================================================== */
-/* M-006 fix: Distinct return codes for path resolution:
+/* Distinct return codes for path resolution:
  *   0  = path resolved and file exists
  *  -1  = path resolved but file does not exist (valid path, missing file)
  *  -2  = path resolution failed (invalid input, no HOME, etc.) */
@@ -97,8 +96,8 @@ int whisper_resolve_model_path(const char *input, char *output, size_t out_size)
             if (!home) return -2;
             snprintf(resolved, sizeof(resolved), "%s%s", home, input + 1);
         } else {
-            // ~username style - not supported, treat as literal
-            snprintf(resolved, sizeof(resolved), "%s", input);
+            // ~username style - not supported, return resolution failure
+            return -2;
         }
     } else {
         snprintf(resolved, sizeof(resolved), "%s", input);
@@ -111,7 +110,7 @@ int whisper_resolve_model_path(const char *input, char *output, size_t out_size)
         return 0;
     }
 
-    // ME-01 fix: Simplified -- only search default dirs for bare filenames (no '/')
+    // Simplified -- only search default dirs for bare filenames (no '/')
     if (strrchr(input, '/') == NULL) {
             const char *basename = input[0] == '~' ? input + 2 : input;
             for (size_t i = 0; DEFAULT_MODEL_DIRS[i] != NULL; i++) {
@@ -171,14 +170,11 @@ bool whisper_gpu_available(void) {
 }
 
 /* ===================================================================
- * Public: Get GPU usage status
- * =================================================================== */
-/* ===================================================================
  * Public: Check if model is loaded
  * =================================================================== */
 bool whisper_client_is_model_loaded(const WhisperClient *client) {
     if (!client) return false;
-    return client->model_loaded;
+    return atomic_load(&client->model_loaded);
 }
 
 /* ===================================================================
@@ -194,7 +190,7 @@ bool whisper_client_is_loading(const WhisperClient *client) {
  * =================================================================== */
 static bool load_model_internal(WhisperClient *client) {
     if (!client) return false;
-    if (client->model_loaded) return true;
+    if (atomic_load(&client->model_loaded)) return true;
 
     if (client->model_path[0] == '\0') {
         set_error(client, 1, "No model path configured");
@@ -300,7 +296,7 @@ static bool load_model_internal(WhisperClient *client) {
     }
 
     client->ctx = ctx;
-    client->model_loaded = true;
+    atomic_store(&client->model_loaded, true);
 
     /* Release CUDA contexts on GPUs not used by the loaded model.
      * whisper_init_from_file_with_params() enumerates all CUDA devices
@@ -316,7 +312,7 @@ static bool load_model_internal(WhisperClient *client) {
  * Internal: load model (wrapper with loading state tracking)
  * =================================================================== */
 static bool load_model(WhisperClient *client) {
-    if (!client || client->model_loaded) return true;
+    if (!client || atomic_load(&client->model_loaded)) return true;
 
     // Mark as loading (atomic for cross-thread visibility)
     atomic_store(&client->model_loading, true);
@@ -348,18 +344,18 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
     }
 
     // If already loaded with same GPU config, skip
-    if (client->model_loaded && client->gpu_index == gpu_index) {
+    if (atomic_load(&client->model_loaded) && client->gpu_index == gpu_index) {
         pthread_mutex_unlock(&client->mutex);
         return true;
     }
 
     // If already loaded but GPU config differs, unload first
-    if (client->model_loaded) {
+    if (atomic_load(&client->model_loaded)) {
         if (client->ctx) {
             whisper_free(client->ctx);
             client->ctx = NULL;
         }
-        client->model_loaded = false;
+        atomic_store(&client->model_loaded, false);
     }
 
     // Set the GPU index preference
@@ -378,7 +374,7 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
 /* ===================================================================
  * Helper: read WAV file and extract PCM samples
  * =================================================================== */
-/* ME-02 fix: Little-endian byte extraction helpers for portable WAV parsing */
+/* Little-endian byte extraction helpers for portable WAV parsing */
 static uint16_t le16dec(const unsigned char *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
@@ -465,6 +461,17 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: %d Hz sample rate, expected 16000\n", sample_rate);
     }
 
+    // Validate data_size to prevent excessive memory allocation from malicious WAV files.
+    // Cap at 30 minutes of 16kHz/16-bit/mono audio = ~57.6 MB.
+    #define MAX_WAV_DATA_SIZE (30UL * 60 * 16000 * 2)
+    if ((uint64_t)data_size > MAX_WAV_DATA_SIZE) {
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+              "[whisper] WAV data chunk too large: %u bytes (max %lu) — aborting\n",
+              data_size, (unsigned long)MAX_WAV_DATA_SIZE);
+        fclose(f);
+        return false;
+    }
+
     // Read PCM data and convert to float32
     int n_samples = data_size / (bits_per_sample / 8);
     int bytes_per_sample_actual = bits_per_sample / 8;
@@ -540,7 +547,7 @@ WhisperClient* whisper_client_create(void) {
 
     client->ctx = NULL;
     client->model_loaded = false;
-    client->model_loading = false;
+    atomic_store(&client->model_loading, false);
     client->n_threads = DEFAULT_THREADS;
     client->gpu_index = GPU_INDEX_AUTO_MEMORY;  // Auto-select by free memory
     client->model_path[0] = '\0';
@@ -548,7 +555,10 @@ WhisperClient* whisper_client_create(void) {
     client->error_code = 0;
     atomic_store(&client->cancel_requested, 0);
 
-    pthread_mutex_init(&client->mutex, NULL);
+    if (pthread_mutex_init(&client->mutex, NULL) != 0) {
+        free(client);
+        return NULL;
+    }
     return client;
 }
 
@@ -558,13 +568,19 @@ WhisperClient* whisper_client_create(void) {
 void whisper_client_destroy(WhisperClient* client) {
     if (!client) return;
 
+    /* Signal any in-flight transcription to abort before freeing the context.
+     * The abort callback checked by whisper_full() will cause it to exit.
+     * However, whisper_full() may not check the callback immediately under
+     * heavy GPU load, so we also set model_loaded=false to prevent new
+     * transcriptions from starting. */
+    atomic_store(&client->model_loading, false);
+
     pthread_mutex_lock(&client->mutex);
     if (client->ctx) {
         whisper_free(client->ctx);
         client->ctx = NULL;
     }
-    client->model_loaded = false;
-    client->model_loading = false;
+    atomic_store(&client->model_loaded, false);
     pthread_mutex_unlock(&client->mutex);
 
     pthread_mutex_destroy(&client->mutex);
@@ -594,7 +610,7 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
         if (strcmp(client->model_path, resolved) != 0) {
             whisper_free(client->ctx);
             client->ctx = NULL;
-            client->model_loaded = false;
+            atomic_store(&client->model_loaded, false);
         }
     }
 
@@ -604,7 +620,7 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
 
 /* ===================================================================
  * Public API: whisper_transcribe
- * HI-01 fix: Mutex is now held only to access shared state (context,
+ * Mutex is now held only to access shared state (context,
  * config), then released before the actual transcription runs. This
  * prevents blocking whisper_check_connection(), whisper_client_set_model_path(),
  * and whisper_client_destroy() during long transcription operations.
@@ -754,10 +770,200 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
 }
 
 /* ===================================================================
+ * Public API: whisper_transcribe_samples (in-memory, no WAV file)
+ * =================================================================== */
+WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
+                                            const int16_t *samples,
+                                            int n_samples) {
+    WhisperResponse *response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
+    if (!response) return NULL;
+
+    response->text = NULL;
+    response->error_code = 1;
+    response->success = false;
+    response->error_message[0] = '\0';
+
+    if (!client || !samples || n_samples <= 0) {
+        strncpy(response->error_message, "Invalid parameters", sizeof(response->error_message) - 1);
+        response->error_code = 1;
+        return response;
+    }
+
+    // --- Phase 1: Lock mutex to access shared state ---
+    pthread_mutex_lock(&client->mutex);
+
+    // Reset cancel flag
+    atomic_store(&client->cancel_requested, 0);
+
+    // Load model if needed
+    if (!load_model(client)) {
+        snprintf(response->error_message, sizeof(response->error_message), "%s", client->error_message);
+        response->error_message[sizeof(response->error_message) - 1] = '\0';
+        response->error_code = client->error_code;
+        pthread_mutex_unlock(&client->mutex);
+        return response;
+    }
+
+    // Copy needed config while holding mutex
+    struct whisper_context *ctx = client->ctx;
+    int n_threads_cfg = client->n_threads;
+
+    pthread_mutex_unlock(&client->mutex);
+    // --- Mutex released ---
+
+    // Convert int16_t PCM to float32 samples expected by whisper.cpp
+    float *float_samples = (float *)malloc((size_t)n_samples * sizeof(float));
+    if (!float_samples) {
+        pthread_mutex_lock(&client->mutex);
+        set_error(client, 7, "Memory allocation failed for sample conversion");
+        pthread_mutex_unlock(&client->mutex);
+        strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
+        response->error_code = 7;
+        return response;
+    }
+
+    for (int i = 0; i < n_samples; i++) {
+        float_samples[i] = (float)samples[i] / 32768.0f;
+    }
+
+    // Setup transcription parameters
+    struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    params.n_threads = n_threads_cfg > 0 ? n_threads_cfg : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    params.print_progress = false;
+    params.print_realtime = false;
+    params.print_special = false;
+    params.translate = false;
+    params.no_timestamps = true;
+    params.abort_callback = whisper_abort_callback;
+    params.abort_callback_user_data = &client->cancel_requested;
+    params.language = NULL;  // auto-detect
+
+    // Run transcription
+    int result = whisper_full(ctx, params, float_samples, n_samples);
+    free(float_samples);
+
+    if (result != 0) {
+        const char *err_msg = "Unknown transcription error";
+        switch (result) {
+            case -1: err_msg = "Failed to compute log mel spectrogram"; break;
+            case -2: err_msg = "Failed to auto-detect language"; break;
+            case -3: err_msg = "Too many source language tokens"; break;
+            case -4: err_msg = "whisper_decode() failed"; break;
+            case -5: err_msg = "Failed to batch decode"; break;
+            default: err_msg = "Transcription failed";
+        }
+        pthread_mutex_lock(&client->mutex);
+        set_error(client, 5, err_msg);
+        pthread_mutex_unlock(&client->mutex);
+        strncpy(response->error_message, err_msg, sizeof(response->error_message) - 1);
+        response->error_code = 5;
+        return response;
+    }
+
+    // Extract text from segments
+    int n_segments = whisper_full_n_segments(ctx);
+    if (n_segments <= 0) {
+        strncpy(response->error_message, "No transcription segments produced", sizeof(response->error_message) - 1);
+        response->error_code = 6;
+        return response;
+    }
+
+    // Concatenate all segments
+    size_t total_len = 0;
+    for (int i = 0; i < n_segments; i++) {
+        const char *text = whisper_full_get_segment_text(ctx, i);
+        if (text) total_len += strlen(text);
+    }
+
+    char *full_text = (char *)malloc(total_len + 1);
+    if (!full_text) {
+        pthread_mutex_lock(&client->mutex);
+        set_error(client, 7, "Memory allocation failed");
+        pthread_mutex_unlock(&client->mutex);
+        strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
+        response->error_code = 7;
+        return response;
+    }
+
+    full_text[0] = '\0';
+    size_t offset = 0;
+    for (int i = 0; i < n_segments; i++) {
+        const char *text = whisper_full_get_segment_text(ctx, i);
+        if (text) {
+            size_t len = strlen(text);
+            memcpy(full_text + offset, text, len);
+            offset += len;
+        }
+    }
+    full_text[offset] = '\0';
+
+    response->text = full_text;
+    response->success = true;
+    response->error_code = 0;
+
+    return response;
+}
+
+/* ===================================================================
+ * Public API: whisper_transcribe_samples_with_retry
+ * =================================================================== */
+WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
+                                                        const int16_t *samples,
+                                                        int n_samples,
+                                                        int max_retries) {
+    if (!client || !samples || n_samples <= 0) return NULL;
+
+    int attempts = max_retries > 0 ? max_retries + 1 : 1;
+    WhisperResponse *last_response = NULL;
+
+    for (int i = 0; i < attempts; i++) {
+        WhisperResponse *response = whisper_transcribe_samples(client, samples, n_samples);
+        if (!response) {
+            continue;
+        }
+
+        if (response->success) {
+            if (last_response) {
+                whisper_response_free(last_response);
+            }
+            return response;
+        }
+
+        int code = response->error_code;
+
+        // Only retry on certain error codes (5=decode error, 7=memory)
+        if (code != 5 && code != 7) {
+            if (last_response) {
+                whisper_response_free(last_response);
+            }
+            last_response = response;
+            break;
+        }
+
+        if (last_response) {
+            whisper_response_free(last_response);
+        }
+        last_response = response;
+
+        if (i == attempts - 1) break;
+
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Retry %d/%d after error: %s\n",
+                i + 1, max_retries, whisper_client_get_error(client));
+
+        /* Use g_usleep for brief retry delay. Note: g_usleep wraps nanosleep()
+         * on modern GLib, making it POSIX-compliant. The delay is short enough
+         * (100-300ms) that it won't block the transcription thread meaningfully. */
+        g_usleep(100000 * (size_t)(i + 1));  // 100ms, 200ms, ...
+    }
+
+    return last_response;
+}
+
+/* ===================================================================
  * Public API: whisper_transcribe_with_retry
  * =================================================================== */
-/* ME-03 fix: Restructured retry loop to avoid unconditional extra call.
- * Memory leak fix: Free failed responses on each retry iteration to prevent
+/* Restructured retry loop to avoid unconditional extra call.
+ * Free failed responses on each retry iteration to prevent
  * accumulating orphaned WhisperResponse structs when retries are exhausted. */
 WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char* wav_path, int max_retries) {
     if (!client || !wav_path) return NULL;
@@ -887,8 +1093,12 @@ bool whisper_check_connection(WhisperClient* client) {
  * Public API: whisper_client_get_error
  * =================================================================== */
 const char* whisper_client_get_error(WhisperClient* client) {
+    static __thread char local_buffer[256] = {0};
     if (!client) return "No client";
-    return client->error_message[0] != '\0' ? client->error_message : "";
+    pthread_mutex_lock(&client->mutex);
+    snprintf(local_buffer, sizeof(local_buffer), "%s", client->error_message);
+    pthread_mutex_unlock(&client->mutex);
+    return local_buffer[0] != '\0' ? local_buffer : "";
 }
 
 /* ===================================================================

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -79,9 +79,9 @@ typedef struct _AppConfig {
                                            ///< Stored for readability in config file; not used for device opening.
                                            ///< @see CFG-006: Audio Device
 
-    int max_duration;            ///< Maximum recording duration in seconds (5-30)
-                                  ///< @see CFG-014: Max Recording Duration
-                                  ///< @see FR-007a: Maximum Session Limit
+    int max_duration;            ///< Maximum recording duration in seconds (5-120)
+                                   ///< @see CFG-014: Max Recording Duration
+                                   ///< @see FR-007a: Maximum Session Limit
 
     /* Window Settings */
     int window_x;                ///< Window X position (screen coordinates, -1 = center)
@@ -99,15 +99,50 @@ typedef struct _AppConfig {
 
     /* Transcription Text Mode */
     bool append_transcription_text;  ///< true = append new text to existing, false = clear before new transcription
-                                       ///< When false, the text window is cleared at the start of each new transcription
-                                       ///< session to prevent unbounded growth. When true, new text is appended.
-                                       ///< Default: true (append mode for backward compatibility).
+                                        ///< When false, the text window is cleared at the start of each new transcription
+                                        ///< session to prevent unbounded growth. When true, new text is appended.
+                                        ///< Default: true (append mode for backward compatibility).
+
+    /* VAD (Voice Activity Detection) Settings */
+    bool vad_enabled;                ///< Enable VAD-based silence detection for auto-stop recording
+                                        ///< When true, the audio capture thread monitors for silence periods
+                                        ///< and triggers transcription automatically when speech ends.
+                                        ///< Default: false (disabled, use watchdog timer only).
+
+    int vad_mode;                    ///< VAD aggressiveness mode (0-3)
+                                        ///< 0 = Least aggressive (most sensitive, catches quiet speech)
+                                        ///< 1 = Moderate
+                                        ///< 2 = Aggressive
+                                        ///< 3 = Most aggressive (most restrictive, only clear speech)
+                                        ///< Default: 1 (moderate).
+
+    int vad_silence_ms;              ///< Silence duration in ms before triggering auto-stop
+                                        ///< When VAD detects continuous silence for this duration,
+                                        ///< recording stops and transcription begins automatically.
+                                        ///< Range: 500-5000 ms. Default: 1000 (1 second).
+
+    bool continuous_dictation;       ///< Continuous dictation mode (silence-triggered loop)
+                                         ///< When true (default), the silence scanner monitors
+                                         ///< the ring buffer for silence and triggers transcription
+                                         ///< automatically. When false, recording continues until
+                                         ///< the watchdog timer expires or the user manually clicks
+                                         ///< the mic icon, then stops. Default: true.
+
+    /* Silence Scanner Settings — only used in continuous dictation mode */
+    int scanner_silence_ms;          ///< Silence duration (ms) before scanner checks segment
+                                         ///< When the scanner detects continuous silence for this
+                                         ///< duration, it checks if the audio segment meets the
+                                         ///< minimum duration. Range: 1000-10000 ms. Default: 2000.
+
+    int scanner_min_segment_ms;      ///< Minimum segment duration (ms) before transcribing
+                                         ///< The scanner will never send a segment shorter than
+                                         ///< this to Whisper. Short segments are absorbed into
+                                         ///< the next batch. Range: 1000-30000 ms. Default: 5000.
 
     /* NOTE: Language field removed.
-     * M-001 fix: The SRS originally specified a language configuration field
+     * The SRS originally specified a language configuration field
      * (CFG-007, WHISPER-005), but this was removed in favor of using
      * multilingual-only models which auto-detect the input language.
-     * The language_combo was removed from the config dialog (MIN-002 fix).
      * The SRS should be updated to reflect this deviation. */
 
 } AppConfig;
@@ -452,6 +487,77 @@ void config_set_append_transcription_text(AppConfig* config, bool append);
  * @return true if append mode, false if overwrite (clear) mode.
  */
 bool config_get_append_transcription_text(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6: VAD (Voice Activity Detection) Accessors
+ *---------------------------------------------------------------------------
+ * Getters and setters for VAD configuration fields.
+ */
+
+/**
+ * Enable or disable VAD-based silence detection.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param enabled true to enable VAD, false to disable.
+ */
+void config_set_vad_enabled(AppConfig* config, bool enabled);
+
+/**
+ * Get VAD enabled status.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if VAD is enabled, false otherwise.
+ */
+bool config_get_vad_enabled(const AppConfig* config);
+
+/**
+ * Set VAD aggressiveness mode (0-3).
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param mode    Aggressiveness mode: 0 (least) to 3 (most restrictive).
+ */
+void config_set_vad_mode(AppConfig* config, int mode);
+
+/**
+ * Get VAD aggressiveness mode.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return Mode value (0-3), defaults to 1.
+ */
+int config_get_vad_mode(const AppConfig* config);
+
+/**
+ * Set silence duration in ms before VAD triggers auto-stop.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param ms      Silence duration in milliseconds (500-5000).
+ */
+void config_set_vad_silence_ms(AppConfig* config, int ms);
+
+/**
+ * Get silence duration threshold in ms.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return Silence duration in ms, defaults to 1000.
+ */
+int config_get_vad_silence_ms(const AppConfig* config);
+
+/**
+ * Enable or disable continuous dictation mode.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param enabled true for continuous dictation (silence loop), false for timed recording.
+ */
+void config_set_continuous_dictation(AppConfig* config, bool enabled);
+
+/**
+ * Get continuous dictation status.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if continuous dictation mode is enabled.
+ */
+bool config_get_continuous_dictation(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6.5: Scanner Configuration Accessors
+ *---------------------------------------------------------------------------*/
+
+void config_set_scanner_silence_ms(AppConfig* config, int ms);
+int config_get_scanner_silence_ms(const AppConfig* config);
+void config_set_scanner_min_segment_ms(AppConfig* config, int ms);
+int config_get_scanner_min_segment_ms(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

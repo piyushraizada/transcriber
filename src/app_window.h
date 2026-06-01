@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -23,7 +23,8 @@
  *                          display monitor, it is positioned above instead.
  *   3. Sine Wave Animation — Cairo-driven animation rendered on a GtkDrawingArea
  *                          overlay during STATE_LISTENING only. Rendered in
- *                          blue (RGB 0,0,1) with a line width of 6.0 pixels.
+ *                          green (RGB 0.165, 0.655, 0.259) with a line width
+ *                          of 6.0 pixels and 70% opacity.
  *                          Hidden during STATE_IDLE and STATE_TRANSCRIBING.
  *   4. Countdown Timer  — GtkLabel centered in the status bar that counts down
  *                          from max_duration to 0 during STATE_LISTENING.
@@ -51,7 +52,7 @@
  *     (redmic.xpm or greenmic.xpm) onto the icon drawing area.
  *   • The sine wave is drawn on a separate drawing area stacked on top,
  *     with a transparent background so the mic icon shows through.
- *     Color: blue (RGB 0,0,1), line width: 6.0 pixels.
+ *     Color: green (RGB 0.165, 0.655, 0.259), alpha 0.7, line width: 6.0 pixels.
  *   • The status bar is a fixed 16-pixel GtkBox with:
  *     - Left:  GtkButton with gear.xpm icon → opens Config Dialog
  *     - Center: GtkLabel countdown timer (hidden when not recording)
@@ -81,7 +82,7 @@
  *   • Timer-driven at 30fps via g_timeout_add(33, ...).
  *   • Draws a continuous sine wave that scrolls left to right.
  *   • Transparent background (no clear/fill before drawing the wave).
- *   • Color: blue (RGB 0,0,1), line width: 6.0 pixels.
+ *   • Color: green (RGB 0.165, 0.655, 0.259), alpha 0.7, line width: 6.0 pixels.
  *   • Visible only during STATE_LISTENING (hidden via gtk_widget_hide).
  *
  * Countdown Timer:
@@ -451,7 +452,7 @@ void app_text_window_set_error(TextWindow *tw, const char *error);
  */
 void app_text_window_clear_text(TextWindow *tw);
 
-/* MIN-001 fix: Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
+/* Removed unused app_text_window_get_text() and app_text_window_is_visible(). */
 
 /* app_window_set_volume_level — Update the volume level bar.
  *
@@ -465,7 +466,7 @@ void app_text_window_clear_text(TextWindow *tw);
  */
 void app_window_set_volume_level(MainWindow *win, double level);
 
-/* MED-9 fix: Get/set the last volume level for threshold-based updates.
+/* Get/set the last volume level for threshold-based updates.
  * These are used by the volume poll callback in main.c to avoid
  * unnecessary GTK widget redraws. */
 double app_window_get_last_volume_level(MainWindow *win);

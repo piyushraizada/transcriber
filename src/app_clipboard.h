@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -103,7 +103,7 @@ bool clipboard_copy_text(GdkDisplay* display, const char* text);
  */
 bool clipboard_copy_text_both(GdkDisplay* display, const char* text);
 
-/* MIN-001 fix: Removed unused clipboard_copy_from_text_view() and clipboard_clear(). */
+/* Removed unused clipboard_copy_from_text_view() and clipboard_clear(). */
 
 /*---------------------------------------------------------------------------
  * Section 3: Clipboard Utilities
@@ -123,7 +123,7 @@ bool clipboard_copy_text_both(GdkDisplay* display, const char* text);
  */
 bool clipboard_is_available(GdkDisplay* display);
 
-/* MIN-001 fix: Removed unused clipboard_get_clipboard() and clipboard_get_primary(). */
+/* Removed unused clipboard_get_clipboard() and clipboard_get_primary(). */
 
 /*---------------------------------------------------------------------------
  * Section 4: Error Handling

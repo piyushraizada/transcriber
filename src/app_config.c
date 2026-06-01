@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -32,7 +32,7 @@
 #include <cjson/cJSON.h>
 
 /*---------------------------------------------------------------------------
- * Static error buffer — protected by mutex for thread safety (M5-001 fix)
+ * Static error buffer — protected by mutex for thread safety
  *---------------------------------------------------------------------------*/
 
 static char g_config_error[256] = {0};
@@ -51,7 +51,7 @@ static void set_error(const char* msg)
 
 const char* config_get_error(void)
 {
-    /* HI-05 fix: Lock mutex, copy to thread-local buffer, unlock, then return. */
+    /* Lock mutex, copy to thread-local buffer, unlock, then return. */
     static __thread char local_buffer[256] = {0};
     pthread_mutex_lock(&g_config_error_mutex);
     snprintf(local_buffer, sizeof(local_buffer), "%s", g_config_error);
@@ -65,11 +65,22 @@ const char* config_get_error(void)
 
 static bool mkdirs(const char* path, mode_t mode)
 {
-    char tmp[1024];
+    char tmp[PATH_MAX];
     char* p = NULL;
     size_t len;
 
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    int n = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (n < 0) {
+        set_error("snprintf failed in mkdirs");
+        return false;
+    }
+    if ((size_t)n >= sizeof(tmp)) {
+        char msg[128];
+        g_snprintf(msg, sizeof(msg), "Path too long for mkdirs (truncated from %d chars)", n);
+        set_error(msg);
+        g_log("app-config", G_LOG_LEVEL_WARNING,
+              "[config] Path truncated in mkdirs: %.200s... (len=%d)\n", path, n);
+    }
     len = strlen(tmp);
 
     /* Remove trailing slash */
@@ -216,7 +227,7 @@ void config_set_defaults(AppConfig* config)
 
     config->audio_device_display_name[0] = '\0';  /* No display name by default */
 
-    config->max_duration = 30;  /* 30 seconds (SRS default) */
+    config->max_duration = 60;  /* 60 seconds — supports extended dictation sessions */
 
     config->window_x = 100;  /* Default position */
     config->window_y = 100;  /* Default position */
@@ -227,6 +238,16 @@ void config_set_defaults(AppConfig* config)
 
     /* Transcription text mode — default to append (true) for backward compatibility */
     config->append_transcription_text = true;
+
+    /* VAD (Voice Activity Detection) — default enabled for hands-free operation */
+    config->vad_enabled = true;
+    config->vad_mode = 1;              // Moderate aggressiveness
+    config->vad_silence_ms = 2500;     // 2.5 seconds of silence triggers auto-stop (allows natural pauses)
+    config->continuous_dictation = true; // Continuous dictation mode by default
+
+    /* Silence Scanner — only active in continuous dictation mode */
+    config->scanner_silence_ms = 2000;       // 2s silence before checking segment
+    config->scanner_min_segment_ms = 5000;   // Minimum 5s audio before transcribing
 
     set_error(NULL);
 }
@@ -281,22 +302,28 @@ bool config_load_from_path(AppConfig* config, const char* path)
     }
 
     /* Get file size */
-    /* M-004 fix: Use off_t + ftello for portable file size handling */
+    /* Use off_t + ftello for portable file size handling */
     fseek(fp, 0, SEEK_END);
     off_t fsize = ftello(fp);
     fseeko(fp, 0, SEEK_SET);
 
-    if (fsize <= 0 || fsize > (off_t)(64 * 1024)) {
-        /* File too small or too large (max 64 KB) */
+    if (fsize <= 0) {
         fclose(fp);
-        set_error("Config file has invalid size");
+        set_error("Config file is empty");
+        return false;
+    }
+    if (fsize > (off_t)(64 * 1024)) {
+        fclose(fp);
+        char msg[128];
+        g_snprintf(msg, sizeof(msg), "Config file too large (%" G_GINT64_FORMAT " bytes, max 65536)", (gint64)fsize);
+        set_error(msg);
         return false;
     }
 
     /* Read file content
-     * MED-12 fix: The cast (size_t)fsize is safe because fsize is bounded
-     * to [1, 1MB] by the check above. On 32-bit systems, size_t is 32-bit,
-     * but 1MB fits comfortably in 32 bits (max ~4GB). */
+     * The cast (size_t)fsize is safe because fsize is bounded
+     * to [1, 64KB] by the check above. On 32-bit systems, size_t is 32-bit,
+     * but 64KB fits comfortably in 32 bits (max ~4GB). */
     char* content = malloc((size_t)fsize + 1);
     if (!content) {
         fclose(fp);
@@ -345,7 +372,7 @@ bool config_load_from_path(AppConfig* config, const char* path)
     if (item && cJSON_IsNumber(item)) {
         int dur = (int)item->valueint;
         if (dur < 5) config->max_duration = 5;
-        else if (dur > 30) config->max_duration = 30;
+        else if (dur > 120) config->max_duration = 120;
         else config->max_duration = dur;
     }
 
@@ -384,6 +411,62 @@ bool config_load_from_path(AppConfig* config, const char* path)
         config->append_transcription_text = cJSON_IsTrue(item);
     }
 
+    /* VAD settings */
+    item = cJSON_GetObjectItemCaseSensitive(root, "vad_enabled");
+    if (item && cJSON_IsBool(item)) {
+        config->vad_enabled = cJSON_IsTrue(item);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "vad_mode");
+    if (item && cJSON_IsNumber(item)) {
+        int mode = (int)item->valueint;
+        if (mode >= 0 && mode <= 3) {
+            config->vad_mode = mode;
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid vad_mode %d, clamping to 1\n", mode);
+            config->vad_mode = 1;
+        }
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "vad_silence_ms");
+    if (item && cJSON_IsNumber(item)) {
+        int ms = (int)item->valueint;
+        if (ms >= 500 && ms <= 5000) {
+            config->vad_silence_ms = ms;
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid vad_silence_ms %d, clamping to 1000\n", ms);
+            config->vad_silence_ms = 1000;
+        }
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "continuous_dictation");
+    if (item && cJSON_IsBool(item)) {
+        config->continuous_dictation = cJSON_IsTrue(item);
+    }
+
+    /* Scanner settings */
+    item = cJSON_GetObjectItemCaseSensitive(root, "scanner_silence_ms");
+    if (item && cJSON_IsNumber(item)) {
+        int ms = (int)item->valueint;
+        if (ms >= 1000 && ms <= 10000) {
+            config->scanner_silence_ms = ms;
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid scanner_silence_ms %d, clamping to 2000\n", ms);
+            config->scanner_silence_ms = 2000;
+        }
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "scanner_min_segment_ms");
+    if (item && cJSON_IsNumber(item)) {
+        int ms = (int)item->valueint;
+        if (ms >= 1000 && ms <= 30000) {
+            config->scanner_min_segment_ms = ms;
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid scanner_min_segment_ms %d, clamping to 5000\n", ms);
+            config->scanner_min_segment_ms = 5000;
+        }
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -414,19 +497,18 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     }
 
     /* Create config directory if needed */
-    char* path_copy = strdup(path);
-    if (!path_copy) {
+    char* dir = g_path_get_dirname(path);
+    if (!dir) {
         set_error("Memory allocation failed");
         return false;
     }
 
-    char* dir = dirname(path_copy);
     if (!mkdirs(dir, 0700)) {
-        free(path_copy);
+        g_free(dir);
         set_error("Failed to create config directory");
         return false;
     }
-    free(path_copy);
+    g_free(dir);
 
     /* Build JSON object */
     cJSON* root = cJSON_CreateObject();
@@ -448,6 +530,16 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddStringToObject(root, "gpu_mode", config->gpu_mode);
 
     cJSON_AddBoolToObject(root, "append_transcription_text", config->append_transcription_text);
+
+    /* VAD settings */
+    cJSON_AddBoolToObject(root, "vad_enabled", config->vad_enabled);
+    cJSON_AddNumberToObject(root, "vad_mode", config->vad_mode);
+    cJSON_AddNumberToObject(root, "vad_silence_ms", config->vad_silence_ms);
+    cJSON_AddBoolToObject(root, "continuous_dictation", config->continuous_dictation);
+
+    /* Scanner settings */
+    cJSON_AddNumberToObject(root, "scanner_silence_ms", config->scanner_silence_ms);
+    cJSON_AddNumberToObject(root, "scanner_min_segment_ms", config->scanner_min_segment_ms);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -523,9 +615,9 @@ bool config_validate(const AppConfig* config)
         return false;
     }
 
-    /* Validate max_duration — must be in [5, 30] per SRS */
-    if (config->max_duration < 5 || config->max_duration > 30) {
-        set_error("max_duration must be between 5 and 30 seconds");
+    /* Validate max_duration — must be in [5, 120] per SRS */
+    if (config->max_duration < 5 || config->max_duration > 120) {
+        set_error("max_duration must be between 5 and 120 seconds");
         return false;
     }
 
@@ -621,14 +713,14 @@ bool config_set_max_duration(AppConfig* config, int duration)
         return false;
     }
     if (duration < 5) duration = 5;
-    if (duration > 30) duration = 30;
+    if (duration > 120) duration = 120;
     config->max_duration = duration;
     return true;
 }
 
 int config_get_max_duration(const AppConfig* config)
 {
-    if (!config) return 30;
+    if (!config) return 60;
     return config->max_duration;
 }
 
@@ -681,10 +773,94 @@ void config_set_append_transcription_text(AppConfig* config, bool append)
     if (!config) return;
     config->append_transcription_text = append;
 }
-
 bool config_get_append_transcription_text(const AppConfig* config)
 {
     if (!config) return true;
     return config->append_transcription_text;
 }
 
+// VAD configuration accessors
+
+void config_set_vad_enabled(AppConfig* config, bool enabled)
+{
+    if (!config) return;
+    config->vad_enabled = enabled;
+}
+
+bool config_get_vad_enabled(const AppConfig* config)
+{
+    if (!config) return false;
+    return config->vad_enabled;
+}
+
+void config_set_vad_mode(AppConfig* config, int mode)
+{
+    if (!config) return;
+    if (mode >= 0 && mode <= 3) {
+        config->vad_mode = mode;
+    }
+}
+
+int config_get_vad_mode(const AppConfig* config)
+{
+    if (!config) return 1;
+    return config->vad_mode;
+}
+
+void config_set_vad_silence_ms(AppConfig* config, int ms)
+{
+    if (!config) return;
+    if (ms >= 500 && ms <= 5000) {
+        config->vad_silence_ms = ms;
+    }
+}
+
+int config_get_vad_silence_ms(const AppConfig* config)
+{
+    if (!config) return 1000;
+    return config->vad_silence_ms;
+}
+
+void config_set_continuous_dictation(AppConfig* config, bool enabled)
+{
+    if (!config) return;
+    config->continuous_dictation = enabled;
+}
+
+bool config_get_continuous_dictation(const AppConfig* config)
+{
+    if (!config) return true;
+    return config->continuous_dictation;
+}
+
+/* ----------------------------------------------------------------
+ * Scanner configuration accessors
+ * ---------------------------------------------------------------- */
+
+void config_set_scanner_silence_ms(AppConfig* config, int ms)
+{
+    if (!config) return;
+    if (ms >= 1000 && ms <= 10000) {
+        config->scanner_silence_ms = ms;
+    }
+}
+
+int config_get_scanner_silence_ms(const AppConfig* config)
+{
+    if (!config) return 2000;
+    return config->scanner_silence_ms;
+}
+
+void config_set_scanner_min_segment_ms(AppConfig* config, int ms)
+{
+    if (!config) return;
+    if (ms >= 1000 && ms <= 30000) {
+        config->scanner_min_segment_ms = ms;
+    }
+}
+
+int config_get_scanner_min_segment_ms(const AppConfig* config)
+{
+    if (!config) return 5000;
+    return config->scanner_min_segment_ms;
+}

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -147,7 +147,12 @@ static GDBusNodeInfo *parse_introspection(void) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Handle the Toggle method call from external clients.
+ * Unified method handler for all D-Bus interfaces.
+ *
+ * Routes incoming method calls to the appropriate handler based on
+ * interface name and method name. Supports:
+ *   - org.xvoice.Actions.Toggle      → toggle callback
+ *   - org.gnome.Shell.Application.Activate → activate callback
  *
  * When a desktop environment hotkey triggers:
  *   dbus-send --session --dest=org.xvoice.Controller \
@@ -156,22 +161,6 @@ static GDBusNodeInfo *parse_introspection(void) {
  * This handler is invoked by GDBus automatically. It calls the registered
  * toggle callback (which performs the state machine transition), then
  * sends a success reply.
- */
-/**
- * Unified method handler for all D-Bus interfaces.
- *
- * Routes incoming method calls to the appropriate handler based on
- * interface name and method name. Supports:
- *   - org.xvoice.Actions.Toggle      → toggle callback
- *   - org.gnome.Shell.Application.Activate → activate callback
- */
-/**
- * Unified method handler for all D-Bus interfaces.
- *
- * Routes incoming method calls to the appropriate handler based on
- * interface name and method name. Supports:
- *   - org.xvoice.Actions.Toggle      → toggle callback
- *   - org.gnome.Shell.Application.Activate → activate callback
  */
 static void on_method_call(GDBusConnection       *connection,
                             const gchar           *sender,
@@ -209,7 +198,9 @@ static void on_method_call(GDBusConnection       *connection,
         if (service && service->activate_cb) {
             service->activate_cb(service->user_data);
         }
-        g_dbus_method_invocation_return_value(invocation, g_variant_new("( )"));
+        /* Activate method has no return arguments per introspection XML.
+         * Use NULL for void return instead of empty tuple variant. */
+        g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
 

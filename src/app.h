@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -38,8 +38,10 @@
  *
  *   • IDLE:           Mic icon is red. Audio thread suspended. Transcription idle.
  *   • LISTENING:      Mic icon is green with sine wave animation. Audio thread
- *                     actively capturing PCM into a temporary WAV file. A 30-second
- *                     (configurable) watchdog timer auto-transitions to TRANSCRIBING.
+ *                     actively capturing PCM into a temporary WAV file and ring
+ *                     buffer. A configurable watchdog timer (default: 60s) auto-
+ *                     transitions to TRANSCRIBING. VAD-based silence detection
+ *                     can also trigger auto-stop when enabled.
  *   • TRANSCRIBING:   Sine wave stops. Audio file closed. Transcription thread
  *                     runs local whisper.cpp model. On completion, text is displayed,
  *                     clipboard is populated, temp file is deleted, and state returns to IDLE.
@@ -66,7 +68,7 @@
 /******************************************************************************
  * Centralized Error Messages
  *
- * L-002 fix: Shared error strings to avoid duplication across modules.
+ * Shared error strings to avoid duplication across modules.
  *****************************************************************************/
 #define APP_ERROR_NO_VALID_MODEL  "No valid whisper ggml file found"
 
@@ -108,13 +110,13 @@ typedef enum {
  * Tracks the availability of the local Whisper model. Displayed as
  * an 8x8 pixel circle in the MainWindow status bar (right side).
  *
- *   • CONNECTED (green)    — Model file verified and accessible
- *   • DISCONNECTED (red)   — Model file not found or not yet checked
- *   • CHECKING (yellow)    — Model check in progress (blinking)
+ *   • AVAILABLE (green)    — Model file verified and accessible
+ *   • UNAVAILABLE (red)   — Model file not found or not yet checked
+ *   • CHECKING (amber)    — Model check in progress (blinking)
  *   • LOADING (amber)      — Model is being loaded into GPU/CPU memory
  *
- * The indicator is clickable: clicking while DISCONNECTED triggers a manual
- * model verification check (WHISPER-013). Clicking while CONNECTED is ignored.
+ * The indicator is clickable: clicking while UNAVAILABLE triggers a manual
+ * model verification check. Clicking while AVAILABLE or LOADING is ignored.
  *
  * SRS: UI-021, UI-022, UI-023, WHISPER-013, FR-037
  *****************************************************************************/
@@ -142,19 +144,19 @@ typedef enum {
  *                     Default: "default"
  *                     SRS: CFG-006, CFG-010, AUD-002
  *
- *   max_duration   — Maximum recording duration in seconds (5–30).
- *                     Default: 30
+ *   max_duration   — Maximum recording duration in seconds (5–120).
+ *                     Default: 60
  *                     SRS: CFG-014, FR-024
  *
  *   window_x, window_y — Persisted MainWindow position.
  *                     Default: (100, 100)
  *                     SRS: CFG-004, FR-002
  *
- * Immutability:
+ * Thread Safety:
  *   After app_config_load() populates this struct, it is treated as
  *   read-only by all worker threads. When the user saves new settings
- *   via the Configuration Dialog, the struct is updated under a mutex
- *   and the new values take effect on the next transcription session.
+ *   via the Configuration Dialog, the struct is updated on the GTK main
+ *   thread and the new values take effect on the next transcription session.
  *
  * SRS: Section 9 (Configuration Management)
  *****************************************************************************/
@@ -307,19 +309,19 @@ typedef struct {
  *   controller — Pointer to an uninitialized AppStateController struct.
  *   config     — Pointer to the shared AppConfig (read-only after init).
  *   on_transcription_result — Callback for transcription results.
-  *   on_model_status    — Callback for connection status changes.
-  *   on_state_change         — Callback invoked on each state transition.
-  *   user_data               — Opaque pointer passed to all callbacks.
-  *
-  * Returns: 0 on success, -1 if mutex initialization fails.
-  *
-  * SRS: Section 2.1, Section 2.3 */
- int app_state_controller_init(AppStateController *controller,
-                        AppConfig *config,
-                        transcription_result_callback on_transcription_result,
-                        model_status_callback on_model_status,
-                        state_change_callback on_state_change,
-                        void *user_data);
+ *   on_model_status         — Callback for connection status changes.
+ *   on_state_change         — Callback invoked on each state transition.
+ *   user_data               — Opaque pointer passed to all callbacks.
+ *
+ * Returns: 0 on success, -1 if mutex initialization fails.
+ *
+ * SRS: Section 2.1, Section 2.3 */
+int app_state_controller_init(AppStateController *controller,
+                     AppConfig *config,
+                     transcription_result_callback on_transcription_result,
+                     model_status_callback on_model_status,
+                     state_change_callback on_state_change,
+                     void *user_data);
 
 /* app_state_controller_cleanup — Destroy the state controller's mutex.
  *

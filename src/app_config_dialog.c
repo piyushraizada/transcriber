@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -43,9 +43,14 @@ struct _ConfigDialog {
     GtkLabel *model_info_label;
     GtkComboBox *device_combo;
     GtkComboBox *gpu_mode_combo;
-    /* MIN-002 fix: Removed language_combo - multilingual models only */
+    /* Language selection removed - multilingual models only */
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
+    /* VAD controls */
+    GtkCheckButton *vad_enabled_checkbox;
+    GtkComboBox *vad_mode_combo;
+    GtkSpinButton *vad_silence_spin;
+    GtkCheckButton *continuous_dictation_checkbox;
     GtkLabel *model_path_error;
     GtkLabel *duration_error;
     GtkLabel *hotkey_label;
@@ -53,8 +58,7 @@ struct _ConfigDialog {
     guint model_info_idle_id;  /* Track idle source so we can cancel on dialog close */
 };
 
-/* MIN-002 fix: Removed dead language_combo and g_languages array.
- * Language selection was removed - using multilingual models only. */
+/* Language selection removed - using multilingual models only. */
 
 /* ===================================================================
  * Default model path helpers
@@ -122,7 +126,7 @@ bool config_dialog_validate_model_path(const char *path) {
  * @return true if valid (5 <= duration <= 30)
  */
 bool config_dialog_validate_duration(int duration) {
-    return duration >= 5 && duration <= 30;
+    return duration >= 5 && duration <= 120;
 }
 
 /**
@@ -135,7 +139,7 @@ bool config_dialog_validate_duration(int duration) {
 void config_dialog_show_error(GtkLabel *error_label, const char *message) {
     if (!error_label) return;
 
-    /* M6-001 fix: Use markup instead of creating/destroying CSS providers repeatedly */
+    /* Use markup instead of creating/destroying CSS providers repeatedly */
     if (message && message[0]) {
         char *escaped = g_markup_escape_text(message, -1);
         char *markup = g_strdup_printf("<span foreground='red'>%s</span>", escaped);
@@ -211,7 +215,7 @@ GtkListStore * config_dialog_get_audio_devices(void) {
     return store;
 }
 
-/* MIN-002 fix: Removed language list section — language selection removed. */
+/* Language list section removed — language selection removed. */
 
 /* ===================================================================
  * Hotkey command display
@@ -262,14 +266,16 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
         valid = FALSE;
     } else {
-        /* Check file exists */
+        /* Check file exists using lstat() to detect symlinks.
+         * Reject symlinks to prevent symlink attacks where a malicious
+         * user could redirect model loading to an arbitrary file. */
         struct stat st;
-        if (stat(model_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (lstat(model_path, &st) != 0 || !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
             config_dialog_show_error(dlg->model_path_error, APP_ERROR_NO_VALID_MODEL);
             valid = FALSE;
         } else {
             /* Validate GGUF/GGML format by attempting to load metadata
-             * HIGH-7 fix: model_info_load now returns false on I/O errors,
+             * model_info_load returns false on I/O errors,
              * so we check return value first, then info.valid for format. */
             ModelInfo info;
             model_info_init(&info);
@@ -290,7 +296,7 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     /* Validate duration */
     int duration = (int)gtk_spin_button_get_value(dlg->duration_spin);
     if (!config_dialog_validate_duration(duration)) {
-        config_dialog_show_error(dlg->duration_error, "Duration must be between 5 and 30 seconds");
+        config_dialog_show_error(dlg->duration_error, "Duration must be between 5 and 120 seconds");
         valid = FALSE;
     } else {
         config_dialog_clear_error(dlg->duration_error);
@@ -345,6 +351,15 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     config_set_append_transcription_text(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->append_text_checkbox)));
 
+    /* Save VAD settings */
+    config_set_vad_enabled(dlg->config,
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox)));
+    config_set_vad_mode(dlg->config, gtk_combo_box_get_active(dlg->vad_mode_combo));
+    config_set_vad_silence_ms(dlg->config,
+        (int)gtk_spin_button_get_value(dlg->vad_silence_spin));
+    config_set_continuous_dictation(dlg->config,
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
+
     /* Save config to file */
     config_save(dlg->config);
 
@@ -364,7 +379,7 @@ static void on_reset_position_clicked(GtkButton *button, ConfigDialog *dlg) {
     gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
 }
 
-/* FIX #2: Async model info loading to avoid blocking GTK main loop */
+/* Async model info loading to avoid blocking GTK main loop */
 typedef struct {
     ConfigDialog *dlg;
     char *path;
@@ -389,15 +404,18 @@ static gboolean model_info_load_callback(gpointer user_data) {
     ModelInfo info;
     model_info_init(&info);
 
-    /* HIGH-7 fix: Check return value first, then info.valid */
+    /* Check return value first, then info.valid */
     if (model_info_load(path, &info) && info.valid) {
-        /* MIN-006 fix: Escape model metadata for Pango markup safety */
+        /* Escape model metadata for Pango markup safety */
+        /* Truncate to prevent markup buffer overflow from malformed GGUF metadata */
         gchar *escaped_name = g_markup_escape_text(info.model_name, -1);
         gchar *escaped_quant = g_markup_escape_text(info.quantization, -1);
+        if (strlen(escaped_name) > 120) escaped_name[120] = '\0';
+        if (strlen(escaped_quant) > 40) escaped_quant[40] = '\0';
         const char *lang_str = info.multilingual ? "Multilingual" : "English-only";
-        char markup[512];
-        snprintf(markup, sizeof(markup),
-            "<span size='small'><b>%s</b> — %s — %s</span>",
+        char markup[256];
+        g_snprintf(markup, sizeof(markup),
+            "<span size='small'><b>%s</b> - %s - %s</span>",
             escaped_name, escaped_quant, lang_str);
         gtk_label_set_markup(dlg->model_info_label, markup);
         g_free(escaped_name);
@@ -514,10 +532,17 @@ static void on_duration_changed(GtkSpinButton *spin, ConfigDialog *dlg) {
     config_dialog_clear_error(dlg->duration_error);
 }
 
-/* MAJ-001 fix: Async model metadata loading to avoid blocking GTK main loop.
+static void on_vad_enabled_toggled(GtkCheckButton *check, ConfigDialog *dlg) {
+    UNUSED(check);
+    gboolean enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox));
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_mode_combo), enabled);
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_silence_spin), enabled);
+}
+
+/* Async model metadata loading to avoid blocking GTK main loop.
  * Previously, model_info_load() blocked the GTK thread for 5-15 seconds
  * on large models. Now uses g_idle_add() callback pattern. */
-/* HI-01/HI-04 fix: Proper callback struct for timeout to reset button label.
+/* Proper callback struct for timeout to reset button label.
  * Avoids type mismatch with GSourceFunc and memory leak from g_strdup. */
 typedef struct {
     GtkButton *button;
@@ -530,7 +555,7 @@ static gboolean reset_copy_button_label_callback(gpointer user_data) {
     return FALSE;  /* One-shot timeout */
 }
 
-/* MIN-003 fix: Copy hotkey command to clipboard */
+/* Copy hotkey command to clipboard */
 static void on_copy_hotkey_clicked(GtkButton *button, ConfigDialog *dlg) {
     UNUSED(button);
     UNUSED(dlg);
@@ -540,7 +565,7 @@ static void on_copy_hotkey_clicked(GtkButton *button, ConfigDialog *dlg) {
     gtk_clipboard_store(clipboard);
     /* Briefly change button text to confirm */
     gtk_button_set_label(button, "Copied!");
-    /* HI-01/HI-04 fix: Use proper callback with correct GSourceFunc signature */
+    /* Use proper callback with correct GSourceFunc signature */
     ResetLabelData *data = g_new0(ResetLabelData, 1);
     data->button = button;
     g_timeout_add(1500, reset_copy_button_label_callback, data);
@@ -562,7 +587,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     if (!parent_window || !config) return false;
 
 
-    /* MIN-004 fix: Allocate ConfigDialog on heap to avoid stack overflow */
+    /* Allocate ConfigDialog on heap to avoid stack overflow */
     ConfigDialog *dlg = g_new0(ConfigDialog, 1);
     dlg->config = config;
     dlg->dialog = GTK_DIALOG(gtk_dialog_new_with_buttons(
@@ -765,7 +790,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     gtk_label_set_xalign(GTK_LABEL(dur_label), 0);
     gtk_box_pack_start(GTK_BOX(vbox), dur_label, FALSE, FALSE, 0);
 
-    dlg->duration_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(5, 30, 1));
+    dlg->duration_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(5, 120, 1));
     gtk_spin_button_set_value(dlg->duration_spin, (gdouble)config_get_max_duration(config));
     gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->duration_spin), FALSE, TRUE, 0);
 
@@ -878,6 +903,86 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
     }
 
+    /* ---- VAD (Voice Activity Detection) ---- */
+    {
+        GtkWidget *vad_title = gtk_label_new("Voice Activity Detection (VAD):");
+        gtk_label_set_xalign(GTK_LABEL(vad_title), 0);
+        PangoAttrList *vad_attrs = pango_attr_list_new();
+        pango_attr_list_insert(vad_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(vad_title), vad_attrs);
+        pango_attr_list_unref(vad_attrs);
+        gtk_box_pack_start(GTK_BOX(vbox), vad_title, FALSE, FALSE, 0);
+
+        dlg->vad_enabled_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
+            "Enable VAD-based auto-stop on silence"));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox),
+                                     config_get_vad_enabled(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_enabled_checkbox), FALSE, FALSE, 0);
+
+        GtkWidget *vad_help = gtk_label_new(
+            "When enabled, recording stops automatically after a period of silence.\n"
+            "Transcription begins immediately without needing to click the mic icon.");
+        gtk_label_set_xalign(GTK_LABEL(vad_help), 0);
+        gtk_widget_set_opacity(vad_help, 0.6);
+        gtk_label_set_line_wrap(GTK_LABEL(vad_help), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), vad_help, FALSE, FALSE, 0);
+
+        // VAD Mode (sensitivity)
+        GtkWidget *vad_mode_label = gtk_label_new("  Sensitivity:");
+        gtk_label_set_xalign(GTK_LABEL(vad_mode_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), vad_mode_label, FALSE, FALSE, 0);
+
+        dlg->vad_mode_combo = GTK_COMBO_BOX(gtk_combo_box_text_new());
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_mode_combo), "0", "Least sensitive (catches quiet speech)");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_mode_combo), "1", "Moderate (recommended)");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_mode_combo), "2", "Aggressive");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_mode_combo), "3", "Most aggressive (only clear speech)");
+        gtk_combo_box_set_active(dlg->vad_mode_combo, config_get_vad_mode(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_mode_combo), FALSE, FALSE, 0);
+
+        // VAD Silence Duration
+        GtkWidget *vad_silence_label = gtk_label_new("  Silence threshold:");
+        gtk_label_set_xalign(GTK_LABEL(vad_silence_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), vad_silence_label, FALSE, FALSE, 0);
+
+        GtkWidget *silence_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0.5, 5.0, 0.1));
+        gtk_spin_button_set_value(dlg->vad_silence_spin,
+                                  (gdouble)config_get_vad_silence_ms(config) / 1000.0);
+        gtk_box_pack_start(GTK_BOX(silence_box), GTK_WIDGET(dlg->vad_silence_spin), FALSE, FALSE, 0);
+
+        GtkWidget *silence_unit = gtk_label_new("seconds");
+        gtk_box_pack_start(GTK_BOX(silence_box), silence_unit, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), silence_box, FALSE, FALSE, 0);
+
+        // Connect toggle signal to enable/disable VAD controls
+        g_signal_connect(dlg->vad_enabled_checkbox, "toggled",
+                         G_CALLBACK(on_vad_enabled_toggled), dlg);
+
+        // Set initial sensitivity of VAD sub-controls based on enabled state
+        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox))) {
+            gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_mode_combo), FALSE);
+            gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_silence_spin), FALSE);
+        }
+
+        // Continuous dictation checkbox
+        dlg->continuous_dictation_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
+            "Continuous dictation (silence-triggered loop)"));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox),
+                                     config_get_continuous_dictation(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->continuous_dictation_checkbox), FALSE, FALSE, 0);
+
+        GtkWidget *dictation_help = gtk_label_new(
+            "When enabled, silence triggers transcription and recording restarts.\n"
+            "When disabled, recording runs until timer expires or you click the mic, then stops.");
+        gtk_label_set_xalign(GTK_LABEL(dictation_help), 0);
+        gtk_widget_set_opacity(dictation_help, 0.6);
+        gtk_label_set_line_wrap(GTK_LABEL(dictation_help), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), dictation_help, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+    }
+
     /* ---- Hotkey Command ---- */
     GtkWidget *hotkey_title = gtk_label_new("D-Bus Hotkey Command:");
     gtk_label_set_xalign(GTK_LABEL(hotkey_title), 0);
@@ -897,7 +1002,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     GtkStyleContext *ctx = gtk_widget_get_style_context(GTK_WIDGET(dlg->hotkey_label));
     gtk_style_context_add_class(ctx, "monospace");
 
-    /* Copy button for hotkey command (MIN-003 fix) */
+    /* Copy button for hotkey command */
     GtkWidget *hotkey_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(hotkey_box), GTK_WIDGET(dlg->hotkey_label), TRUE, TRUE, 0);
     GtkWidget *copy_btn = gtk_button_new_with_label("Copy");
@@ -932,7 +1037,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_cancel_clicked), dlg);
     }
 
-    /* MIN-002 fix: Ensure Escape key closes dialog */
+    /* Ensure Escape key closes dialog */
     gtk_window_set_accept_focus(GTK_WINDOW(dlg->dialog), TRUE);
     gtk_widget_grab_focus(GTK_WIDGET(cancel_btn));
 
@@ -955,7 +1060,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
 
     /* Destroy dialog */
     gtk_widget_destroy(GTK_WIDGET(dlg->dialog));
-    g_free(dlg); /* MIN-004 fix: free heap-allocated ConfigDialog */
+    g_free(dlg); /* Free heap-allocated ConfigDialog */
 
     return saved;
 }

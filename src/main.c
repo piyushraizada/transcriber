@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -52,7 +52,7 @@
  *
  * Recording Completion Beep:
  *   - When recording finishes (handle_enter_transcribing), a GTK window
- *     bell is used to trigger the system beep (LO-05 fix).
+ *     bell is used to trigger the system beep.
  *
  * Threading:
  *   - Main thread: GTK main loop, UI updates, D-Bus message processing
@@ -72,6 +72,8 @@
 
 #include "app.h"
 #include "app_audio.h"
+#include "app_silence_scanner.h"
+#include "app_vad.h"
 #include "app_whisper.h"
 #include "whisper.h"
 #include "app_config.h"
@@ -113,6 +115,7 @@ typedef struct TranscriberApp {
     AudioRecorder *audio_recorder;
     WhisperClient *whisper_client;
     SystemTray *tray;
+    SilenceScanner *silence_scanner;
 
     /* Configuration (owned by the app, lifetime = app lifetime) */
     AppConfig config;
@@ -137,6 +140,14 @@ typedef struct TranscriberApp {
 
     /* Shutdown flag — atomic for portable cross-thread visibility */
     atomic_bool shutting_down;
+
+    /* User explicitly clicked mic to stop recording in continuous mode.
+     * When set, on_transcription_result will transition to IDLE instead
+     * of restarting recording, even if continuous_dictation is enabled. */
+    atomic_bool user_requested_stop;
+
+    /* Mutex for scanner segment callback — protects concurrent transcription */
+    pthread_mutex_t scanner_transcribe_mutex;
 } TranscriberApp;
 
 /* ------------------------------------------------------------------ */
@@ -160,6 +171,9 @@ static void show_auto_close_dialog(TranscriberApp *app, const char *title,
                                    GtkMessageType type, const char *format, ...);
 static void handle_enter_listening(TranscriberApp *app);
 static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path);
+static void on_vad_silence_stop(void *user_data);
+static void on_scanner_segment(int16_t *samples, size_t count, void *user_data);
+static gboolean restart_watchdog_idle(gpointer user_data);
 static void start_watchdog_timer(TranscriberApp *app);
 static void stop_watchdog_timer(TranscriberApp *app);
 static void start_transcription_watchdog(TranscriberApp *app);
@@ -168,6 +182,8 @@ static void start_volume_poll(TranscriberApp *app);
 static void stop_volume_poll(TranscriberApp *app);
 static void perform_initial_model_load(TranscriberApp *app);
 static int get_transcription_timeout_seconds(TranscriberApp *app);
+static TranscriberApp *app_create(void);
+static void app_destroy(TranscriberApp *app);
 
 /* ------------------------------------------------------------------ */
 /* Idle callback wrappers (GSourceFunc signature)                      */
@@ -193,7 +209,7 @@ static gboolean on_transcription_result_idle(gpointer data) {
     IdleCallbackData *icd = (IdleCallbackData *)data;
     TranscriberApp *app = icd->app;
 
-    /* H-002 fix: Bail out early if application is shutting down */
+    /* Bail out early if application is shutting down */
     if (app->shutting_down) {
         g_free(icd->data);
         g_free(icd);
@@ -209,7 +225,7 @@ static gboolean on_transcription_error_idle(gpointer data) {
     IdleCallbackData *icd = (IdleCallbackData *)data;
     TranscriberApp *app = icd->app;
 
-    /* H-002 fix: Bail out early if application is shutting down */
+    /* Bail out early if application is shutting down */
     if (app->shutting_down) {
         g_free(icd->data);
         g_free(icd);
@@ -352,7 +368,7 @@ static void stop_watchdog_timer(TranscriberApp *app) {
     }
 }
 
-/* LOW-16 fix: Transcription phase watchdog timeout is now configurable via
+/* Transcription phase watchdog timeout is now configurable via
  * the AppConfig max_duration field, scaled by a factor to allow longer
  * transcriptions for longer recordings. Minimum 30s, maximum 120s. */
 static int get_transcription_timeout_seconds(TranscriberApp *app) {
@@ -400,6 +416,24 @@ static void stop_transcription_watchdog(TranscriberApp *app) {
         g_source_remove(app->transcription_watchdog_source_id);
         app->transcription_watchdog_source_id = 0;
     }
+}
+
+/**
+ * Idle callback to restart the watchdog timer after a scanner transcription.
+ * Ensures continuous recording doesn't expire during long dictation sessions.
+ */
+static gboolean restart_watchdog_idle(gpointer user_data)
+{
+    TranscriberApp *app = (TranscriberApp *)user_data;
+    stop_watchdog_timer(app);
+    start_watchdog_timer(app);
+    /* Restart the UI countdown timer so the user sees the full duration reset
+     * after each successfully transcribed segment in continuous mode. */
+    if (app->main_window) {
+        app_window_stop_countdown(app->main_window);
+        app_window_start_countdown(app->main_window);
+    }
+    return G_SOURCE_REMOVE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -473,6 +507,93 @@ static void on_config_changed(void *user_data) {
 }
 
 /* ------------------------------------------------------------------ */
+/* VAD Silence Stop Callback                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Callback invoked on the GTK main thread when VAD detects silence
+ * and the capture thread has stopped recording.
+ * Transitions the application from LISTENING to TRANSCRIBING state.
+ */
+static void on_vad_silence_stop(void *user_data) {
+    TranscriberApp *app = (TranscriberApp *)user_data;
+
+    g_log("main", G_LOG_LEVEL_MESSAGE,
+          "[main] VAD silence stop callback — transitioning to TRANSCRIBING\n");
+
+    AppState state = app_get_state(&app->controller);
+    if (state == STATE_LISTENING) {
+        /* Transition to TRANSCRIBING */
+        if (app_transition_to(&app->controller, STATE_TRANSCRIBING)) {
+            /* Stop audio recording (capture thread already exited, but this
+             * finalizes the WAV file and performs cleanup) */
+            if (app->audio_recorder) {
+                audio_recorder_stop(app->audio_recorder);
+            }
+        }
+    }
+}
+
+/**
+ * Callback invoked by the silence scanner when a segment is ready for transcription.
+ * This runs on the scanner thread, so we marshal to GTK main thread via g_idle_add.
+ */
+static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
+{
+    TranscriberApp *app = (TranscriberApp *)user_data;
+
+    /* Guard against shutdown: if whisper_client is NULL, skip transcription */
+    if (!app->whisper_client) {
+        g_free(samples);
+        return;
+    }
+
+    g_log("main", G_LOG_LEVEL_MESSAGE,
+          "[main] Scanner segment: %zu samples (%.1fs) — transcribing\n",
+          count, (double)count / 16000.0);
+
+    /* Transcribe samples directly (no WAV file needed) */
+    pthread_mutex_lock(&app->scanner_transcribe_mutex);
+
+    WhisperResponse *response = whisper_transcribe_samples(app->whisper_client, samples, (int)count);
+    g_free(samples);  /* Free scanner-allocated samples */
+
+    if (response && response->success && response->text && response->text[0] != '\0') {
+        /* Marshal success to GTK main thread */
+        IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
+        icd->app = app;
+        icd->data = g_strdup(response->text);
+        g_idle_add(on_transcription_result_idle, icd);
+
+        /* Restart watchdog timer so continuous recording doesn't expire */
+        g_idle_add(restart_watchdog_idle, app);
+    } else {
+        const char *error = "Scanner transcription returned empty result";
+        if (response) {
+            if (response->error_message[0] != '\0') {
+                error = response->error_message;
+            }
+        }
+        if (!error || error[0] == '\0') {
+            error = whisper_client_get_error(app->whisper_client);
+        }
+        if (!error || error[0] == '\0') {
+            error = "Scanner transcription returned empty result";
+        }
+        IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
+        icd->app = app;
+        icd->data = g_strdup(error);
+        g_idle_add(on_transcription_error_idle, icd);
+    }
+
+    if (response) {
+        whisper_response_free(response);
+    }
+
+    pthread_mutex_unlock(&app->scanner_transcribe_mutex);
+}
+
+/* ------------------------------------------------------------------ */
 /* State Transition Handlers                                           */
 /* ------------------------------------------------------------------ */
 
@@ -483,8 +604,12 @@ static void on_config_changed(void *user_data) {
 static void handle_enter_listening(TranscriberApp *app) {
     /* Clear the TextWindow buffer at the start of a new transcription session
      * if the user has disabled append mode (overwrite mode). This prevents
-     * unbounded memory growth over many transcription sessions. */
-    if (app->text_window && !config_get_append_transcription_text(app->controller.config)) {
+     * unbounded memory growth over many transcription sessions.
+     * However, skip clearing during continuous mode restarts (TRANSCRIBING→LISTENING)
+     * to avoid erasing the text that was just appended. */
+    bool append_mode = app->controller.config ? config_get_append_transcription_text(app->controller.config) : true;
+    bool continuous_dictation = app->controller.config ? config_get_continuous_dictation(app->controller.config) : false;
+    if (app->text_window && !append_mode && !continuous_dictation) {
         app_text_window_clear_text(app->text_window);
     }
 
@@ -499,6 +624,31 @@ static void handle_enter_listening(TranscriberApp *app) {
         tray_start_animation(app->tray);
     }
 
+    /* Configure VAD before starting recording.
+     * Continuous mode: disable VAD auto-stop (scanner handles it).
+     * On-demand mode: enable VAD auto-stop with callback. */
+    if (app->audio_recorder && app->controller.config) {
+        bool vad_enabled = config_get_vad_enabled(app->controller.config);
+        bool continuous_dictation = config_get_continuous_dictation(app->controller.config);
+
+        if (continuous_dictation) {
+            /* Continuous mode: disable VAD auto-stop, use silence scanner instead */
+            audio_recorder_configure_vad(app->audio_recorder, false,
+                                         config_get_vad_mode(app->controller.config),
+                                         config_get_vad_silence_ms(app->controller.config));
+        } else {
+            /* On-demand mode: enable VAD auto-stop with callback */
+            audio_recorder_configure_vad(
+                app->audio_recorder,
+                vad_enabled,
+                config_get_vad_mode(app->controller.config),
+                config_get_vad_silence_ms(app->controller.config)
+            );
+            audio_recorder_set_vad_stop_callback(app->audio_recorder,
+                                                 on_vad_silence_stop, app);
+        }
+    }
+
     /* Start audio recording */
     if (app->audio_recorder) {
         int max_duration = app->controller.config->max_duration;
@@ -508,6 +658,31 @@ static void handle_enter_listening(TranscriberApp *app) {
             start_watchdog_timer(app);
             /* Start volume level polling */
             start_volume_poll(app);
+
+            /* Create and start silence scanner AFTER ring buffer exists */
+            if (config_get_continuous_dictation(app->controller.config)) {
+                if (!app->silence_scanner) {
+                    AudioRingBuffer *rb = audio_recorder_get_ring_buffer(app->audio_recorder);
+                    if (rb) {
+                        app->silence_scanner = silence_scanner_create(
+                            rb,
+                            (VadMode)config_get_vad_mode(app->controller.config),
+                            config_get_scanner_silence_ms(app->controller.config),
+                            config_get_scanner_min_segment_ms(app->controller.config)
+                        );
+                        if (app->silence_scanner) {
+                            silence_scanner_set_callback(app->silence_scanner,
+                                                         on_scanner_segment, app);
+                        }
+                    }
+                }
+                if (app->silence_scanner) {
+                    if (silence_scanner_start(app->silence_scanner)) {
+                        g_log("main", G_LOG_LEVEL_MESSAGE,
+                              "[main] Continuous mode — silence scanner started\n");
+                    }
+                }
+            }
         } else {
             /* Failed to start recording — return to IDLE */
             const char *error = audio_recorder_get_error();
@@ -534,7 +709,7 @@ static void handle_enter_listening(TranscriberApp *app) {
  * Stops audio recording and initiates transcription.
  */
 static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path) {
-    /* LO-05 fix: Use GTK window bell instead of terminal BEL character,
+    /* Use GTK window bell instead of terminal BEL character,
      * which works reliably in modern desktop environments */
     if (app->main_window) {
         GtkWindow *gtk_win = GTK_WINDOW(app_window_get_gtk_window(app->main_window));
@@ -583,21 +758,37 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
     }
     pthread_mutex_unlock(&app->wav_path_mutex);
 
-    /* Start transcription in a background thread */
-    if (app->whisper_client && app->current_wav_path[0] != '\0') {
-        /* MIN-012 fix: Start transcription watchdog (30s constant timeout) */
+    /* Start transcription in a background thread.
+     * In continuous mode, the WAV path may be empty (deleted by scanner segments),
+     * but the ring buffer still has audio. Allow transcription to proceed as long
+     * as the whisper client exists. */
+    bool continuous = app->controller.config
+        ? config_get_continuous_dictation(app->controller.config) : false;
+    if (app->whisper_client && (app->current_wav_path[0] != '\0' || continuous)) {
+        /* Start transcription watchdog (30s constant timeout) */
         start_transcription_watchdog(app);
 
-        /* HI-04 fix: Store thread handle for clean shutdown.
-         * Memory leak fix: Join any previous transcription thread before
-         * overwriting the handle, preventing zombie threads from accumulating. */
+        /* Store thread handle for clean shutdown.
+         * Join any previous transcription thread before overwriting,
+         * preventing zombie threads from accumulating. */
+        GThread *old_thread = NULL;
         pthread_mutex_lock(&app->transcribe_thread_mutex);
         if (app->transcribe_thread) {
-            /* Cancel the in-flight transcription to free its resources */
-            whisper_client_cancel(app->whisper_client);
-            g_thread_join(app->transcribe_thread);
+            old_thread = app->transcribe_thread;
             app->transcribe_thread = NULL;
         }
+        pthread_mutex_unlock(&app->transcribe_thread_mutex);
+
+        /* Cancel the in-flight transcription OUTSIDE the mutex to prevent
+         * deadlock: whisper_client_cancel() sets an atomic flag that the
+         * transcription thread checks, but we must not hold the thread mutex
+         * while waiting for that thread to respond. */
+        if (old_thread) {
+            whisper_client_cancel(app->whisper_client);
+            g_thread_join(old_thread);
+        }
+
+        pthread_mutex_lock(&app->transcribe_thread_mutex);
         app->transcribe_thread = g_thread_new("transcribe",
                         (GThreadFunc)transcribe_thread_func,
                         app);
@@ -623,16 +814,139 @@ static gpointer transcribe_thread_func(gpointer data) {
     const char *model_path = config_get_model_path(app->controller.config);
     whisper_client_set_model_path(app->whisper_client, model_path);
 
-    /* Copy WAV path under mutex */
-    pthread_mutex_lock(&app->wav_path_mutex);
-    char wav_path[PATH_MAX];
-    g_strlcpy(wav_path, app->current_wav_path, sizeof(wav_path));
-    pthread_mutex_unlock(&app->wav_path_mutex);
+    /* Stop the silence scanner first to prevent it from reading the ring buffer
+     * while we extract samples. The scanner thread and this transcription thread
+     * both access the ring buffer, so we must stop the scanner before extracting. */
+    if (app->silence_scanner) {
+        silence_scanner_stop(app->silence_scanner);
+    }
 
-    /* Perform transcription with retry */
-    WhisperResponse *response = whisper_transcribe_with_retry(app->whisper_client,
-                                                 wav_path,
-                                                 WHISPER_MAX_RETRIES);
+    /* Stop audio recording first (capture thread must stop before ring buffer extract) */
+    if (app->audio_recorder) {
+        audio_recorder_stop(app->audio_recorder);
+    }
+
+    /* Extract PCM samples from ring buffer for in-memory transcription */
+    int16_t *samples = NULL;
+    size_t n_samples = 0;
+    if (app->audio_recorder) {
+        n_samples = audio_recorder_extract_samples(app->audio_recorder, &samples);
+
+        /* In continuous mode, skip already-transcribed samples.
+         * The silence scanner tracks how many samples have been sent
+         * for transcription. We only want the remaining untranscribed
+         * portion from the ring buffer. */
+        if (samples && n_samples > 0 && app->silence_scanner) {
+            size_t already_transcribed = silence_scanner_get_transcribed_offset(app->silence_scanner);
+            if (already_transcribed >= n_samples) {
+                /* All samples were already transcribed by the scanner */
+                g_free(samples);
+                samples = NULL;
+                n_samples = 0;
+            } else if (already_transcribed > 0) {
+                /* Skip the already-transcribed prefix */
+                memmove(samples, samples + already_transcribed,
+                        (n_samples - already_transcribed) * sizeof(int16_t));
+                n_samples -= already_transcribed;
+            }
+        }
+
+        /* Trim trailing silence to prevent whisper from hallucinating text
+         * on the silence period that triggered VAD auto-stop. */
+        if (samples && n_samples > 0) {
+            n_samples = audio_trim_trailing_silence(samples, n_samples, 16000);
+        }
+
+        /* Skip transcription if remaining audio is too short.
+         * Whisper hallucinates text (e.g., "Thank you") on very short
+         * noise-only clips. Require at least 500ms of audio after trimming
+         * to avoid spurious transcriptions. */
+        if (samples && n_samples > 0) {
+            int remaining_ms = (int)((double)n_samples / 16000.0 * 1000.0);
+            if (remaining_ms < 500) {
+                g_free(samples);
+                samples = NULL;
+                n_samples = 0;
+            }
+        }
+
+        /* Verify remaining audio actually contains voice using VAD.
+         * In continuous mode, the user may have stopped speaking before
+         * clicking the mic, leaving only background noise in the buffer.
+         * Whisper hallucinates text on noise-only audio, so we skip
+         * transcription if VAD finds insufficient voice content. */
+        if (samples && n_samples > 0 && app->silence_scanner) {
+            VadDetector *vad = vad_detector_create(VAD_MODE_MODERATE);
+            if (vad) {
+                size_t frame_samples = 320;  /* 20ms at 16kHz */
+                size_t n_frames = n_samples / frame_samples;
+                int voice_frames = 0;
+                for (size_t f = 0; f < n_frames; f++) {
+                    bool frame_voice = vad_process_frame(vad,
+                                                         samples + f * frame_samples,
+                                                         frame_samples,
+                                                         16000);
+                    if (frame_voice) voice_frames++;
+                }
+                /* Require at least 30% of frames to be voice */
+                bool has_voice = (voice_frames > (int)(n_frames * 0.3));
+                vad_detector_destroy(vad);
+                if (!has_voice) {
+                    g_log("main", G_LOG_LEVEL_MESSAGE,
+                          "[main] Remaining audio has no voice (%d/%d frames) — skipping transcription\n",
+                          voice_frames, (int)n_frames);
+                    g_free(samples);
+                    samples = NULL;
+                    n_samples = 0;
+                }
+            }
+        }
+    }
+
+    WhisperResponse *response = NULL;
+
+    if (samples && n_samples > 0) {
+        /* In-memory transcription from ring buffer */
+        response = whisper_transcribe_samples(app->whisper_client, samples, (int)n_samples);
+        g_free(samples);
+    } else {
+        /* Fallback: try WAV file path if ring buffer is empty */
+        pthread_mutex_lock(&app->wav_path_mutex);
+        char wav_path[PATH_MAX];
+        g_strlcpy(wav_path, app->current_wav_path, sizeof(wav_path));
+        pthread_mutex_unlock(&app->wav_path_mutex);
+
+        if (wav_path[0] != '\0') {
+            response = whisper_transcribe_with_retry(app->whisper_client, wav_path, WHISPER_MAX_RETRIES);
+        }
+    }
+
+    /* If both ring buffer and WAV path are empty, check if this is continuous
+     * mode with VAD-filtered silence. In that case, silently skip transcription
+     * and let the app transition to IDLE without showing an error. */
+    bool continuous = app->controller.config
+        ? config_get_continuous_dictation(app->controller.config) : false;
+    if (!response) {
+        if (continuous) {
+            /* In continuous mode, VAD may have filtered out all remaining audio
+             * as silence. Create a success response with empty text so the app
+             * transitions to IDLE without showing an error. */
+            response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
+            if (response) {
+                response->success = true;
+                response->text = NULL;  /* text is dynamically allocated, not inline */
+            }
+        } else {
+            /* Non-continuous mode: show error */
+            response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
+            if (response) {
+                strncpy(response->error_message, "No audio data available for transcription",
+                        sizeof(response->error_message) - 1);
+                response->error_code = 10;
+                response->success = false;
+            }
+        }
+    }
 
     /* Marshal result to the GTK main thread */
     if (app->controller.on_transcription_result) {
@@ -657,7 +971,7 @@ static gpointer transcribe_thread_func(gpointer data) {
             whisper_response_free(response);
         }
     } else {
-        /* ME-05 fix: Free response when callback is NULL to prevent memory leak */
+        /* Free response when callback is NULL to prevent memory leak */
         if (response) {
             whisper_response_free(response);
         }
@@ -675,45 +989,66 @@ static gpointer transcribe_thread_func(gpointer data) {
  * Called from the GTK main thread via g_idle_add().
  * Either text or error may be non-NULL, but not both.
  */
-static void on_transcription_result(TranscriberApp *app, const char *text, bool success) {
-    /* MIN-012 fix: Stop transcription watchdog on result */
+static void on_transcription_result(TranscriberApp *app, const char *text_or_error, bool success) {
+    /* Stop transcription watchdog on result */
     stop_transcription_watchdog(app);
 
-    if (success && text) {
+    if (success && text_or_error) {
+        /* Log the raw transcription output for debugging */
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[transcription] Whisper output: %s\n", text_or_error);
+
         /* Append transcribed text to the TextWindow */
         if (app->text_window) {
-            app_text_window_append_text(app->text_window, text);
+            app_text_window_append_text(app->text_window, text_or_error);
         }
 
         /* Copy to clipboard (both PRIMARY and CLIPBOARD).
-         * This function is invoked from the GTK main thread via
-         * g_idle_add() in transcribe_thread_func(), so GTK clipboard
-         * operations are safe here without additional marshaling. */
+          * This function is invoked from the GTK main thread via
+          * g_idle_add() in transcribe_thread_func(), so GTK clipboard
+          * operations are safe here without additional marshaling. */
         if (clipboard_is_available(NULL)) {
-            clipboard_copy_text_both(NULL, text);
+            clipboard_copy_text_both(NULL, text_or_error);
         }
 
         /* Delete the temporary WAV file after transcription */
         if (app->audio_recorder) {
             audio_recorder_delete_wav(app->audio_recorder);
         }
-    } else if (!success && text) {
-        /* 'text' parameter holds the error message on failure */
+    } else if (!success && text_or_error) {
+        /* 'text_or_error' parameter holds the error message on failure */
         if (app->text_window) {
-            app_text_window_set_error(app->text_window, text);
+            app_text_window_set_error(app->text_window, text_or_error);
         }
     }
 
-    /* Transition back to IDLE */
-    app_transition_to(&app->controller, STATE_IDLE);
-    if (app->main_window) {
-        app_window_set_state(app->main_window, STATE_IDLE);
+    /* Check if continuous mode is enabled */
+    bool continuous = false;
+    if (app->controller.config) {
+        continuous = config_get_continuous_dictation(app->controller.config);
     }
 
-    /* Update tray icon (tray now sets ACTIVE status — no pulse when idle) */
-    if (app->tray) {
-        tray_stop_animation(app->tray);
-        tray_set_state(app->tray, STATE_IDLE);
+    /* Check if user explicitly requested stop (click during LISTENING in continuous mode).
+     * Capture and clear the flag atomically so the next transcription cycle is unaffected. */
+    bool user_stopped = atomic_exchange(&app->user_requested_stop, 0) != 0;
+
+    if (continuous && success && !user_stopped) {
+        /* Continuous mode: recording never stops — scanner handles segmentation.
+         * Do NOT reset the scanner — it continues scanning from where it left off. */
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[main] Continuous mode — scanner continues\n");
+    } else {
+        /* Normal mode: transition back to IDLE */
+        app_transition_to(&app->controller, STATE_IDLE);
+        if (app->main_window) {
+            app_window_set_state(app->main_window, STATE_IDLE);
+        }
+
+        /* Update tray icon (tray now sets ACTIVE status — no pulse when idle) */
+        if (app->tray) {
+            tray_stop_animation(app->tray);
+            tray_set_state(app->tray, STATE_IDLE);
+        }
     }
 }
 
@@ -770,7 +1105,7 @@ static gpointer model_loading_thread_func(gpointer data) {
 static gboolean on_model_loaded_idle(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
-    /* H-002 fix: Bail out early if application is shutting down */
+    /* Bail out early if application is shutting down */
     if (app->shutting_down) {
         return FALSE;
     }
@@ -810,7 +1145,7 @@ static gboolean on_model_load_failed_idle(gpointer data) {
     TranscriberApp *app = mlfd->app;
     char *error_msg = mlfd->error_msg;
 
-    /* H-002 fix: Bail out early if application is shutting down */
+    /* Bail out early if application is shutting down */
     if (app->shutting_down) {
         g_free(error_msg);
         g_free(mlfd);
@@ -846,7 +1181,7 @@ static gboolean on_model_load_failed_idle(gpointer data) {
  * Handle microphone toggle request.
  * Shared by both the D-Bus toggle and the icon click handler.
  *
- * ERR-014: Before starting recording, check if the local Whisper model
+ * Before starting recording, check if the local Whisper model
  * is available. If unavailable, show an error dialog and abort.
  *
  * MODEL-LOADING: On first mic click, the model is loaded lazily in a
@@ -862,7 +1197,7 @@ static gboolean on_model_load_failed_idle(gpointer data) {
 static void on_microphone_toggle(void *user_data) {
     TranscriberApp *app = (TranscriberApp *)user_data;
 
-    /* HI-03 fix: Only check local model when starting recording (IDLE -> LISTENING) */
+    /* Only check local model when starting recording (IDLE -> LISTENING) */
     AppState current = app_get_state(&app->controller);
     if (current == STATE_IDLE) {
         /* STARTUP-LOADING: If model is still loading from startup,
@@ -954,8 +1289,8 @@ static void on_microphone_toggle(void *user_data) {
                 tray_set_model_status(app->tray, MODEL_LOADING);
             }
 
-            /* H-001 fix: Store model loading thread handle for clean shutdown.
-             * Memory leak fix: Join any previous model load thread before overwriting. */
+            /* Store model loading thread handle for clean shutdown.
+             * Join any previous model load thread before overwriting. */
             pthread_mutex_lock(&app->model_load_thread_mutex);
             if (app->model_load_thread) {
                 g_thread_join(app->model_load_thread);
@@ -974,11 +1309,21 @@ static void on_microphone_toggle(void *user_data) {
         }
     }
 
+    /* When user clicks during LISTENING in continuous mode, set the stop flag
+     * so that on_transcription_result knows this was an explicit user stop
+     * and should transition to IDLE instead of restarting recording. */
+    if (current == STATE_LISTENING && app->controller.config) {
+        bool continuous = config_get_continuous_dictation(app->controller.config);
+        if (continuous) {
+            atomic_store(&app->user_requested_stop, 1);
+        }
+    }
+
     /* Toggle the state — on_state_change callback will handle the actual work.
-     * If we reach here, either:
-     * 1. Model was already loaded (normal fast path)
-     * 2. User is stopping recording (LISTENING -> TRANSCRIBING)
-     * 3. User is in TRANSCRIBING state (no-op) */
+      * If we reach here, either:
+      * 1. Model was already loaded (normal fast path)
+      * 2. User is stopping recording (LISTENING -> TRANSCRIBING)
+      * 3. User is in TRANSCRIBING state (no-op) */
     app_toggle_state(&app->controller);
 }
 
@@ -1048,8 +1393,8 @@ static void perform_initial_model_load(TranscriberApp *app) {
 
     /* The "WAIT" overlay is already active (set to TRUE in app_window_create).
      * Start background thread to load the model. */
-    /* H-001 fix: Store model loading thread handle for clean shutdown.
-     * Memory leak fix: Join any previous model load thread before overwriting. */
+    /* Store model loading thread handle for clean shutdown.
+     * Join any previous model load thread before overwriting. */
     pthread_mutex_lock(&app->model_load_thread_mutex);
     if (app->model_load_thread) {
         g_thread_join(app->model_load_thread);
@@ -1086,7 +1431,14 @@ static void on_state_change(TranscriberApp *app, AppState new_state) {
                 if (app->audio_recorder) {
                     path = audio_recorder_get_wav_path(app->audio_recorder);
                 }
-                if (path && path[0] != '\0') {
+                bool continuous = app->controller.config
+                    ? config_get_continuous_dictation(app->controller.config) : false;
+                /* In continuous mode, always transcribe even if WAV path is empty,
+                 * since the ring buffer may contain remaining audio from the last
+                 * segment that wasn't picked up by the silence scanner. The
+                 * transcribe_thread_func() uses ring buffer as primary source
+                 * and WAV as fallback. */
+                if ((path && path[0] != '\0') || continuous) {
                     handle_enter_transcribing(app, path);
                 } else {
                     app_transition_to(&app->controller, STATE_IDLE);
@@ -1142,7 +1494,7 @@ static void on_state_change_wrapper(AppState new_state, void *user_data) {
  * Returns NULL on failure.
  */
 static TranscriberApp *app_create(void) {
-    TranscriberApp *app = calloc(1, sizeof(TranscriberApp));
+    TranscriberApp *app = g_new0(TranscriberApp, 1);
     if (!app) return NULL;
 
     /* Initialize config with defaults */
@@ -1156,7 +1508,7 @@ static TranscriberApp *app_create(void) {
                                   on_model_status_change_wrapper,
                                   on_state_change_wrapper,
                                   app) != 0) {
-        free(app);
+        g_free(app);
         return NULL;
     }
 
@@ -1166,7 +1518,7 @@ static TranscriberApp *app_create(void) {
     app->audio_recorder = audio_recorder_create(&fmt);
     if (!app->audio_recorder) {
         app_state_controller_cleanup(&app->controller);
-        free(app);
+        g_free(app);
         return NULL;
     }
     if (device && device[0] != '\0') {
@@ -1178,9 +1530,13 @@ static TranscriberApp *app_create(void) {
     if (!app->whisper_client) {
         audio_recorder_destroy(app->audio_recorder);
         app_state_controller_cleanup(&app->controller);
-        free(app);
+        g_free(app);
         return NULL;
     }
+
+    /* Silence scanner will be created lazily when entering continuous mode
+     * (ring buffer only exists after audio_recorder_start()). */
+    app->silence_scanner = NULL;
 
     /* Create MainWindow */
     app->main_window = app_window_create(&app->config, &app->controller, app->whisper_client);
@@ -1188,7 +1544,7 @@ static TranscriberApp *app_create(void) {
         whisper_client_destroy(app->whisper_client);
         audio_recorder_destroy(app->audio_recorder);
         app_state_controller_cleanup(&app->controller);
-        free(app);
+        g_free(app);
         return NULL;
     }
 
@@ -1218,9 +1574,13 @@ static TranscriberApp *app_create(void) {
     }
 
     /* Initialize mutexes */
-    pthread_mutex_init(&app->wav_path_mutex, NULL);
-    pthread_mutex_init(&app->transcribe_thread_mutex, NULL);
-    pthread_mutex_init(&app->model_load_thread_mutex, NULL);
+    if (pthread_mutex_init(&app->wav_path_mutex, NULL) != 0 ||
+        pthread_mutex_init(&app->transcribe_thread_mutex, NULL) != 0 ||
+        pthread_mutex_init(&app->model_load_thread_mutex, NULL) != 0 ||
+        pthread_mutex_init(&app->scanner_transcribe_mutex, NULL) != 0) {
+        app_destroy(app);
+        return NULL;
+    }
 
     /* Initialize atomic flags */
     atomic_store(&app->model_loading_from_toggle, 0);
@@ -1237,8 +1597,9 @@ static TranscriberApp *app_create(void) {
 static void app_destroy(TranscriberApp *app) {
     if (!app) return;
 
-    /* H-002 fix: Set shutdown flag to prevent idle callbacks from accessing freed resources */
-    app->shutting_down = true;
+    /* Set shutdown flag atomically to prevent idle callbacks from accessing freed resources.
+      * Using atomic_store for portable cross-thread visibility. */
+    atomic_store(&app->shutting_down, true);
 
     /* Stop timers */
     stop_watchdog_timer(app);
@@ -1274,12 +1635,12 @@ static void app_destroy(TranscriberApp *app) {
         app->main_window = NULL;
     }
 
-    /* HI-04 fix: Gracefully cancel and join any in-flight transcription thread */
+    /* Gracefully cancel and join any in-flight transcription thread */
     if (app->whisper_client) {
         whisper_client_cancel(app->whisper_client);
     }
 
-    /* CRIT-2 fix: Join the transcription thread */
+    /* Join the transcription thread */
     pthread_mutex_lock(&app->transcribe_thread_mutex);
     if (app->transcribe_thread) {
         g_thread_join(app->transcribe_thread);
@@ -1287,7 +1648,7 @@ static void app_destroy(TranscriberApp *app) {
     }
     pthread_mutex_unlock(&app->transcribe_thread_mutex);
 
-    /* H-001 fix: Join the model loading thread if it's still running */
+    /* Join the model loading thread if it's still running */
     pthread_mutex_lock(&app->model_load_thread_mutex);
     if (app->model_load_thread) {
         g_thread_join(app->model_load_thread);
@@ -1295,7 +1656,18 @@ static void app_destroy(TranscriberApp *app) {
     }
     pthread_mutex_unlock(&app->model_load_thread_mutex);
 
-    /* Destroy Whisper client */
+    /* Stop and destroy silence scanner BEFORE destroying the whisper client.
+     * The scanner thread's on_scanner_segment() callback accesses
+     * app->whisper_client. If the whisper client is destroyed first, the
+     * scanner callback could access freed memory (use-after-free).
+     * silence_scanner_destroy() calls pthread_join() internally, ensuring
+     * the scanner thread has fully exited before the whisper client is freed. */
+    if (app->silence_scanner) {
+        silence_scanner_destroy(app->silence_scanner);
+        app->silence_scanner = NULL;
+    }
+
+    /* Destroy Whisper client (after scanner is stopped to prevent use-after-free) */
     if (app->whisper_client) {
         whisper_client_destroy(app->whisper_client);
         app->whisper_client = NULL;
@@ -1315,7 +1687,17 @@ static void app_destroy(TranscriberApp *app) {
     pthread_mutex_destroy(&app->transcribe_thread_mutex);
     pthread_mutex_destroy(&app->model_load_thread_mutex);
 
-    free(app);
+    /* Drain any pending GTK idle callbacks that may reference 'app' before
+     * freeing it. Worker threads (scanner, transcription) queue idle callbacks
+     * via g_idle_add() that capture the 'app' pointer. Even after the worker
+     * threads are joined, those callbacks may still be pending in the GTK main
+     * loop. Processing them here ensures they execute while 'app' is still valid,
+     * and their internal shutting_down checks will cause them to bail out safely. */
+    while (g_main_context_pending(NULL)) {
+        g_main_context_iteration(NULL, FALSE);
+    }
+
+    g_free(app);
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -27,6 +27,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <glib.h>
+#include "app_ring_buffer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,18 +45,18 @@ typedef struct {
     uint32_t sample_rate;      ///< Sample rate in Hz — fixed at 16000
     uint32_t channels;         ///< Number of channels — fixed at 1/mono
     uint16_t bits_per_sample;  ///< Bit depth — fixed at 16
-    uint32_t buffer_size;      ///< PCM buffer size in frames — 1024
+    uint32_t buffer_size;      ///< PCM buffer size in frames — 320 (20ms at 16kHz, matches WebRTC VAD)
 } AudioFormat;
 
 /*---------------------------------------------------------------------------
- * Section 3: Audio Recorder Handle (Opaque)
+ * Section 2: Audio Recorder Handle (Opaque)
  *---------------------------------------------------------------------------
  * Opaque handle to the internal audio recorder state.
  */
 typedef struct _AudioRecorder AudioRecorder;
 
 /*---------------------------------------------------------------------------
- * Section 4: Initialization and Cleanup
+ * Section 3: Initialization and Cleanup
  *---------------------------------------------------------------------------
  * Functions for creating, initializing, and destroying the audio recorder.
  */
@@ -76,7 +77,7 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format);
 void audio_recorder_destroy(AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
- * Section 5: Device Configuration
+ * Section 3: Device Configuration
  *---------------------------------------------------------------------------
  * Functions for configuring the audio input device.
  */
@@ -99,19 +100,21 @@ bool audio_recorder_set_device(AudioRecorder *recorder, const char *device);
 const char *audio_recorder_get_device(const AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
- * Section 6: Recording Control
+ * Section 4: Recording Control
  *---------------------------------------------------------------------------
  * Functions for starting and stopping audio recording.
  */
 
 /**
- * Start audio recording to a temporary WAV file.
+ * Start audio recording to a temporary WAV file and ring buffer.
  *
  * @param recorder      Pointer to a valid AudioRecorder. Must not be NULL.
  * @return true if recording started successfully, false on failure.
  *
- * @note Duration enforcement is handled by the watchdog timer in main.c,
- *       not by this function. The audio module has no concept of duration limits.
+ * @note Duration enforcement is handled externally by the application's
+ *       watchdog timer. Additionally, VAD-based auto-stop (when enabled via
+ *       audio_recorder_configure_vad()) can trigger internal recording stop
+ *       after a configured period of silence.
  */
 bool audio_recorder_start(AudioRecorder *recorder);
 
@@ -124,7 +127,7 @@ bool audio_recorder_start(AudioRecorder *recorder);
 bool audio_recorder_stop(AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
- * Section 7: WAV File Management
+ * Section 5: WAV File Management
  *---------------------------------------------------------------------------
  * Functions for accessing and managing the temporary WAV file.
  */
@@ -154,7 +157,7 @@ const char *audio_recorder_get_wav_path(const AudioRecorder *recorder);
 double audio_recorder_get_volume_level(const AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
- * Section 8: Audio Format Utilities
+ * Section 6: Audio Format Utilities
  *---------------------------------------------------------------------------
  * Functions for working with the fixed audio format parameters.
  */
@@ -167,7 +170,7 @@ double audio_recorder_get_volume_level(const AudioRecorder *recorder);
 AudioFormat audio_format_get_default(void);
 
 /*---------------------------------------------------------------------------
- * Section 9: Error Handling and Diagnostics
+ * Section 7: Error Handling and Diagnostics
  *---------------------------------------------------------------------------
  * Functions for retrieving error information and diagnostic data.
  */
@@ -186,7 +189,7 @@ const char *audio_recorder_get_error(void);
 void audio_recorder_reset_error(void);
 
 /*---------------------------------------------------------------------------
- * Section 10: Device Listing
+ * Section 8: Device Listing
  *---------------------------------------------------------------------------
  * Functions for listing available audio input devices.
  */
@@ -225,6 +228,87 @@ void audio_device_list_free(AudioDeviceList *list);
  * Delete the WAV file from disk. Call this AFTER transcription is done.
  */
 bool audio_recorder_delete_wav(AudioRecorder *recorder);
+
+/*---------------------------------------------------------------------------
+ * Section 11: VAD (Voice Activity Detection) Configuration
+ *---------------------------------------------------------------------------
+ * Functions for enabling VAD-based silence detection.
+ * Call these before audio_recorder_start() to configure VAD behavior.
+ */
+
+/**
+ * Configure VAD settings on the audio recorder.
+ *
+ * When VAD is enabled, the capture thread monitors audio for silence periods.
+ * After the configured silence duration elapses with no voice detected,
+ * recording stops automatically and transcription begins.
+ *
+ * @param recorder      AudioRecorder handle
+ * @param enabled       true to enable VAD, false to disable
+ * @param mode          Aggressiveness mode (0-3, higher = more restrictive)
+ * @param silence_ms    Silence duration in ms before auto-stop (500-5000)
+ */
+void audio_recorder_configure_vad(AudioRecorder *recorder,
+                                   bool enabled,
+                                   int mode,
+                                   int silence_ms);
+
+/**
+ * Set the callback to invoke when VAD triggers a silence-based stop.
+ * The callback is scheduled on the GTK main thread via g_idle_add().
+ *
+ * @param recorder  AudioRecorder handle
+ * @param callback  Function to call when VAD silence triggers stop
+ * @param user_data User data passed to callback
+ */
+void audio_recorder_set_vad_stop_callback(AudioRecorder *recorder,
+                                          void (*callback)(void *user_data),
+                                          void *user_data);
+
+/*---------------------------------------------------------------------------
+ * Section 12: Ring Buffer Access
+ *---------------------------------------------------------------------------
+ * Extract captured audio from the in-memory ring buffer for transcription.
+ */
+
+/**
+ * Extract all PCM samples from the ring buffer into a contiguous array.
+ *
+ * The returned buffer is allocated with g_malloc() and must be freed by the
+ * caller using g_free(). Data is ordered from oldest to newest sample.
+ * After extraction, the ring buffer is emptied.
+ *
+ * @param recorder      AudioRecorder handle
+ * @param out_samples   Output: pointer to allocated int16_t array (set by caller to NULL)
+ * @return Number of samples extracted, or 0 if ring buffer unavailable/empty
+ */
+size_t audio_recorder_extract_samples(AudioRecorder *recorder, int16_t **out_samples);
+
+/**
+ * Trim trailing silence from a PCM sample buffer.
+ *
+ * Scans backwards from the end of the buffer in 20ms frames (320 samples
+ * at 16kHz) and removes any frames whose RMS amplitude falls below the
+ * silence threshold. This prevents whisper from receiving trailing silence
+ * (e.g., the 1-second silence period that triggers VAD auto-stop) which
+ * can cause hallucinated transcriptions.
+ *
+ * The samples array is modified in-place by reducing the sample count.
+ * The caller is responsible for freeing the buffer.
+ *
+ * @param samples      Pointer to int16_t PCM samples (16kHz, mono).
+ * @param n_samples    Initial number of samples.
+ * @param sample_rate  Sample rate in Hz (must be 16000).
+ * @return Number of non-silence samples remaining (<= n_samples).
+ */
+size_t audio_trim_trailing_silence(int16_t *samples, size_t n_samples, uint32_t sample_rate);
+
+/**
+ * Get the ring buffer associated with this recorder.
+ * Returns NULL if the recorder has no ring buffer (not started yet).
+ * The ring buffer is owned by the recorder — do not free it.
+ */
+AudioRingBuffer *audio_recorder_get_ring_buffer(const AudioRecorder *recorder);
 
 #ifdef __cplusplus
 }

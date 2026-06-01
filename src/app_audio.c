@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Piyush Raizada <piyush.raizada@gmail.com>
  *
  * This file is part of the Transcriber project.
@@ -26,6 +26,8 @@
 #include "app_audio.h"
 #include "app.h"  /* For UNUSED macro */
 #include "app_config.h"
+#include "app_vad.h"
+#include "app_ring_buffer.h"
 
 #include <glib.h>
 #include <stdio.h>
@@ -53,13 +55,32 @@ static void scrub_memory(void *ptr, size_t len) {
 }
 
 /* ===================================================================
+ * VAD Stop Callback Idle Helper
+ * =================================================================== */
+
+/* Helper struct for marshaling VAD stop callback to GTK main thread */
+typedef struct {
+    void (*callback)(void *user_data);
+    void *user_data;
+} VadStopIdleData;
+
+static gboolean g_idle_invoke_vad_stop(gpointer data) {
+    VadStopIdleData *vsd = (VadStopIdleData *)data;
+    if (vsd->callback) {
+        vsd->callback(vsd->user_data);
+    }
+    g_free(vsd);
+    return FALSE;
+}
+
+/* ===================================================================
  * Audio sample analysis helper
  * =================================================================== */
 
 /* RIFF WAV header size */
 #define WAV_HEADER_SIZE 44
 
-/* Global error string — protected by mutex for thread safety (M3-001 fix) */
+/* File-scope error string — protected by mutex for thread safety */
 static char g_audio_error[512] = {0};
 static pthread_mutex_t g_audio_error_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -83,11 +104,11 @@ AudioFormat audio_format_get_default(void) {
     fmt.sample_rate = 16000;
     fmt.channels = 1;
     fmt.bits_per_sample = 16;
-    fmt.buffer_size = 1024;
+    fmt.buffer_size = 320;  /* 20ms at 16kHz — matches WebRTC VAD frame size requirement */
     return fmt;
 }
 
-/* LOW-15 fix: Replace PACK32 macro with inline function for clarity */
+/* Inline helper for little-endian 32-bit packing */
 static inline void pack32(unsigned char *buf, uint32_t val) {
     buf[0] = (unsigned char)((val) & 0xFF);
     buf[1] = (unsigned char)(((val) >> 8) & 0xFF);
@@ -192,13 +213,12 @@ struct _AudioRecorder {
     gint wav_fd;
     FILE *wav_file;
     gsize wav_data_size;
-    /* CRIT-3 fix: Protect wav_data_size with the same mutex as wav_file
-     * to prevent data races on non-x86 architectures. */
+    /* wav_data_size protected by mutex to prevent data races */
     gboolean is_recording;
 
     pthread_t capture_thread;
     pthread_mutex_t mutex;
-    /* HI-02 + SG-01 fix: Use atomic_int for portable thread-safe stop flag */
+    /* Atomic stop flag for portable thread safety */
     atomic_int stop_flag;
 
     /* ALSA context */
@@ -208,6 +228,21 @@ struct _AudioRecorder {
     /* Protected by volume_mutex for portable thread safety (not just x86) */
     gdouble rms_volume;
     pthread_mutex_t volume_mutex;
+
+    /* VAD (Voice Activity Detection) for silence-based auto-stop */
+    VadDetector *vad_detector;       ///< VAD instance, created on start, destroyed on stop
+    gint64 last_voice_frame_time_ms; ///< Timestamp (ms) of last frame detected as voice
+    bool vad_active;                 ///< true if VAD is enabled for current recording session
+    int vad_silence_ms;              ///< Silence threshold in ms before auto-stop
+    int vad_mode;                    ///< VAD aggressiveness mode (0-3), preserved for reset
+
+    /* VAD stop callback — invoked on GTK main thread when VAD triggers silence stop.
+     * Allows the application to transition from LISTENING to TRANSCRIBING state. */
+    void (*vad_stop_callback)(void *user_data);
+    void *vad_stop_user_data;
+
+    /* In-memory ring buffer for continuous transcription (replaces WAV file) */
+    AudioRingBuffer *ring_buffer;    ///< Ring buffer, created on start
 };
 
 /* ===================================================================
@@ -234,6 +269,12 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
     snd_pcm_hw_params_alloca(&params);
     err = snd_pcm_hw_params_any(pcm, params);
     if (err < 0) {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg),
+                   "[audio] Failed to get hw params for '%s': %s",
+                   device_name, snd_strerror(err));
+        set_audio_error(msg);
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "%s\n", msg);
         snd_pcm_close(pcm);
         return false;
     }
@@ -251,9 +292,8 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
     err = snd_pcm_hw_params_set_rate_near(pcm, params, &actual_rate, 0);
     if (err < 0) { snd_pcm_close(pcm); return false; }
 
-    /* MIN-004 fix: Validate that the actual rate matches requested 16kHz.
-     * If the device cannot provide 16kHz, the WAV header would claim 16kHz
-     * but contain audio at a different rate, producing distorted playback. */
+    /* Validate that the actual rate matches requested 16kHz.
+     * Mismatched rates produce distorted audio. */
     if (actual_rate != 16000) {
         g_log("app-audio", G_LOG_LEVEL_MESSAGE, "[audio] Device '%s' provides %u Hz instead of 16000 Hz — skipping\n",
                 device_name, actual_rate);
@@ -280,7 +320,7 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
  * =================================================================== */
 
 AudioRecorder *audio_recorder_create(const AudioFormat *format) {
-    AudioRecorder *recorder = (AudioRecorder *)calloc(1, sizeof(AudioRecorder));
+    AudioRecorder *recorder = g_new0(AudioRecorder, 1);
     if (!recorder) return NULL;
 
     if (format) {
@@ -296,9 +336,22 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
     atomic_store(&recorder->stop_flag, false);
     recorder->alsa_pcm = NULL;
     recorder->rms_volume = 0.0;
-    pthread_mutex_init(&recorder->volume_mutex, NULL);
+    if (pthread_mutex_init(&recorder->volume_mutex, NULL) != 0 ||
+        pthread_mutex_init(&recorder->mutex, NULL) != 0) {
+        g_free(recorder);
+        return NULL;
+    }
 
-    pthread_mutex_init(&recorder->mutex, NULL);
+    /* VAD initialized to NULL — created on start if enabled in config */
+    recorder->vad_detector = NULL;
+    recorder->last_voice_frame_time_ms = 0;
+    recorder->vad_active = false;
+    recorder->vad_mode = 1;
+    recorder->vad_stop_callback = NULL;
+    recorder->vad_stop_user_data = NULL;
+
+    /* Ring buffer initialized to NULL — created on start */
+    recorder->ring_buffer = NULL;
 
     return recorder;
 }
@@ -331,10 +384,22 @@ void audio_recorder_destroy(AudioRecorder *recorder) {
     pthread_mutex_destroy(&recorder->volume_mutex);
     pthread_mutex_destroy(&recorder->mutex);
 
+    /* Destroy VAD detector if it was created */
+    if (recorder->vad_detector) {
+        vad_detector_destroy(recorder->vad_detector);
+        recorder->vad_detector = NULL;
+    }
+
+    /* Destroy ring buffer if it was created */
+    if (recorder->ring_buffer) {
+        ring_buffer_destroy(recorder->ring_buffer);
+        recorder->ring_buffer = NULL;
+    }
+
     scrub_memory(recorder->wav_path, sizeof(recorder->wav_path));
     scrub_memory(recorder->device, sizeof(recorder->device));
 
-    free(recorder);
+    g_free(recorder);
 }
 
 bool audio_recorder_set_device(AudioRecorder *recorder, const char *device) {
@@ -365,10 +430,16 @@ static void *capture_thread_func(void *arg) {
     gsize bytes_per_frame = recorder->format.channels * (recorder->format.bits_per_sample / 8);
     gsize buffer_bytes = recorder->format.buffer_size * bytes_per_frame;
 
-    guchar *buffer = (guchar *)malloc(buffer_bytes);
+    guchar *buffer = g_malloc(buffer_bytes);
     if (!buffer) {
         set_audio_error("Failed to allocate capture buffer");
-        /* M-008 fix: Don't set is_recording here — main thread handles it after join */
+        /* Signal failure: set is_recording=false under mutex so the main
+         * thread knows recording did not start. The main thread set
+         * is_recording=true after pthread_create(), but the thread failed
+         * before entering the capture loop. */
+        pthread_mutex_lock(&recorder->mutex);
+        recorder->is_recording = false;
+        pthread_mutex_unlock(&recorder->mutex);
         return NULL;
     }
 
@@ -400,15 +471,40 @@ static void *capture_thread_func(void *arg) {
                    "Please check your microphone configuration.",
                    last_error ? last_error : "unknown");
         set_audio_error(msg);
-        /* M-008 fix: Don't set is_recording here — main thread handles it after join */
+        /* Signal failure: set is_recording=false so the main thread knows
+         * recording did not start. Without this, is_recording remains true
+         * (set by main thread after pthread_create), blocking future starts. */
+        pthread_mutex_lock(&recorder->mutex);
+        recorder->is_recording = false;
+        pthread_mutex_unlock(&recorder->mutex);
         scrub_memory(buffer, buffer_bytes);
-        free(buffer);
+        g_free(buffer);
         return NULL;
     }
 
-    /* HI-03 fix: Device successfully opened.
-     * M-008 fix: is_recording is set to TRUE by the main thread under the mutex
+    /* Device successfully opened.
+     * is_recording is set to TRUE by the main thread under the mutex
      * in audio_recorder_start() after pthread_create() returns successfully. */
+
+    /* Initialize VAD silence timer so the first silence period doesn't
+     * trigger a false auto-stop (last_voice_frame_time_ms defaults to 0,
+     * which would make the first silence check report a huge elapsed time). */
+    /* Initialize VAD silence timer under mutex to prevent data race with
+     * audio_recorder_configure_vad() which may modify vad_active concurrently. */
+    {
+        bool vad_active_snapshot;
+        pthread_mutex_lock(&recorder->mutex);
+        vad_active_snapshot = recorder->vad_active;
+        pthread_mutex_unlock(&recorder->mutex);
+        if (vad_active_snapshot) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            pthread_mutex_lock(&recorder->mutex);
+            recorder->last_voice_frame_time_ms =
+                (gint64)now.tv_sec * 1000 + (gint64)now.tv_nsec / 1000000;
+            pthread_mutex_unlock(&recorder->mutex);
+        }
+    }
 
     /* Enter the ALSA read loop */
     int err;
@@ -416,7 +512,7 @@ static void *capture_thread_func(void *arg) {
     int read_error_count = 0;
     gsize total_frames = 0;
 
-    /* HI-02 fix: Use atomic load for the stop flag check */
+    /* Use atomic load for the stop flag check */
     while (!atomic_load(&recorder->stop_flag)) {
         err = snd_pcm_readi(recorder->alsa_pcm, buffer, recorder->format.buffer_size);
         if (err == -EPIPE) {
@@ -438,11 +534,7 @@ static void *capture_thread_func(void *arg) {
             set_audio_error("Failed to write audio data to WAV file");
             break;
         }
-        /* Protect wav_data_size with mutex for portable thread safety.
-         * Even though the main thread only reads after pthread_join, using
-         * the mutex here ensures correctness on all architectures. The mutex
-         * in start/stop protects is_recording during the capture phase,
-         * and wav_data_size concurrently. */
+        /* Protect wav_data_size with mutex for portable thread safety. */
         pthread_mutex_lock(&recorder->mutex);
         recorder->wav_data_size += (size_t)bytes_written_count;
         pthread_mutex_unlock(&recorder->mutex);
@@ -466,6 +558,98 @@ static void *capture_thread_func(void *arg) {
             pthread_mutex_unlock(&recorder->volume_mutex);
         }
 
+        /* VAD-based silence detection — auto-stop after configured silence period.
+         * Buffer size is 320 samples (20ms at 16kHz), matching WebRTC VAD frame requirements.
+         * Snapshot VAD fields under mutex to prevent data races with main thread.
+         *
+         * IMPORTANT: When VAD is active, only voice frames are written to the ring
+         * buffer. Silence frames are excluded to prevent whisper from receiving
+         * trailing silence that causes hallucinated transcriptions. The WAV file
+         * still receives all frames for debugging/fallback purposes. */
+        bool frame_is_voice = true;  /* Default: assume voice when VAD is not active */
+        {
+            bool vad_active_snapshot;
+            VadDetector *vad_detector_snapshot;
+            int vad_silence_ms_snapshot;
+            pthread_mutex_lock(&recorder->mutex);
+            vad_active_snapshot = recorder->vad_active;
+            vad_detector_snapshot = recorder->vad_detector;
+            vad_silence_ms_snapshot = recorder->vad_silence_ms;
+            pthread_mutex_unlock(&recorder->mutex);
+            if (vad_active_snapshot && vad_detector_snapshot) {
+                int num_samples = err * recorder->format.channels;
+                int16_t *samples = (int16_t *)buffer;
+                frame_is_voice = vad_process_frame(vad_detector_snapshot,
+                                                   samples,
+                                                   (size_t)num_samples,
+                                                   recorder->format.sample_rate);
+
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                gint64 current_ms = (gint64)now.tv_sec * 1000 + (gint64)now.tv_nsec / 1000000;
+
+                if (frame_is_voice) {
+                    pthread_mutex_lock(&recorder->mutex);
+                    recorder->last_voice_frame_time_ms = current_ms;
+                    pthread_mutex_unlock(&recorder->mutex);
+                } else {
+                    gint64 last_voice_time;
+                    pthread_mutex_lock(&recorder->mutex);
+                    last_voice_time = recorder->last_voice_frame_time_ms;
+                    pthread_mutex_unlock(&recorder->mutex);
+                    gint64 silence_duration = current_ms - last_voice_time;
+                    if (silence_duration >= (gint64)vad_silence_ms_snapshot) {
+                        g_log("app-audio", G_LOG_LEVEL_MESSAGE,
+                              "[vad] Silence detected for %" G_GINT64_MODIFIER "d ms — stopping recording\n",
+                              silence_duration);
+                        /* Schedule VAD stop callback on GTK main thread before exiting loop.
+                         * This ensures the application transitions to TRANSCRIBING state. */
+                        void (*stop_cb)(void *) = NULL;
+                        void *stop_user_data = NULL;
+                        pthread_mutex_lock(&recorder->mutex);
+                        stop_cb = recorder->vad_stop_callback;
+                        stop_user_data = recorder->vad_stop_user_data;
+                        pthread_mutex_unlock(&recorder->mutex);
+                        if (stop_cb) {
+                            VadStopIdleData *vsd = g_new0(VadStopIdleData, 1);
+                            vsd->callback = stop_cb;
+                            vsd->user_data = stop_user_data;
+                            g_idle_add(g_idle_invoke_vad_stop, vsd);
+                        }
+                        atomic_store(&recorder->stop_flag, true);
+                    }
+                }
+            }
+        }
+
+        /* Write to ring buffer.
+         * In continuous mode (scanner active): write ALL frames so the scanner
+         * can detect silence patterns. The scanner enforces min_segment_ms to
+         * prevent hallucinations on short clips.
+         * In on-demand mode (VAD auto-stop): only write voice frames to prevent
+         * trailing silence from being transcribed.
+         *
+         * Thread safety: recorder->ring_buffer is set once during
+         * audio_recorder_start() before pthread_create() returns, and is
+         * never modified during recording. The pthread_create() call provides
+         * a happens-before guarantee, ensuring the capture thread sees the
+         * initialized ring_buffer pointer without additional synchronization. */
+        if (recorder->ring_buffer) {
+            bool write_to_rb;
+            pthread_mutex_lock(&recorder->mutex);
+            /* In continuous mode (scanner), vad_active is false but we still
+             * need all frames. In on-demand VAD mode, vad_active is true and
+             * we filter silence. The key indicator is continuous_dictation. */
+            write_to_rb = !recorder->vad_active || frame_is_voice;
+            pthread_mutex_unlock(&recorder->mutex);
+
+            if (write_to_rb) {
+                int num_samples = err * recorder->format.channels;
+                int16_t *samples = (int16_t *)buffer;
+                ring_buffer_write(recorder->ring_buffer, samples, (size_t)num_samples);
+            }
+        }
+
         iteration++;
     }
 
@@ -476,16 +660,15 @@ static void *capture_thread_func(void *arg) {
         recorder->alsa_pcm = NULL;
     }
 
-    /* M-008 fix: Set is_recording = FALSE under mutex for thread safety.
+    /* Set is_recording = FALSE under mutex for thread safety.
      * The main thread only reads is_recording after pthread_join() returns,
-     * which provides a happens-before guarantee. The mutex here ensures
-     * correctness if any other path reads is_recording concurrently. */
+     * which provides a happens-before guarantee. */
     pthread_mutex_lock(&recorder->mutex);
     recorder->is_recording = false;
     pthread_mutex_unlock(&recorder->mutex);
 
     scrub_memory(buffer, buffer_bytes);
-    free(buffer);
+    g_free(buffer);
     return NULL;
 }
 
@@ -493,12 +676,11 @@ static void *capture_thread_func(void *arg) {
  * Recording control
  * =================================================================== */
 
-/* HIGH-5 fix: Removed misleading max_duration parameter.
- * Duration enforcement is done by the watchdog timer in main.c.
+/* Duration enforcement is done by the watchdog timer in main.c.
  * The audio module has no concept of duration limits. */
 bool audio_recorder_start(AudioRecorder *recorder) {
 
-    /* M1-003 fix: Reset any stale error before starting a new recording */
+    /* Reset any stale error before starting a new recording */
     audio_recorder_reset_error();
 
     if (!recorder) {
@@ -530,7 +712,7 @@ bool audio_recorder_start(AudioRecorder *recorder) {
     }
     g_strlcpy(recorder->wav_path, tmp_path, sizeof(recorder->wav_path));
     g_free(tmp_path);
-    /* ME-01 fix: Use owner-only permissions (0600) for privacy. */
+    /* Use owner-only permissions (0600) for privacy. */
     chmod(recorder->wav_path, 0600);
 
     recorder->wav_file = fdopen(recorder->wav_fd, "w+");
@@ -557,6 +739,15 @@ bool audio_recorder_start(AudioRecorder *recorder) {
     recorder->wav_data_size = 0;
     atomic_store(&recorder->stop_flag, false);
 
+    /* Create ring buffer for in-memory audio storage (90 seconds = 3x whisper segment limit) */
+    if (!recorder->ring_buffer) {
+        recorder->ring_buffer = ring_buffer_create(90, recorder->format.sample_rate);
+        if (!recorder->ring_buffer) {
+            g_log("app-audio", G_LOG_LEVEL_WARNING,
+                  "[audio] Failed to create ring buffer — in-memory transcription unavailable\n");
+        }
+    }
+
     int err = pthread_create(&recorder->capture_thread, NULL, capture_thread_func, recorder);
     if (err != 0) {
         char msg[512];
@@ -570,9 +761,9 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         pthread_mutex_unlock(&recorder->mutex);
         return false;
     }
-    /* MAJ-003 fix: Do NOT detach — use pthread_join() in stop() */
+    /* Do NOT detach — use pthread_join() in stop() */
 
-    /* M-008 fix: Set is_recording = TRUE under mutex AFTER successful thread creation.
+    /* Set is_recording = TRUE under mutex AFTER successful thread creation.
      * This ensures the main thread and capture thread have a consistent view of
      * the recording state, protected by the mutex. */
     recorder->is_recording = true;
@@ -586,7 +777,7 @@ bool audio_recorder_stop(AudioRecorder *recorder) {
         return false;
     }
 
-    /* M-008 fix: Check stop_flag atomically to guard against double-stop.
+    /* Check stop_flag atomically to guard against double-stop.
      * We check is_recording under the mutex below after setting the stop flag. */
 
     pthread_mutex_lock(&recorder->mutex);
@@ -597,12 +788,12 @@ bool audio_recorder_stop(AudioRecorder *recorder) {
         return false;
     }
 
-    /* HI-02 + SG-01 fix: Use atomic store for portable thread safety */
+    /* Use atomic store for portable thread safety */
     atomic_store(&recorder->stop_flag, true);
 
     pthread_mutex_unlock(&recorder->mutex);
 
-    /* MAJ-003 fix: Use pthread_join() instead of busy-wait polling */
+    /* Use pthread_join() for clean thread termination */
     void *thread_result = NULL;
     int join_err = pthread_join(recorder->capture_thread, &thread_result);
     if (join_err != 0) {
@@ -612,15 +803,21 @@ bool audio_recorder_stop(AudioRecorder *recorder) {
     /* Finalize WAV header and close file before clearing is_recording.
      * The capture thread sets is_recording=FALSE under mutex, but we must
      * finalize the WAV file first. */
+    /* Read wav_data_size under mutex to prevent data race with capture thread */
+    gsize final_data_size;
+    pthread_mutex_lock(&recorder->mutex);
+    final_data_size = recorder->wav_data_size;
+    pthread_mutex_unlock(&recorder->mutex);
+
     if (recorder->wav_file) {
-        audio_format_finalize_wav_header(recorder->wav_file, recorder->wav_data_size);
+        audio_format_finalize_wav_header(recorder->wav_file, final_data_size);
         fflush(recorder->wav_file);
 
         /* Close the file so data is fully flushed to disk and handle is released */
         fclose(recorder->wav_file);
         recorder->wav_file = NULL;
         recorder->wav_fd = -1;
-        /* ME-01 fix: Use owner-only permissions (0600) for privacy. */
+        /* Use owner-only permissions (0600) for privacy. */
         chmod(recorder->wav_path, 0600);
     }
 
@@ -637,7 +834,7 @@ const char *audio_recorder_get_wav_path(const AudioRecorder *recorder) {
 }
 
 const char *audio_recorder_get_error(void) {
-    /* HI-05 fix: Lock mutex, copy to thread-local buffer, unlock, then return.
+    /* Lock mutex, copy to thread-local buffer, unlock, then return.
      * This ensures the returned pointer is stable regardless of concurrent writes. */
     static __thread char local_buffer[512] = {0};
     pthread_mutex_lock(&g_audio_error_mutex);
@@ -713,7 +910,14 @@ AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
             continue;
         }
 
-        /* Only show direct hardware devices (hw: prefix) — skip plugins/virtual */
+        /* Only show direct hardware devices (hw: prefix) — skip plugins/virtual.
+         * Rationale: ALSA plugin devices (e.g., "default", "plug:", "surround:")
+         * go through the ALSA plugin chain which can introduce latency, resampling,
+         * or channel remapping that breaks the 16kHz mono PCM requirement for
+         * whisper.cpp. Direct hw: devices provide raw hardware access with
+         * predictable format. Users with PipeWire/PulseAudio should ensure their
+         * hw: devices are properly routed. The "default" virtual device is still
+         * available as a fallback in the config dialog device list. */
         if (strncmp(name, "hw:", 3) != 0) {
             free(name);
             free(desc);
@@ -814,11 +1018,9 @@ void audio_device_list_free(AudioDeviceList *list) {
 
 double audio_recorder_get_volume_level(const AudioRecorder *recorder) {
     if (!recorder) return 0.0;
-    /* FIX: Use dedicated volume_mutex for portable thread safety.
-     * Previously relied on x86 double-width atomic loads via volatile,
-     * which is not portable to ARM or other architectures.
-     * Note: const-cast is safe here — mutex lock/unlock does not logically
-     * modify the recorder state, it only provides synchronization. */
+    /* Use dedicated volume_mutex for portable thread safety.
+      * Note: const-cast is safe here — mutex lock/unlock does not logically
+      * modify the recorder state, it only provides synchronization. */
     AudioRecorder *nonconst = (AudioRecorder *)recorder;
     double vol;
     pthread_mutex_lock(&nonconst->volume_mutex);
@@ -826,3 +1028,124 @@ double audio_recorder_get_volume_level(const AudioRecorder *recorder) {
     pthread_mutex_unlock(&nonconst->volume_mutex);
     return vol;
 }
+
+/* ===================================================================
+ * VAD Configuration
+ * =================================================================== */
+
+void audio_recorder_configure_vad(AudioRecorder *recorder,
+                                  bool enabled,
+                                  int mode,
+                                  int silence_ms)
+{
+    if (!recorder) return;
+
+    pthread_mutex_lock(&recorder->mutex);
+
+    // Destroy existing VAD detector if changing config
+    if (recorder->vad_detector) {
+        vad_detector_destroy(recorder->vad_detector);
+        recorder->vad_detector = NULL;
+    }
+
+    recorder->vad_active = false;
+    recorder->vad_silence_ms = 1000;  // default
+
+    if (enabled && mode >= 0 && mode <= 3 && silence_ms >= 500 && silence_ms <= 5000) {
+        recorder->vad_mode = mode;  /* Store mode for reset */
+        recorder->vad_detector = vad_detector_create((VadMode)mode);
+        if (recorder->vad_detector) {
+            recorder->vad_active = true;
+            recorder->vad_silence_ms = silence_ms;
+            g_log("app-audio", G_LOG_LEVEL_MESSAGE,
+                  "[vad] VAD enabled: mode=%d, silence=%dms\n", mode, silence_ms);
+        } else {
+            g_log("app-audio", G_LOG_LEVEL_WARNING,
+                  "[vad] Failed to create VAD detector — VAD disabled\n");
+        }
+    }
+pthread_mutex_unlock(&recorder->mutex);
+}
+
+AudioRingBuffer *audio_recorder_get_ring_buffer(const AudioRecorder *recorder)
+{
+    if (!recorder) return NULL;
+    /* Ring buffer is set during start() and never modified during recording.
+     * The pthread_create() in start() provides happens-before guarantee. */
+    return recorder->ring_buffer;
+}
+
+/**
+ * Set the callback to invoke when VAD triggers a silence-based stop.
+ * The callback is scheduled on the GTK main thread via g_idle_add().
+ */
+void audio_recorder_set_vad_stop_callback(AudioRecorder *recorder,
+                                          void (*callback)(void *user_data),
+                                          void *user_data)
+{
+    if (!recorder) return;
+    pthread_mutex_lock(&recorder->mutex);
+    recorder->vad_stop_callback = callback;
+    recorder->vad_stop_user_data = user_data;
+    pthread_mutex_unlock(&recorder->mutex);
+}
+
+/* ===================================================================
+ * Ring Buffer Extraction
+ * =================================================================== */
+
+size_t audio_recorder_extract_samples(AudioRecorder *recorder, int16_t **out_samples)
+{
+    if (!recorder || !out_samples || !recorder->ring_buffer) {
+        if (out_samples) *out_samples = NULL;
+        return 0;
+    }
+    return ring_buffer_extract_all(recorder->ring_buffer, out_samples);
+}
+
+/* Trim trailing silence from PCM samples.
+ * Scans backwards in 20ms frames and removes frames below RMS threshold.
+ * Returns the trimmed sample count. */
+size_t audio_trim_trailing_silence(int16_t *samples, size_t n_samples, uint32_t sample_rate)
+{
+    if (!samples || n_samples == 0 || sample_rate == 0) return n_samples;
+
+    /* Frame size: 20ms at the given sample rate */
+    size_t frame_size = sample_rate / 50;  /* 16000/50 = 320 samples */
+    if (frame_size == 0) frame_size = 1;
+
+    /* Silence threshold: RMS amplitude below this is considered silence.
+     * 100 out of 32768 full scale ≈ -90 dB, well below speech levels. */
+    const double silence_threshold = 100.0;
+
+    size_t remaining = n_samples;
+
+    while (remaining >= frame_size) {
+        /* Calculate RMS of the last frame */
+        size_t frame_start = remaining - frame_size;
+        double sum_squares = 0.0;
+        for (size_t i = frame_start; i < remaining; i++) {
+            double val = (double)samples[i];
+            sum_squares += val * val;
+        }
+        double rms = sqrt(sum_squares / frame_size);
+
+        if (rms < silence_threshold) {
+            /* This frame is silence — trim it */
+            remaining -= frame_size;
+        } else {
+            /* Found a non-silent frame — stop trimming */
+            break;
+        }
+    }
+
+    if (remaining < n_samples) {
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE,
+              "[audio] Trimmed trailing silence: %zu -> %zu samples (%.1f seconds removed)\n",
+              n_samples, remaining,
+              (double)(n_samples - remaining) / (double)sample_rate);
+    }
+
+    return remaining;
+}
+
