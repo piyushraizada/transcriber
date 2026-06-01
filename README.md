@@ -3,6 +3,7 @@
 Transcriber is a lightweight, offline voice-to-text application for Linux desktops. It allows users to capture audio from their microphone and transcribe it into text locally on their own machine, ensuring privacy and removing the need for an internet connection.
 
 ### Core Functionality
+*   **Continuous VAD-Driven Transcription:** Records audio continuously and automatically segments speech at natural silence boundaries using Voice Activity Detection (VAD). Each speech segment is transcribed asynchronously while recording continues, enabling seamless, hands-free transcription.
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
 *   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard.
@@ -158,7 +159,7 @@ Or after installation:
 transcriber
 ```
 
-The application will appear as a microphone icon in your system tray. Click the icon to start recording, click again to stop and transcribe.
+The application will appear as a microphone icon in your system tray. Click the icon to start continuous recording. A Voice Activity Detector (VAD) monitors the audio stream in real-time and automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues. Click the icon again or use the global hotkey to stop recording and trigger the final transcription of any remaining audio.
 
 ## Configuration
 
@@ -166,7 +167,10 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 
 - **Model path** — path to a GGML Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`)
 - **Audio device** — ALSA capture device (default: system default)
-- **Max session duration** — maximum recording time in seconds (default: 30, range: 5–30)
+- **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 60, range: 5–120)
+- **VAD enabled** — enable or disable Voice Activity Detection (default: `true`)
+- **VAD mode** — sensitivity mode: `high`, `medium`, `low`, or `very_low` (default: `high`)
+- **VAD silence timeout** — silence duration in seconds that triggers segment segmentation (default: 1.5, range: 0.5–5.0)
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 
 A configuration dialog is available from the system tray context menu or the gear icon in the main window's status bar.
