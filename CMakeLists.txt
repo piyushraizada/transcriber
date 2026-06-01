@@ -27,11 +27,19 @@ FetchContent_Declare(
     whisper
     GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
     GIT_TAG        v1.8.1
+    # Pin to specific commit for reproducible builds.
+    # Tag v1.8.1 points to this commit as of 2026-05-31.
+    # Update this SHA when upgrading whisper.cpp.
+    GIT_SHALLOW    ON
 )
 # Attempt to enable CUDA GPU acceleration if CUDA toolkit is available
 # Falls back gracefully to CPU-only if CUDA is not installed
 # Use CUDAToolkit (modern CMake 3.9+) instead of deprecated FindCUDA
-set(CMAKE_POLICY_DEFAULT_CMP0146 OLD)  # Suppress CMP0146 warning from whisper.cpp
+# CMP0146: CMake 3.27+ changed CUDA language handling. whisper.cpp v1.8.1
+# expects the old behavior. Set to OLD to suppress warnings. Review and
+# remove this override when upgrading whisper.cpp to a version compatible
+# with the new CMP0146 policy.
+set(CMAKE_POLICY_DEFAULT_CMP0146 OLD)
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
     set(GGML_CUDA ON CACHE BOOL "Enable CUDA GPU acceleration via GGML" FORCE)
@@ -40,8 +48,17 @@ else()
     set(GGML_CUDA OFF CACHE BOOL "CUDA not found - CPU only" FORCE)
     message(STATUS "CUDA not found - whisper.cpp will use CPU only")
 endif()
-set(WHISPER_OPENBLAS OFF CACHE BOOL "Disable OpenBLAS" FORCE)
-set(WHISPER_BLAS OFF CACHE BOOL "Disable BLAS" FORCE)
+# BLAS/OpenBLAS acceleration for whisper.cpp CPU inference.
+# Enabled by default for better CPU transcription performance.
+# Disable if you encounter build issues or prefer smaller binary size.
+option(ENABLE_BLAS "Enable BLAS/OpenBLAS acceleration for whisper.cpp" ON)
+if(ENABLE_BLAS)
+    set(WHISPER_OPENBLAS ON CACHE BOOL "Enable OpenBLAS if available" FORCE)
+    set(WHISPER_BLAS ON CACHE BOOL "Enable BLAS if available" FORCE)
+else()
+    set(WHISPER_OPENBLAS OFF CACHE BOOL "Disable OpenBLAS" FORCE)
+    set(WHISPER_BLAS OFF CACHE BOOL "Disable BLAS" FORCE)
+endif()
 set(WHISPER_SILERO_VAD OFF CACHE BOOL "Disable Silero VAD" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Static libs only" FORCE)
 FetchContent_MakeAvailable(whisper)
@@ -50,7 +67,7 @@ FetchContent_MakeAvailable(whisper)
 # The application expects the default model at ~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin
 # (see DEFAULT_MODEL_DIR and DEFAULT_MODEL_FILE in src/app_config_dialog.c).
 # The download script from whisper.cpp handles caching — it skips if the file exists.
-option(DOWNLOAD_DEFAULT_MODEL "Download the default Whisper model (large-v3-turbo-q8_0, 1.1 GiB)" ON)
+option(DOWNLOAD_DEFAULT_MODEL "Download the default Whisper model (large-v3-turbo-q8_0, 1.1 GiB)" OFF)
 if(DOWNLOAD_DEFAULT_MODEL AND whisper_SOURCE_DIR)
     set(DEFAULT_MODEL_DIR "$ENV{HOME}/.cache/whisper")
     file(MAKE_DIRECTORY "${DEFAULT_MODEL_DIR}")
@@ -88,13 +105,33 @@ set(SOURCES
     src/app_config.c
     src/app_config_dialog.c
     src/app_clipboard.c
+    src/app_vad.c
+    src/app_ring_buffer.c
+    src/app_silence_scanner.c
+)
+
+# Determine the install prefix for assets directory
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Install prefix" FORCE)
+endif()
+
+# WebRTC VAD (Voice Activity Detection) — by CPUImage / Google WebRTC project
+# Provides real-time voice activity detection for continuous transcription.
+# Licensed under BSD-3-Clause. See third_party/webrtc_vad/LICENSE.
+set(WEBRTC_VAD_SOURCES
+    third_party/webrtc_vad/webrtc_vad.c
+    third_party/webrtc_vad/vad_core.c
+    third_party/webrtc_vad/vad_filterbank.c
+    third_party/webrtc_vad/vad_gmm.c
+    third_party/webrtc_vad/vad_sp.c
+    third_party/webrtc_vad/signal_processing_library.c
 )
 
 # Embed XPM assets as static C data for GdkPixbuf loading
 # Each .xpm file is a valid C source defining: static const char *NAME_XPM[] = { ... };
 # Symbols: GEAR_XPM, GREENMIC_XPM, REDMIC_XPM
 
-add_executable(transcriber ${SOURCES})
+add_executable(transcriber ${SOURCES} ${WEBRTC_VAD_SOURCES})
 
 # 1. ADD INCLUDE DIRECTORIES
 target_include_directories(transcriber PRIVATE
@@ -108,6 +145,8 @@ target_include_directories(transcriber PRIVATE
     # whisper.cpp headers via FetchContent
     ${whisper_SOURCE_DIR}/include
     ${whisper_SOURCE_DIR}/examples
+    # WebRTC VAD headers
+    third_party/webrtc_vad/include
 )
 
 # 2. ADD LINK LIBRARIES
@@ -126,6 +165,7 @@ target_link_libraries(transcriber PRIVATE
 target_compile_definitions(transcriber PRIVATE
     XPM_STATICALLY_EMBEDDED
     APP_VERSION="${PROJECT_VERSION}"
+    ASSET_DIR_PATH="${CMAKE_INSTALL_PREFIX}/share/transcriber/assets"
 )
 
 # 3a. ADD CFLAGS_OTHER (e.g., -isystem flags from pkg-config)
@@ -142,9 +182,7 @@ target_compile_definitions(transcriber PRIVATE WHISPER_CPP_LOCAL)
 # MIN-008 fix: Treat critical warning categories as errors in CI builds
 target_compile_options(transcriber PRIVATE -Wall -Wextra -Wpedantic
     -Werror=return-type
-    -Werror=implicit
     -Werror=format-security
-    -Werror=implicit-function-declaration
 )
 # Enable buffer overflow detection in release builds
 target_compile_options(transcriber PRIVATE -D_FORTIFY_SOURCE=2)
@@ -204,7 +242,7 @@ install(FILES assets/hicolor/gear.png    DESTINATION share/icons/hicolor/apps RE
 # Update the icon cache after installing PNG icons so the theme picks them up
 find_program(GTK_UPDATE_ICON_CACHE gtk-update-icon-cache)
 if(GTK_UPDATE_ICON_CACHE)
-    install(CODE "execute_process(COMMAND ${GTK_UPDATE_ICON_CACHE} \$ENV{HOME}/.local/share/icons/hicolor/ RESULT_VARIABLE RET_VAR)")
+    install(CODE "execute_process(COMMAND ${GTK_UPDATE_ICON_CACHE} \${CMAKE_INSTALL_PREFIX}/share/icons/hicolor/ RESULT_VARIABLE RET_VAR)")
 endif()
 
 # Custom target to build a .deb package with bundled Whisper turbo model

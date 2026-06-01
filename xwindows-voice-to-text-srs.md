@@ -1,8 +1,8 @@
 # Software Requirements Specification (SRS)
 ## X-Windows Voice-to-Text Application
 
-**Document Version:** 2.3
-**Date:** 2026-05-25
+**Document Version:** 2.5
+**Date:** 2026-05-31
 **Author:** System Architecture Team
 **Status:** Production-Ready
 
@@ -10,6 +10,8 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.5 | 2026-05-31 | Updated constants to match implementation: max_duration default 60s (was 30s), range 5-120 (was 5-30), vad_silence_ms range 500-5000 (was 500-3000), config key vad_silence_ms (was vad_silence_timeout_ms), VAD mode labels updated to match UI, audio buffer size 320 (was 1024), silence timeout UI uses seconds (was ms), removed Session Duration field (not in implementation), removed max_session_minutes config parameter |
+| 2.4 | 2026-05-30 | Augmented transcription behavior with VAD-driven continuous segmentation: audio recording is monitored in real-time by a Voice Activity Detector that automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues |
 | 2.3 | 2026-05-30 | Added requirements for: D-Bus Activation Service File (DEPLOY-009), Hicolor Icon Theme Assets (DEPLOY-010), Debian Packaging (DEPLOY-011 through DEPLOY-017), Model Download Script (DEPLOY-018), Desktop Entry File (DEPLOY-019), updated Table of Contents and traceability matrix |
 | 2.2 | 2026-05-30 | Updated to match actual implementation: D-Bus Toggle returns boolean (was "no return value"), GDBus native main loop integration (was timer-based polling), FR-039 uses gdk_display_beep() (was ASCII BEL), FR-041 uses g_log() with snd_strerror(), WHISPER-013 parses GGUF/GGML headers directly (was loading full model), DEP-010 uses volatile pointer loop (was explicit_bzero), CFG-014 max clamped to 30 (was 120), added CFG-TEXT-001 (append mode), added build system options table, added tray sine wave animation docs, added UNUSED macro to app.h, standardized _POSIX_C_SOURCE to 200809L, added ENABLE_LTO option |
 | 2.1 | 2026-05-25 | Added requirements for: Volume Level Monitoring (FR-051, UI-028, AUD-016), Audio Device Display Name (CFG-AUDIO-002), Loading State Indicator (UI-023), Transcription Watchdog (NR-019 updated), Model Loading Background Thread (WHISPER-014), GPU Discovery Module (FR-049d), enhanced Model Metadata Extraction (WHISPER-013) |
@@ -26,19 +28,20 @@
 4. [Non-Functional Requirements](#4-non-functional-requirements)
 5. [Audio Capture Pipeline](#5-audio-capture-pipeline)
 6. [Local Whisper Integration (whisper.cpp)](#6-local-whisper-integration-whispercpp)
-7. [X-Windows UI Components](#7-x-windows-ui-components)
-8. [Hotkey Integration](#8-hotkey-integration)
-9. [Configuration Management](#9-configuration-management)
-10. [Error Handling and Fallbacks](#10-error-handling-and-fallbacks)
-11. [Dependency Specifications](#11-dependency-specifications)
-12. [Deployment and Startup Procedures](#12-deployment-and-startup-procedures)
-   - [12.4 D-Bus Activation Service File](#124-d-bus-activation-service-file)
-   - [12.5 Desktop Entry File](#125-desktop-entry-file)
-   - [12.6 Hicolor Icon Theme Assets](#126-hicolor-icon-theme-assets)
-   - [12.7 Debian Package Distribution](#127-debian-package-distribution)
-   - [12.8 Model Download Script](#128-model-download-script)
-13. [Testing and Validation Criteria](#13-testing-and-validation-criteria)
-14. [Appendix](#14-appendix)
+7. [Voice Activity Detection (VAD)](#7-voice-activity-detection-vad)
+8. [X-Windows UI Components](#8-x-windows-ui-components)
+9. [Hotkey Integration](#9-hotkey-integration)
+10. [Configuration Management](#10-configuration-management)
+11. [Error Handling and Fallbacks](#11-error-handling-and-fallbacks)
+12. [Dependency Specifications](#12-dependency-specifications)
+13. [Deployment and Startup Procedures](#13-deployment-and-startup-procedures)
+    - [13.4 D-Bus Activation Service File](#134-d-bus-activation-service-file)
+    - [13.5 Desktop Entry File](#135-desktop-entry-file)
+    - [13.6 Hicolor Icon Theme Assets](#136-hicolor-icon-theme-assets)
+    - [13.7 Debian Package Distribution](#137-debian-package-distribution)
+    - [13.8 Model Download Script](#138-model-download-script)
+14. [Testing and Validation Criteria](#14-testing-and-validation-criteria)
+15. [Appendix](#15-appendix)
 
 ---
 
@@ -46,7 +49,7 @@
 
 ### 1.1 Purpose
 
-This document specifies the Software Requirements Specification (SRS) for a GTK3-based voice-to-text application. The application provides a graphical interface with a microphone icon that, when clicked, captures audio from a configured microphone (system default or user-selected), transcribes it using a local Whisper model via the whisper.cpp library (fully offline, no network required), and displays the transcribed text in a persistent, lightweight text area attached to the application window. The text area allows users to view, edit, and copy the transcribed text to the system clipboard for use in other applications.
+This document specifies the Software Requirements Specification (SRS) for a GTK3-based voice-to-text application. The application provides a graphical interface with a microphone icon that, when clicked, captures audio from a configured microphone (system default or user-selected) and performs continuous VAD-driven transcription using a local Whisper model via the whisper.cpp library (fully offline, no network required). During recording, a Voice Activity Detector (VAD) monitors the audio stream in real-time and automatically segments speech at natural silence boundaries. Each speech segment is transcribed asynchronously while recording continues, with results appended to a persistent text area attached to the application window. The text area allows users to view, edit, and copy the transcribed text to the system clipboard for use in other applications.
 
 ### 1.2 Scope
 
@@ -56,13 +59,14 @@ The X-Windows voice-to-text application provides:
 - Click-to-start listening functionality, changing to greenmic.xpm icon
 - Animated sine wave visualization over the microphone icon during recording
 - Persistent, lightweight text area attached to the application window for displaying transcribed text
-- Configurable maximum transcription sessions (default: 30 seconds, range: 5-30) with user-initiated stop capability
+- VAD-driven continuous transcription that automatically segments speech at natural silence boundaries
+- Configurable maximum segment duration (default: 60 seconds) that forces segmentation during continuous speech
 - Local Whisper model integration via whisper.cpp (fully offline, no network required)
 - GPU (CUDA) acceleration support with automatic CPU fallback
 - GGML model file management with metadata extraction (model name, quantization, multilingual support)
 - System clipboard integration (via GTK3) for copied text that can be pasted into other applications
-- Configuration UI for model path, microphone selection, and more
-- Manual stop with final transcription of remaining audio
+- Configuration UI for model path, microphone selection, VAD settings, and more
+- Manual stop (click mic or D-Bus toggle) with final transcription of remaining audio
 - In-place editing of transcribed text before copying
 - Automatic return to redmic.xpm icon after transcription completes or session ends
 - Global hotkey support via OS or window manager for toggling recording without clicking the window
@@ -83,6 +87,8 @@ The X-Windows voice-to-text application provides:
 | Hotkey | A global keyboard shortcut configured in the OS or window manager that triggers a command or action in the application |
 | D-Bus | Desktop Bus — an inter-process communication system used on Linux desktops |
 | System Tray | Notification area icon provided via libappindicator (Ayatana fork) with state-aware icon and context menu |
+| VAD | Voice Activity Detection — real-time analysis of audio to distinguish speech from silence, used to automatically segment continuous recording into transcribable clips |
+| Speech Segment | A contiguous portion of recorded audio bounded by silence gaps (detected by VAD) or the maximum segment duration timer, processed as a single transcription unit |
 
 ### 1.4 Document Conventions
 
@@ -94,6 +100,7 @@ The X-Windows voice-to-text application provides:
 - **HK-XXX**: Hotkey Requirement
 - **CFG-XXX**: Configuration Requirement
 - **ERR-XXX**: Error Handling Requirement
+- **VAD-XXX**: Voice Activity Detection Requirement
 - **DEP-XXX**: Dependency Requirement
 - **DEPLOY-XXX**: Deployment Requirement
 - **TEST-XXX**: Testing Requirement
@@ -106,14 +113,15 @@ This document is organized by functional areas:
 - Section 4: Non-Functional Requirements
 - Section 5: Audio Capture Pipeline
 - Section 6: Whisper Integration (whisper.cpp)
-- Section 7: X-Windows UI Components
-- Section 8: Hotkey Integration
-- Section 9: Configuration Management
-- Section 10: Error Handling
-- Section 11: Dependencies
-- Section 12: Deployment
-- Section 13: Testing
-- Section 14: Appendix
+- Section 7: Voice Activity Detection (VAD)
+- Section 8: X-Windows UI Components
+- Section 9: Hotkey Integration
+- Section 10: Configuration Management
+- Section 11: Error Handling
+- Section 12: Dependencies
+- Section 13: Deployment
+- Section 14: Testing
+- Section 15: Appendix
 
 The application supports global hotkey activation for starting and stopping transcription, triggered by the operating system or desktop environment. The hotkey is configured externally (not within the application) via desktop environment tools. The application exposes a D-Bus method for toggling transcription, which the OS hotkey action can invoke via `dbus-send`.
 
@@ -127,14 +135,14 @@ The application is built on a multi-threaded architecture managed by a **Central
 
 | Thread | Responsibility | Key Operations |
 |--------|---------------|----------------|
-| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC via GDBus (GIO) integrated into the GLib main loop, system tray icon updates via libappindicator |
-| **Audio Thread** | Real-time PCM capture | Captures audio from ALSA using real-time priority scheduling. Writes raw PCM frames to a temporary WAV file. Suspended in `STATE_IDLE`, active in `STATE_LISTENING`. |
-| **Transcription Thread** | Local whisper.cpp model processing | Loads GGML model file, reads WAV samples, runs `whisper_full()` for local transcription. Supports GPU (CUDA) acceleration with CPU fallback. Active only in `STATE_TRANSCRIBING`. |
+| **Presentation Thread (Main)** | GTK main loop, UI rendering, D-Bus IPC | GTK main loop (`gtk_main()`), window management (GTK handles WM hints automatically), rendering (GdkPixbuf icons, Cairo drawing for sine wave animation), D-Bus IPC via GDBus (GIO) integrated into the GLib main loop, system tray icon updates via libappindicator, manages segment flush callbacks and transcription result display |
+| **Audio Thread** | Real-time PCM capture + VAD analysis | Captures audio from ALSA using real-time priority scheduling. Writes raw PCM frames to a temporary WAV file. Runs VAD analysis on each captured frame inline to detect speech/silence boundaries. Suspended in `STATE_IDLE`, active in `STATE_LISTENING`. |
+| **Transcription Thread(s)** | Local whisper.cpp model processing | Loads GGML model file, reads WAV samples, runs `whisper_full()` for local transcription. Supports GPU (CUDA) acceleration with CPU fallback. Multiple transcription threads may run concurrently during `STATE_LISTENING` (one per speech segment). Final transcription runs during `STATE_TRANSCRIBING`. |
 
 **Design Rationale:**
-- The Audio Thread runs independently to guarantee real-time capture without being blocked by GTK rendering or transcription processing.
-- The Transcription Thread isolates blocking whisper.cpp model processing from the Presentation Thread, preventing UI freezes during local transcription.
-- The Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch, enabling responsive hotkey toggling without a dedicated D-Bus thread.
+- The Audio Thread runs independently to guarantee real-time capture without being blocked by GTK rendering or transcription processing. VAD analysis runs inline in this thread to avoid introducing additional latency.
+- Transcription Threads isolate blocking whisper.cpp model processing from both the Presentation Thread and Audio Thread, preventing UI freezes and capture drops during local transcription. Multiple transcription threads may run concurrently during `STATE_LISTENING` as VAD detects speech segments.
+- The Presentation Thread concurrently polls D-Bus messages using a `g_timeout_source_new(100)` timer-based dispatch, enabling responsive hotkey toggling without a dedicated D-Bus thread. It also handles segment flush callbacks marshaled from the Audio Thread via `g_idle_add()`.
 - The Central State Controller ensures thread-safe state transitions using mutex-protected state variables.
 - No network thread is required since all transcription is performed locally via whisper.cpp.
 
@@ -189,6 +197,8 @@ The Central State Controller manages a finite state machine with three distinct 
 
 ```
 STATE_IDLE --> STATE_LISTENING --> STATE_TRANSCRIBING --> STATE_IDLE
+
+**Note:** During `STATE_LISTENING`, VAD-driven speech segmentation triggers asynchronous transcription of individual speech segments. These mid-recording transcriptions do not change the application state — the application remains in `STATE_LISTENING` while segments are transcribed in the background. Only user-initiated stop or session timeout transitions to `STATE_TRANSCRIBING` for the final segment.
 ```
 
 **State Descriptions:**
@@ -203,26 +213,28 @@ STATE_IDLE --> STATE_LISTENING --> STATE_TRANSCRIBING --> STATE_IDLE
   - **Presentation Thread**: Main window displays `greenmic.xpm` with active sine wave overlay animation. System tray icon shows green mic with "Recording..." tooltip.
   - **Audio Thread**: Active. Capturing real-time PCM from ALSA, writing to temporary WAV file (created via `mkstemp()` in `$XDG_RUNTIME_DIR` or `/tmp/`).
   - **Transcription Thread**: Idle.
-  - **Watchdog Timer**: A configurable watchdog timer (default: 30 seconds, range: 5-30 seconds) limits maximum capture duration. On timeout, automatic transition to `STATE_TRANSCRIBING`.
-  - **Atomic Sequence Counter**: The Central State Controller must implement an atomic sequence counter or cancellation token for state transitions. When the user initiates a stop (manual or via hotkey), the watchdog timer must be cleanly invalidated before the WAV file handle is closed, preventing race conditions where both threads attempt to transition to `STATE_TRANSCRIBING` simultaneously.
+  - **Segment Flush Timer**: A configurable timer (default: 60 seconds, range: 5-120 seconds) limits maximum speech segment duration. On timeout, the current audio segment is flushed to whisper for transcription and a new segment begins. The timer resets after each flush. This prevents oversized transcription clips during continuous speech without silence gaps.
+  - **VAD Speech Segmentation**: The Voice Activity Detector (WebRTC VAD) analyzes each audio frame in real-time. When silence is detected for a configurable duration (default: 1000 ms), the current audio segment is flushed to whisper for transcription and a new segment begins. The segment flush timer resets after each VAD-triggered flush.
+  - **Mid-Recording Transcription**: Speech segments flushed during `STATE_LISTENING` are transcribed asynchronously in background threads. Transcription results are appended to the TextWindow and clipboard without changing application state.
+  - **Atomic Sequence Counter**: The Central State Controller must implement an atomic sequence counter or cancellation token for state transitions. When the user initiates a stop (manual or via hotkey), all timers must be cleanly invalidated before the WAV file handle is closed, preventing race conditions where both threads attempt to transition to `STATE_TRANSCRIBING` simultaneously.
   - **Entry Trigger**: Mouse click on microphone icon in `STATE_IDLE`, D-Bus `Toggle` method call, or system tray context menu "Toggle Recording".
-  - **Exit Trigger**: User click to stop, D-Bus `Toggle` call, or watchdog timeout.
+  - **Exit Trigger**: User click to stop, D-Bus `Toggle` call, or session duration timeout.
 
 - **`STATE_TRANSCRIBING`**:
   - **Presentation Thread**: Main window displays `greenmic.xpm` (sine wave animation stopped). System tray icon shows green mic with "Transcribing..." tooltip.
   - **Audio Thread**: WAV file closed. No further writes.
-  - **Transcription Thread**: Active. Loads GGML model (if not already loaded), reads WAV samples, runs `whisper_full()` for local transcription via whisper.cpp. Supports GPU (CUDA) acceleration with automatic CPU fallback.
+  - **Transcription Thread**: Active. Loads GGML model (if not already loaded), reads WAV samples, runs `whisper_full()` for local transcription via whisper.cpp. Supports GPU (CUDA) acceleration with automatic CPU fallback. This is the final transcription after user-initiated stop or session timeout.
   - **Post-Transcription Actions**:
     1. Transcribed text sent to `TextWindow` for display.
     2. Clipboard selections (PRIMARY and CLIPBOARD) populated with transcribed text via GTK3 clipboard APIs.
     3. Temporary WAV file unlinked and deleted.
-    5. Raw PCM memory buffers freed prior to returning to `STATE_IDLE`.
-    6. Reverts to `STATE_IDLE`.
-  - **Entry Trigger**: Exit from `STATE_LISTENING` (user stop or watchdog timeout).
+    4. Raw PCM memory buffers freed prior to returning to `STATE_IDLE`.
+    5. Reverts to `STATE_IDLE`.
+  - **Entry Trigger**: Exit from `STATE_LISTENING` (user stop or session duration timeout).
 
 State transitions may be triggered by mouse click on the microphone icon **or** by the OS hotkey toggle interface (D-Bus `Toggle` method).
 
-### 2.3 Component Interactions
+### 2.4 Component Interactions
 
 ```mermaid
 sequenceDiagram
@@ -249,9 +261,9 @@ sequenceDiagram
     WIN->>TRAY: Update icon to red mic
 ```
 
-### 2.4 GTK3 Integration
+### 2.5 GTK3 Integration
 
-#### 2.4.1 MainWindow — GTK3 Design
+#### 2.5.1 MainWindow — GTK3 Design
 
 The MainWindow is the primary application window hosting the microphone icon, sine wave animation, and status bar.
 
@@ -274,7 +286,7 @@ The MainWindow is the primary application window hosting the microphone icon, si
     - **Yellow/Blinking** = Model verification check in progress (manual or automatic).
     - The indicator is clickable: clicking while in Red state triggers a manual model file verification; clicking while in Green state is ignored or silently re-verifies without visual disruption.
 
-#### 2.4.2 TextWindow — GTK3 Design
+#### 2.5.2 TextWindow — GTK3 Design
 
 The TextWindow is an independent GTK window for displaying transcribed text, created as a transient utility window.
 
@@ -290,14 +302,14 @@ The TextWindow is an independent GTK window for displaying transcribed text, cre
   - The handler calls `gtk_widget_hide()` (hide, not destroy), preserving the window and its content for future reuse.
   - Window is re-shown via `gtk_widget_show()` when new transcription text arrives.
 
-#### 2.4.3 Clipboard Integration
+#### 2.5.3 Clipboard Integration
 - **PRIMARY Selection**: GTK clipboard with `GDK_SELECTION_PRIMARY` (middle-click paste on X11)
 - **CLIPBOARD**: GTK clipboard with `GDK_SELECTION_CLIPBOARD` (Ctrl+V paste)
 - **Format**: Plain text UTF-8
 - **API**: `gtk_clipboard_set_text()`, `gtk_clipboard_wait_for_text()`, `gtk_clipboard_owner_set()`
 - **Population**: Both selections populated automatically after transcription completes in `STATE_TRANSCRIBING`
 
-### 2.5 Hotkey Event Flow — D-Bus Integration
+### 2.6 Hotkey Event Flow — D-Bus Integration
 
 The application exposes a D-Bus toggle interface that can be invoked by the OS or window manager when the user presses a configured global hotkey:
 
@@ -350,19 +362,19 @@ The application shall start recording audio when the user clicks the `assets/red
 **Traceability**: FR-005 → AUD-001
 
 #### FR-006: Toggle Behavior
-The application shall implement toggle behavior: first click on `assets/redmic.xpm` starts a 30-second recording session and changes the icon to `assets/greenmic.xpm`, second click stops and returns the complete transcription of the recorded audio. The transcribed text shall be displayed in a persistent text area attached to the application window. After transcription completes, the icon shall return to `assets/redmic.xpm`.
+The application shall implement toggle behavior: first click on `assets/redmic.xpm` starts a continuous recording session with VAD-driven speech segmentation and changes the icon to `assets/greenmic.xpm`. During recording, the VAD monitors audio in real-time and automatically segments speech at natural silence boundaries, transcribing each segment asynchronously. Second click stops recording, transcribes the final segment, and returns to `assets/redmic.xpm`. The transcribed text from all segments shall be displayed in a persistent text area attached to the application window.
 
 **Traceability**: FR-006 → AUD-002
 
 ### 3.3 Audio Recording
 
 #### FR-007: Audio Recording Duration
-The application shall record audio for a configurable maximum duration per transcription session (default: 30 seconds, range: 5-30 seconds). The maximum duration is configurable through the Configuration Dialog. The transcribed text shall be displayed in a persistent text area attached to the application window. The icon shall return to `assets/redmic.xpm` after transcription completes.
+The application shall record audio continuously until the user stops recording. During recording, the VAD automatically segments speech at silence boundaries, and each segment is limited to a configurable maximum duration (default: 60 seconds, range: 5-120 seconds). If no silence is detected within the maximum segment duration, the current segment is flushed for transcription and a new segment begins. The transcribed text from all segments shall be displayed in a persistent text area attached to the application window. The icon shall return to `assets/redmic.xpm` after the final transcription completes.
 
 **Traceability**: FR-007 → AUD-003, CFG-014
 
-#### FR-007a: Maximum Session Limit
-The application shall enforce a configurable maximum duration limit (default: 30 seconds, range: 5-30 seconds) for each transcription session. Audio recording shall automatically stop when the configured duration is reached. The transcribed text shall remain visible in the persistent text area. The icon shall return to `assets/redmic.xpm` after transcription completes.
+#### FR-007a: Maximum Segment Duration
+The application shall enforce a configurable maximum duration limit (default: 60 seconds, range: 5-120 seconds) for each speech segment. When the segment timer expires without a VAD-detected silence, the current segment is flushed to whisper for transcription and a new segment begins. The segment timer resets after each flush (VAD-triggered or timer-triggered). This prevents oversized transcription clips during continuous speech without silence gaps.
 
 **Traceability**: FR-007a → AUD-003, CFG-014
 
@@ -461,10 +473,10 @@ The configuration dialog shall include a **Model Path** text input box allowing 
 
 **Traceability**: FR-021 → CFG-005
 
-#### FR-024: Max Recording Duration
-The configuration dialog shall include a **Max Recording Duration** numeric input field allowing the user to set the maximum recording duration in seconds. The field shall accept integer values with a minimum of 5 and a maximum of 30. The unit label "seconds" shall be displayed adjacent to the field. Spin buttons (up/down arrows) are preferred for adjusting the value.
+#### FR-024: Max Segment Duration
+The configuration dialog shall include a **Max Recording Duration** numeric input field allowing the user to set the maximum speech segment duration in seconds. The field shall accept integer values with a minimum of 5 and a maximum of 120. The unit label "seconds" shall be displayed adjacent to the field. Spin buttons (up/down arrows) are preferred for adjusting the value.
 
-**Default Value**: `30`
+**Default Value**: `60`
 
 **Traceability**: FR-024 → CFG-014
 
@@ -503,17 +515,17 @@ The application shall verify the local Whisper model file is accessible on start
 
 **Traceability**: FR-030 → WHISPER-013
 
-#### FR-038: Recording Countdown Timer
+#### FR-038: Segment Duration Countdown Timer
 The application shall display a countdown timer in the **center of the MainWindow status bar** (between the gear icon on the left and the connection indicator on the right). The timer shall:
-- Display the remaining recording time in seconds, counting down from the configured `max_duration` value to 0
+- Display the remaining time until the current segment is flushed, counting down from the configured `max_duration` value to 0
 - Be visible only during `STATE_LISTENING` (hidden during `STATE_IDLE` and `STATE_TRANSCRIBING`)
-- Reset to the full `max_duration` value each time recording starts
+- Reset to the full `max_duration` value each time a segment is flushed (VAD-triggered or timer-triggered)
 - Update every second
 
 **Traceability**: FR-038 → UI-025
 
 #### FR-039: Audio Recording Completion Beep
-The application shall emit an audible beep when audio recording completes and transitions to `STATE_TRANSCRIBING`. The beep is implemented using `gdk_display_beep()` (GTK window bell), which works reliably in modern desktop environments (both X11 and Wayland). The beep shall be triggered regardless of whether the recording was stopped by user action or watchdog timeout.
+The application shall emit an audible beep when the recording session ends and transitions to `STATE_TRANSCRIBING` for the final segment. The beep is implemented using `gdk_display_beep()` (GTK window bell), which works reliably in modern desktop environments (both X11 and Wayland). The beep shall be triggered regardless of whether the recording was stopped by user action or session duration timeout. Mid-recording segment flushes (VAD-triggered or timer-triggered) do NOT trigger a beep.
 
 **Implementation**: `gdk_display_beep()` called on the MainWindow's GdkDisplay in `handle_enter_transcribing()` (main.c).
 
@@ -543,13 +555,13 @@ The application shall allow the user to manually trigger a model file verificati
 
 ### 3.8 Transcription Session
 
-#### FR-031: Maximum Session Duration
-The application shall limit each transcription session to a configurable maximum duration of audio recording (default: 30 seconds, range: 5-30 seconds). The transcribed text shall be displayed in a persistent text area attached to the application window.
+#### FR-031: Maximum Recording Duration
+The application shall support a configurable maximum recording duration (default: 60 seconds, range: 5-120 seconds). When the duration is reached, recording stops and the final segment is transcribed. The transcribed text from all segments shall be displayed in a persistent text area attached to the application window.
 
 **Traceability**: FR-031 → FR-007a, CFG-014
 
 #### FR-032: Complete Session Transcription
-The application shall transcribe the complete recorded audio (up to the configured maximum duration) using the local whisper.cpp model and update the persistent text area with the transcribed text.
+The application shall transcribe all speech segments recorded during the session using the local whisper.cpp model. Mid-recording segments are transcribed asynchronously and appended to the persistent text area. The final segment is transcribed during `STATE_TRANSCRIBING` after the user stops recording or the session duration limit is reached.
 
 **Traceability**: FR-032 → WHISPER-001
 
@@ -559,7 +571,7 @@ The application shall display transcribed text in a persistent text area that up
 **Traceability**: FR-033 → UI-006
 
 #### FR-034: Manual Stop Behavior
-The application shall stop listening and return the complete transcription of the recorded audio when the user clicks the `assets/greenmic.xpm` icon to end transcription before the configured maximum duration limit. The transcribed text shall be displayed in the persistent text area. The icon shall return to `assets/redmic.xpm` after transcription completes.
+The application shall stop recording and transcribe the final audio segment when the user clicks the `assets/greenmic.xpm` icon to end the recording session. Any pending mid-recording transcriptions shall complete before the application transitions to `STATE_TRANSCRIBING` for the final segment. The transcribed text from all segments shall be displayed in the persistent text area. The icon shall return to `assets/redmic.xpm` after the final transcription completes.
 
 **Traceability**: FR-034 → FR-006
 
@@ -575,7 +587,7 @@ The application shall support toggling recording/transcription via a global hotk
 
 **Traceability**: FR-036 → HK-002
 
-### 3.11 System Tray Icon
+### 3.10 System Tray Icon
 
 #### FR-046: System Tray Presence
 The application shall display a system tray (notification area) icon using libappindicator. The icon shall reflect the current application state:
@@ -601,7 +613,7 @@ Right-clicking the system tray icon shall display a context menu with the follow
 
 **Traceability**: FR-048 → System Tray Module
 
-### 3.12 GPU Acceleration
+### 3.11 GPU Acceleration
 
 #### FR-049: GPU (CUDA) Support
 The application shall attempt to load the Whisper model on GPU (CUDA) when available. If GPU loading fails, the application shall automatically fall back to CPU processing. The backend used (GPU or CPU) shall be reported to stderr on model load.
@@ -652,7 +664,7 @@ The application shall provide a dedicated GPU module (`app_gpu.c/h`) that encaps
 
 **Traceability**: FR-049d → app_gpu.c, app_gpu.h
 
-### 3.13 Volume Level Monitoring
+### 3.12 Volume Level Monitoring
 
 #### FR-051: Real-Time Volume Level Display
 The application shall display the real-time audio input volume level in the MainWindow status bar during `STATE_LISTENING`. The volume level shall be:
@@ -789,12 +801,12 @@ The application shall be compatible with GTK3 on both X11 and Wayland display se
 
 **Traceability**: NR-011 → UI-013
 
-### 4.6 Performance Requirements
+### 4.6 Transcription Performance
 
 #### NR-012: Transcription Continuity
-The system shall maintain transcription continuity within each 30-second session, providing seamless transcription for the recorded audio.
+The system shall maintain continuous recording and transcription across multiple speech segments within a single recording session. VAD-triggered segment flushes shall not interrupt audio capture. Mid-recording transcriptions shall run asynchronously without blocking the audio capture thread.
 
-**Implementation**: Complete audio file processed by local whisper.cpp for transcription
+**Implementation**: VAD analysis runs inline in the audio capture thread. Segment flush callbacks are marshaled to the GTK main thread via `g_idle_add()`. Transcription runs in separate background threads.
 
 **Traceability**: NR-012 → FR-031
 
@@ -806,12 +818,14 @@ The system shall respond to stop request within 1 second.
 **Traceability**: NR-013 → FR-034
 
 #### NR-019: Transcription Phase Watchdog Timeout
-A watchdog timer starts when the application transitions to `STATE_TRANSCRIBING`. The timeout is scaled based on the configured `max_duration`:
-- Base value: `max_duration` (default 30s, configurable 5–30s)
+A watchdog timer starts when the application transitions to `STATE_TRANSCRIBING` (for the final segment). The timeout is scaled based on the configured `max_duration`:
+- Base value: `max_duration` (default 60s, configurable 5–120s)
 - Scaled timeout = `base × 1.5`, clamped to the range [30, 120] seconds
 - This allows longer transcriptions for longer recordings
 
-If the transcription thread has not completed within this period, the application shall:
+Mid-recording segment transcriptions (during `STATE_LISTENING`) also have a timeout, but failure of a mid-recording transcription does not stop the recording session — an error is displayed in the TextWindow for that segment and recording continues.
+
+If the final transcription thread has not completed within this period, the application shall:
 1. Cancel the in-progress transcription via `whisper_client_cancel()`
 2. Display an error message in the TextWindow indicating the timeout (with the actual timeout value)
 3. Return to `STATE_IDLE`
@@ -873,7 +887,7 @@ The application shall use 16-bit PCM encoding (16-bit signed little-endian PCM, 
 **Traceability**: AUD-005 → FR-009
 
 #### AUD-006: Buffer Size
-The application shall use a buffer size of 1024 frames (~64ms at 16kHz) for low latency.
+The application shall use a buffer size of 320 frames (20ms at 16kHz) for low latency, matching the WebRTC VAD native frame size requirement.
 
 **Traceability**: AUD-006 → NR-001
 
@@ -896,13 +910,13 @@ The application shall use `.wav` extension for audio files.
 
 ### 5.4 Recording Control
 
-#### AUD-010: Duration Limit
-The application shall record audio for a maximum of 30 seconds per transcription session.
+#### AUD-010: Segment Duration Limit
+The application shall limit each speech segment to a maximum of 60 seconds (configurable 5-120 seconds). When the segment timer expires, the current segment is flushed for transcription and a new segment begins. The total recording session may continue until the user stops it.
 
 **Traceability**: AUD-010 → FR-007, FR-007a, FR-031
 
 #### AUD-011: Graceful Stop
-The application shall complete the current buffer and return the complete transcription of the recorded audio before stopping recording.
+The application shall complete the current audio buffer, finalize the last segment WAV file, and transcribe it before stopping recording. Any pending mid-recording transcriptions shall complete before the application transitions to `STATE_IDLE`.
 
 **Traceability**: AUD-011 → FR-006
 
@@ -1082,9 +1096,126 @@ The audio capture thread shall compute the RMS (Root Mean Square) volume level o
 
 ---
 
-## 7. X-Windows UI Components
+## 7. Voice Activity Detection (VAD)
 
-### 7.1 Window Components
+### 7.1 VAD Overview
+
+#### VAD-001: Voice Activity Detection Module
+The application shall integrate the WebRTC Voice Activity Detector (VAD) to perform real-time analysis of the captured audio stream. The VAD module shall:
+- Process audio frames at 16kHz sample rate (matching the audio capture format)
+- Analyze 20ms frames (320 samples at 16kHz) for voice activity
+- Return a binary decision: voice active (1) or silence (0) for each frame
+- Support four aggressiveness modes (0=Normal, 1=Low Bitrate, 2=Aggressive, 3=Very Aggressive) configurable by the user
+
+The VAD library is bundled as third-party source code in `third_party/webrtc_vad/` under the BSD 3-Clause license.
+
+**Traceability**: VAD-001 → DEP-008
+
+#### VAD-002: VAD Integration in Audio Capture Thread
+The VAD analysis shall run inline within the audio capture thread, processing each ALSA buffer immediately after it is read from the PCM device. This design ensures:
+- Zero additional latency (VAD processes data already in the capture buffer)
+- No additional threads required for VAD processing
+- Deterministic processing order: ALSA read → VAD analysis → WAV write
+
+Each ALSA buffer (320 frames at 16kHz = 20ms) is a single VAD-compatible frame (320 samples per buffer, processed directly by the VAD engine).
+
+**Traceability**: VAD-002 → Section 2.1
+
+### 7.2 Speech Segmentation
+
+#### VAD-003: Silence Detection and Segment Flush
+The VAD engine shall track consecutive silence frames to detect speech boundaries. When the accumulated silence duration reaches the configured `vad_silence_timeout_ms` (default: 1000 ms), the current audio segment shall be flushed:
+1. Finalize the current WAV file (patch header with correct data size)
+2. Spawn an asynchronous transcription thread for the completed segment
+3. Create a new temporary WAV file for the next segment
+4. Reset the segment flush timer to `max_duration`
+5. Reset the VAD silence counter
+
+The flush operation shall be marshaled to the GTK main thread via `g_idle_add()` to ensure thread-safe WAV file operations and transcription thread spawning.
+
+**Traceability**: VAD-003 → Section 2.3
+
+#### VAD-004: Segment Flush Timer as Fallback
+The segment flush timer (default: 60 seconds) shall serve as a fallback mechanism for continuous speech without silence gaps. When the timer expires:
+1. Perform the same segment flush operation as VAD-003
+2. Recording continues into the next segment
+3. The timer resets to `max_duration`
+
+This ensures no single transcription clip exceeds the configured maximum duration, even during continuous speech without natural pauses.
+
+**Traceability**: VAD-004 → FR-007a
+
+#### VAD-005: Maximum Recording Duration Timer
+The maximum recording duration timer (watchdog) limits the total recording session based on the configured `max_duration` value. When the timer expires:
+1. Stop audio capture
+2. Finalize the last WAV segment
+3. Transition to `STATE_TRANSCRIBING` for the final segment
+4. Wait for final transcription to complete
+5. Return to `STATE_IDLE`
+
+**Traceability**: VAD-005 → FR-031
+
+### 7.3 VAD Configuration
+
+#### VAD-006: VAD Aggressiveness Mode
+The VAD aggressiveness mode shall be configurable via the `vad_mode` parameter (0-3):
+- **Mode 0 (Least sensitive)**: Most sensitive, catches quiet speech
+- **Mode 1 (Moderate)**: Recommended balance for most environments
+- **Mode 2 (Aggressive)**: Restrictive speech detection, suitable for noisy environments
+- **Mode 3 (Most aggressive)**: Most restrictive, only clear speech triggers VAD=1
+
+Higher modes reduce false positives (noise detected as speech) but may increase false negatives (speech detected as silence). The default mode is 1.
+
+**Traceability**: VAD-006 → CFG-VAD-001
+
+#### VAD-007: Silence Timeout Configuration
+The silence timeout (`vad_silence_ms`) shall be configurable in the range 500-5000 ms (default: 1000 ms). This parameter controls how long consecutive silence must persist before triggering a segment flush. Shorter timeouts produce smaller segments; longer timeouts allow brief pauses within speech without triggering a flush.
+
+**Traceability**: VAD-007 → CFG-VAD-002
+
+#### VAD-008: Maximum Recording Duration Configuration
+The maximum recording duration (`max_duration`) shall be configurable as an integer in seconds:
+- **Range**: 5-120 seconds
+- **Default**: 60 seconds
+
+When the duration timer expires during recording, the application transitions to `STATE_TRANSCRIBING` for the final segment.
+
+### 7.4 Mid-Recording Transcription
+
+#### VAD-009: Asynchronous Segment Transcription
+Speech segments flushed during `STATE_LISTENING` shall be transcribed asynchronously in background threads. Each transcription thread:
+1. Reads the finalized WAV file
+2. Runs whisper.cpp transcription
+3. Marshals the result to the GTK main thread via `g_idle_add()`
+4. Deletes the temporary WAV file after transcription
+
+Multiple transcription threads may run concurrently. The audio capture thread is never blocked by transcription.
+
+**Traceability**: VAD-009 → Section 2.1
+
+#### VAD-010: Transcription Result Handling During Recording
+Transcription results received during `STATE_LISTENING` shall:
+1. Append the transcribed text to the TextWindow (respecting `append_transcription_text` setting)
+2. Update the system clipboard with the new text
+3. NOT change the application state (remain in `STATE_LISTENING`)
+4. NOT trigger the recording completion beep
+
+**Traceability**: VAD-010 → FR-012, FR-014
+
+#### VAD-011: Final Segment Transcription
+When the user stops recording (or session duration expires), the final segment shall:
+1. Be transcribed during `STATE_TRANSCRIBING` (blocking, as in the original design)
+2. Wait for completion before transitioning to `STATE_IDLE`
+3. Trigger the recording completion beep
+4. Return to `STATE_IDLE` after transcription completes
+
+**Traceability**: VAD-011 → FR-034, FR-035
+
+---
+
+## 8. X-Windows UI Components
+
+### 8.1 Window Components
 
 #### UI-001: Microphone Icon Display
 The application shall display two microphone icons in the main window:
@@ -1161,7 +1292,7 @@ The application shall display a `GtkLevelBar` widget in the MainWindow status ba
 
 **Traceability**: UI-028 → FR-051
 
-### 7.2 Text Area Components
+### 8.2 Text Area Components
 
 #### UI-006: Text Area Display
 The application shall display a persistent text area with transcribed voice text attached to the application window. The text area shall not disappear like normal tooltips and shall remain visible during and after transcription.
@@ -1198,7 +1329,7 @@ The application shall support text selection within the text area for copying to
 
 **Traceability**: UI-017 → FR-015
 
-### 7.3 Configuration UI
+### 8.3 Configuration UI
 
 #### UI-011: Configuration Button — Gear Icon
 The application shall display a gear/cog icon loaded from `assets/gear.xpm` on the left side of the MainWindow status bar. The gear icon serves as the entry point to the Configuration Dialog.
@@ -1226,9 +1357,11 @@ The application shall display a fixed-size modal configuration dialog titled "Tr
 |---|-------|-------------|---------------|---------|
 | 1 | **Microphone** | Drop-down (combo box) | "Default" | Populated at runtime with named microphone instances from ALSA. "Default" is always the first option. |
 | 2 | **Model Path** | Text input box | `ggml-large-v3-turbo-q8_0.bin` | Path to the local GGML Whisper model file. |
-| 3 | **Max Recording Duration** | Numeric input field | `30` | Integer input; min=5, max=30, unit label "seconds". Spin buttons (up/down arrows) preferred. |
-| 6 | **Window Position** | Button | — | Label: "Reset Position". Resets MainWindow position to screen center (100, 100) on next launch. |
-| 7 | **Hotkey Command** | Read-only text box | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | Monospace font, read-only. Adjacent "Copy" button copies command to system clipboard. |
+| 3 | **Max Recording Duration** | Numeric input field | `60` | Integer input; min=5, max=120, unit label "seconds". Spin buttons (up/down arrows) preferred. |
+| 4 | **VAD Sensitivity** | Drop-down (combo box) | "Moderate" | Options: Least sensitive, Moderate, Aggressive, Most aggressive. Controls VAD sensitivity to background noise. |
+| 5 | **Silence Threshold** | Numeric input field | `1.0` | Float input; min=0.5, max=5.0, step=0.1, unit label "seconds". Duration of silence required to trigger segment flush. |
+| 7 | **Window Position** | Button | — | Label: "Reset Position". Resets MainWindow position to screen center (100, 100) on next launch. |
+| 8 | **Hotkey Command** | Read-only text box | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | Monospace font, read-only. Adjacent "Copy" button copies command to system clipboard. |
 
 **Dialog Action Buttons (bottom row)**:
 - **"Test Model"** — Verifies the configured model file exists and validates GGUF/GGML header before saving (non-blocking, displays result in a status label)
@@ -1257,21 +1390,21 @@ The connection status indicator circle (defined in UI-021) shall act as a clicka
 
 **Traceability**: UI-024 → FR-037, WHISPER-012, UI-021
 
-### 7.4 Hotkey UI Integration
+### 8.4 Hotkey UI Integration
 
 The application does not provide a UI for hotkey assignment. However, it exposes a D-Bus interface for toggling recording/transcription, which can be triggered by OS-level hotkey configuration via `dbus-send`. The UI shall update appropriately (icon change, animation, text area) when toggled by hotkey, identically to a mouse-click-triggered toggle.
 
-See [Hotkey Integration](#8-hotkey-integration) for details.
+See [Hotkey Integration](#9-hotkey-integration) for details.
 
 ---
 
-## 8. Hotkey Integration
+## 9. Hotkey Integration
 
-### 8.1 Overview
+### 9.1 Overview
 
 The application does not manage hotkey assignments internally. Instead, users configure a global hotkey in their OS or desktop environment to invoke a `dbus-send` command that calls the D-Bus `Toggle` method exposed by the running application. This approach keeps the application decoupled from OS-specific hotkey APIs while supporting both X11 and Wayland environments with zero overhead. GTK3 handles the display server abstraction transparently.
 
-### 8.2 D-Bus Interface Specification
+### 9.2 D-Bus Interface Specification
 
 The application registers the following D-Bus interface on startup using GDBus (GIO):
 
@@ -1284,7 +1417,7 @@ The application registers the following D-Bus interface on startup using GDBus (
 
 The `Toggle` method takes no parameters and returns a boolean `(b)` indicating success (`true` when the toggle callback was executed, `false` when no callback was registered). It toggles the recording state of the application.
 
-### 8.3 D-Bus Registration Requirements
+### 9.3 D-Bus Registration Requirements
 
 #### HK-001: D-Bus Registration on Startup
 On startup, the application shall:
@@ -1297,7 +1430,7 @@ The D-Bus bus name ownership shall enforce single-instance semantics, preventing
 
 **Traceability**: HK-001 → HK-002, FR-036
 
-### 8.4 Hotkey Command Specification
+### 9.4 Hotkey Command Specification
 
 The external hotkey trigger shall invoke the following `dbus-send` command:
 
@@ -1309,10 +1442,10 @@ The application shall respond to this D-Bus method call identically regardless o
 
 **Traceability**: HK-003 → FR-036, NR-020
 
-### 8.5 Hotkey Requirements
+### 9.5 Hotkey Requirements
 
 #### HK-002: D-Bus Toggle Method
-The application shall expose a D-Bus method on the session bus using the interface specified in [Section 8.2](#82-d-bus-interface-specification). When the `Toggle` method is called, it shall toggle the recording/transcription state of the running application instance.
+The application shall expose a D-Bus method on the session bus using the interface specified in [Section 9.2](#92-d-bus-interface-specification). When the `Toggle` method is called, it shall toggle the recording/transcription state of the running application instance.
 
 **Traceability**: HK-002 → FR-036, NR-020
 
@@ -1321,7 +1454,7 @@ The application documentation shall include instructions for configuring a globa
 
 **Traceability**: HK-003 → FR-036
 
-### 8.6 Error Handling
+### 9.6 Error Handling
 
 #### HK-004: D-Bus Call Fails — No Running Instance
 If the `dbus-send` command is executed and no running instance of the application has registered the `org.xvoice.Controller` bus name, the D-Bus daemon will return a `org.freedesktop.DBus.Error.ServiceUnknown` error. The calling shell command will exit with a non-zero status. No special handling is required from the application side.
@@ -1335,9 +1468,9 @@ If the D-Bus session bus is unavailable at application startup, the application 
 
 ---
 
-## 9. Configuration Management
+## 10. Configuration Management
 
-### 9.1 Configuration File
+### 10.1 Configuration File
 
 #### CFG-001: File Location
 The configuration file shall be located at `~/.config/transcriber/config.json`.
@@ -1359,7 +1492,7 @@ If the configuration file does not exist at the expected location, the applicati
 
 **Traceability**: CFG-012 → CFG-001, CFG-003
 
-### 9.2 Configuration Parameters
+### 10.2 Configuration Parameters
 
 #### CFG-004: Window Position
 The `window_position` parameter shall define the window coordinates.
@@ -1454,17 +1587,56 @@ The `append_transcription_text` parameter controls whether new transcription res
 **Traceability**: CFG-TEXT-001 → `config->append_transcription_text` in app_config.h
 
 #### CFG-014: Max Recording Duration
-The `max_duration` parameter shall specify the maximum recording duration in seconds for each transcription session. The value must be an integer between 5 and 30 (inclusive). Values outside this range shall be clamped to the nearest boundary on save.
+The `max_duration` parameter shall specify the maximum speech segment duration in seconds. When the segment timer expires without a VAD-detected silence, the current segment is flushed for transcription and a new segment begins. The value must be an integer between 5 and 120 (inclusive). Values outside this range shall be clamped to the nearest boundary on save.
 
-**Format**: `"max_duration": 30`
+**Format**: `"max_duration": 60`
 
 **Widget**: Numeric input field with spin buttons in Configuration Dialog. Unit label: "seconds".
-**Default Value**: `30`
-**Validation**: Integer, min=5, max=30. Values outside this range are clamped to the nearest boundary on load.
+**Default Value**: `60`
+**Validation**: Integer, min=5, max=120. Values outside this range are clamped to the nearest boundary on load.
 
 **Traceability**: CFG-014 → FR-024, FR-007, FR-007a
 
-### 9.3 Configuration Loading
+#### CFG-VAD-001: VAD Sensitivity Mode
+The `vad_mode` parameter shall specify the VAD sensitivity level (0-3). Higher modes are more restrictive in reporting speech, reducing false positives from background noise.
+
+**Format**: `"vad_mode": 1`
+
+**Widget**: Drop-down (combo box) in Configuration Dialog labeled "Sensitivity" with options: Least sensitive, Moderate, Aggressive, Most aggressive.
+
+**Default Value**: `1` (Moderate)
+
+**Validation**: Integer, min=0, max=3. Values outside this range are clamped to the nearest boundary on load.
+
+**Traceability**: CFG-VAD-001 → VAD-006
+
+#### CFG-VAD-002: VAD Silence Timeout
+The `vad_silence_ms` parameter shall specify the minimum silence duration (in milliseconds) required to trigger a segment flush.
+
+**Format**: `"vad_silence_ms": 1000`
+
+**Widget**: Numeric input field with spin buttons in Configuration Dialog. Unit label: "seconds". Range: 0.5-5.0, step: 0.1 (stored internally as milliseconds).
+
+**Default Value**: `1000` (1.0 seconds)
+
+**Validation**: Integer, min=500, max=5000. Values outside this range are clamped to the nearest boundary on load.
+
+**Traceability**: CFG-VAD-002 → VAD-007
+
+#### CFG-VAD-003: Maximum Recording Duration
+The `max_duration` parameter shall specify the maximum recording session duration in seconds. This is the same parameter as CFG-014, which serves as both the segment flush timer and the watchdog timer for the recording session.
+
+**Format**: `"max_duration": 60`
+
+**Widget**: Numeric input field with spin buttons in Configuration Dialog. Unit label: "seconds". Range: 5-120.
+
+**Default Value**: `60` (seconds)
+
+**Validation**: Integer, min=5, max=120. Values outside this range are clamped to the nearest boundary on load.
+
+**Traceability**: CFG-VAD-003 → VAD-008
+
+### 10.3 Configuration Loading
 
 #### CFG-011: Load on Startup
 The application shall load configuration on startup.
@@ -1476,7 +1648,7 @@ The application shall reload configuration when user saves changes.
 
 **Traceability**: CFG-013 → FR-027
 
-### 9.4 Fixed (Non-Configurable) Settings
+### 10.4 Fixed (Non-Configurable) Settings
 
 The following settings have fixed defaults and are **not exposed** in the Configuration Dialog:
 
@@ -1486,16 +1658,18 @@ The following settings have fixed defaults and are **not exposed** in the Config
 | Retry Count | 3 (with progressive backoff: 100ms, 200ms, ...) | Retrys retryable whisper.cpp errors only |
 | Audio Format | 16000 Hz, 1 channel, 16-bit PCM | Required for Whisper model compatibility |
 | Append Mode | `true` (default) | Appends new transcriptions to existing text |
+| VAD Frame Size | 20 ms (320 samples at 16kHz) | WebRTC VAD native frame size |
+| VAD Sample Rate | 16000 Hz | Matches audio capture rate, native WebRTC VAD rate |
 
-### 9.5 Hotkey Configuration
+### 10.5 Hotkey Configuration
 
-Hotkey configuration is performed outside the application, using the OS or window manager's keyboard shortcut tools. No hotkey-specific parameters are stored in the application configuration file. The D-Bus command for hotkey activation is displayed in the Configuration Dialog (read-only) for user reference. The application interface for hotkey activation is defined in [Section 8.3](#83-application-behavior-the-listener).
+Hotkey configuration is performed outside the application, using the OS or window manager's keyboard shortcut tools. No hotkey-specific parameters are stored in the application configuration file. The D-Bus command for hotkey activation is displayed in the Configuration Dialog (read-only) for user reference. The application interface for hotkey activation is defined in [Section 9.3](#93-d-bus-registration-requirements).
 
 ---
 
-## 10. Error Handling and Fallbacks
+## 11. Error Handling and Fallbacks
 
-### 10.1 Error Categories
+### 11.1 Error Categories
 
 #### ERR-001: File System Errors
 The application shall handle file creation, write, and delete errors.
@@ -1522,14 +1696,14 @@ The application shall handle GTK/GDK display connection and rendering errors.
 
 **Traceability**: ERR-004 → UI-009
 
-### 10.2 User Feedback
+### 11.2 User Feedback
 
 #### ERR-005: TextWindow Error Messages
 The application shall display error messages in the TextWindow.
 
 **Traceability**: ERR-005 → NR-018
 
-### 10.3 Graceful Degradation
+### 11.3 Graceful Degradation
 
 #### ERR-007: Partial Functionality
 The application shall continue operating with reduced functionality on non-critical errors.
@@ -1541,7 +1715,7 @@ The application shall implement retry logic for transient errors.
 
 **Traceability**: ERR-008 → WHISPER-010
 
-### 10.4 Specific Error Scenarios
+### 11.4 Specific Error Scenarios
 
 #### ERR-009: Audio Device Unavailable
 If the audio device is unavailable, the application shall retry every 5 seconds.
@@ -1577,9 +1751,9 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 
 ---
 
-## 11. Dependency Specifications
+## 12. Dependency Specifications
 
-### 11.1 Build Dependencies
+### 12.1 Build Dependencies
 
 #### DEP-001: C Compiler
 - **Name**: GCC or Clang
@@ -1597,7 +1771,7 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Minimum Version**: 0.29
 - **Purpose**: Library detection
 
-### 11.2 Runtime Dependencies
+### 12.2 Runtime Dependencies
 
 #### DEP-005: Temporary File Storage
 - **Name**: Temporary file system
@@ -1622,6 +1796,16 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Purpose**: Local, offline speech-to-text transcription via GGML/GGUF model files
 - **Integration**: CMake FetchContent (no system package required)
 - **Traceability**: DEP-007 → WHISPER-001, WHISPER-002, WHISPER-003
+
+#### DEP-008: WebRTC Voice Activity Detector (VAD)
+- **Name**: WebRTC VAD (ported from WebRTC project)
+- **License**: BSD 3-Clause (Copyright © 2011, The WebRTC project authors)
+- **Purpose**: Real-time voice activity detection for automatic speech segmentation during continuous recording
+- **Integration**: Bundled as third-party source code in `third_party/webrtc_vad/`
+- **Supported Sample Rates**: 8000, 16000, 32000, 48000 Hz
+- **Frame Sizes**: 10, 20, or 30 ms
+- **Aggressiveness Modes**: 0 (Least sensitive), 1 (Moderate), 2 (Aggressive), 3 (Most aggressive)
+- **Traceability**: DEP-008 → VAD-001, VAD-002
 
 #### DEP-009: GTK3 Clipboard (Native)
 - **Name**: GTK3 GdkClipboard
@@ -1666,7 +1850,7 @@ When the user clicks the microphone icon to start recording (or invokes the togg
 - **Required Functions**: `g_bus_own_name()`, `g_dbus_connection_call_sync()`, `g_dbus_connection_register_object()`, `g_dbus_method_invocation_return_value()`
 - **Integration**: Native GLib main loop integration (no polling required). Implements `org.xvoice.Actions.Toggle` and `org.gnome.Shell.Application.Activate` interfaces.
 
-### 11.2.1 Build System Options
+### 12.2.1 Build System Options
 
 The CMake build system supports the following optional features:
 
@@ -1677,7 +1861,7 @@ The CMake build system supports the following optional features:
 | `ENABLE_LTO` | OFF | Enable Link Time Optimization for release builds (requires compiler support) |
 | `DOWNLOAD_DEFAULT_MODEL` | ON | Download the default Whisper model (large-v3-turbo-q8_0, ~1.1 GiB) during build |
 
-### 11.3 System Dependencies
+### 12.3 System Dependencies
 
 #### DEP-014: GTK3
 - **Name**: GTK+ 3
@@ -1687,9 +1871,9 @@ The CMake build system supports the following optional features:
 
 ---
 
-## 12. Deployment and Startup Procedures
+## 13. Deployment and Startup Procedures
 
-### 12.1 Installation Steps
+### 13.1 Installation Steps
 
 #### DEPLOY-001: Create Configuration Directory
 ```bash
@@ -1712,7 +1896,7 @@ chown $USER:$USER ~/.config/transcriber
 chmod 700 ~/.config/transcriber
 ```
 
-### 12.2 Startup Procedure
+### 13.2 Startup Procedure
 
 #### DEPLOY-004: Application Launch
 The application shall start as a foreground process:
@@ -1730,7 +1914,7 @@ On startup, the application shall:
 #### DEPLOY-006: Configuration File Creation
 If configuration file is missing, the application shall create it with default values.
 
-### 12.3 File Permissions
+### 13.3 File Permissions
 
 #### DEPLOY-007: Binary Permissions
 The binary shall have permissions `755` (rwxr-xr-x).
@@ -1742,7 +1926,7 @@ Configuration files shall have permissions `600` (rw-------).
 
 **Traceability**: DEPLOY-008 → CFG-001
 
-### 12.4 D-Bus Activation Service File
+### 13.4 D-Bus Activation Service File
 
 #### DEPLOY-009: D-Bus Activation Service File
 The application shall install a D-Bus activation service file (`org.xvoice.Controller.service`) to enable on-demand launching by the D-Bus session daemon. The service file shall:
@@ -1764,7 +1948,7 @@ Group=
 
 **Traceability**: DEPLOY-009 → Section 2.5 (D-Bus Integration), HK-002
 
-### 12.5 Desktop Entry File
+### 13.5 Desktop Entry File
 
 #### DEPLOY-019: Desktop Entry File
 The application shall install a `.desktop` file (`transcriber.desktop`) for desktop environment integration. The desktop entry shall:
@@ -1796,7 +1980,7 @@ StartupWMClass=transcriber
 
 **Traceability**: DEPLOY-019 → DEPLOY-009
 
-### 12.6 Hicolor Icon Theme Assets
+### 13.6 Hicolor Icon Theme Assets
 
 #### DEPLOY-010: Hicolor Icon Theme PNG Assets
 The application shall install PNG icon files conforming to the freedesktop.org hicolor icon theme specification. The icons shall:
@@ -1812,7 +1996,7 @@ After installation, the icon cache shall be updated via `gtk-update-icon-cache /
 
 **Traceability**: DEPLOY-010 → DEPLOY-019
 
-### 12.7 Debian Package Distribution
+### 13.7 Debian Package Distribution
 
 #### DEPLOY-011: Debian Package Structure
 The application shall support distribution as a Debian `.deb` package. The packaging directory (`packaging/debian/`) shall contain the following files:
@@ -1906,7 +2090,7 @@ The source package format shall be `3.0 (native)` as specified in `packaging/deb
 
 **Traceability**: DEPLOY-017 → DEPLOY-011
 
-### 12.8 Model Download Script
+### 13.8 Model Download Script
 
 #### DEPLOY-018: Model Download Script
 The application shall provide a model download script (`packaging/download-model.sh`) that automates obtaining the Whisper model file. The script shall:
@@ -1926,9 +2110,9 @@ The application shall provide a model download script (`packaging/download-model
 
 ---
 
-## 13. Testing and Validation Criteria
+## 14. Testing and Validation Criteria
 
-### 13.1 Unit Tests
+### 14.1 Unit Tests
 
 #### TEST-001: Configuration Loading
 - **Test Case**: Load valid configuration file
@@ -1936,11 +2120,15 @@ The application shall provide a model download script (`packaging/download-model
 - **Test Case**: Load missing configuration file
 - **Expected**: Default values used
 
-#### TEST-002: Audio Recording
-- **Test Case**: Record up to 30 seconds of audio
-- **Expected**: WAV file created with correct format
+#### TEST-002: Audio Recording and VAD Segmentation
+- **Test Case**: Record audio with natural speech pauses
+- **Expected**: Multiple WAV segments created, each flushed at silence boundaries
+- **Test Case**: Record 30 seconds of continuous speech without pauses
+- **Expected**: Segment flushed at 30-second timer, new segment begins
 - **Test Case**: Verify 16kHz, mono, 16-bit PCM
 - **Expected**: Audio format matches specification
+- **Test Case**: VAD with mode 3 in noisy environment
+- **Expected**: Fewer false segment flushes compared to mode 0
 
 #### TEST-003: TextWindow Display
 - **Test Case**: Display transcribed text in TextWindow
@@ -1950,9 +2138,11 @@ The application shall provide a model download script (`packaging/download-model
 
 #### TEST-004: Window Operations
 - **Test Case**: Click microphone icon
-- **Expected**: Recording starts
+- **Expected**: Recording starts, VAD begins analyzing audio
+- **Test Case**: Speak with natural pauses
+- **Expected**: Text appears incrementally as segments are transcribed
 - **Test Case**: Click again
-- **Expected**: Recording stops and transcribes
+- **Expected**: Recording stops, final segment transcribes, returns to idle
 
 #### TEST-015: Hotkey Toggle
 - **Test Case**: Invoke `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` while idle
@@ -1962,11 +2152,13 @@ The application shall provide a model download script (`packaging/download-model
 - **Test Case**: Invoke `dbus-send` when no instance is running
 - **Expected**: D-Bus returns `org.freedesktop.DBus.Error.ServiceUnknown` error
 
-### 13.2 Integration Tests
+### 14.2 Integration Tests
 
 #### TEST-005: Full Workflow
-- **Test Case**: Launch application, click mic, record, transcribe, copy
-- **Expected**: Text copied to clipboard within latency targets
+- **Test Case**: Launch application, click mic, speak with pauses, transcribe, copy
+- **Expected**: Text appears incrementally as segments are transcribed, all text copied to clipboard
+- **Test Case**: Speak continuously for >30 seconds without pauses
+- **Expected**: Segment flushed at 30s, recording continues, text appears for each segment
 
 #### TEST-006: Error Recovery
 - **Test Case**: Local Whisper model file unavailable
@@ -1976,16 +2168,17 @@ The application shall provide a model download script (`packaging/download-model
 - **Test Case**: Change URL, save, restart
 - **Expected**: New URL loaded
 
-### 13.3 Acceptance Criteria
+### 14.3 Acceptance Criteria
 
 #### TEST-008: Functional Acceptance
 - All functional requirements FR-001 through FR-036 pass
 - All audio requirements AUD-001 through AUD-018 pass
 - All Whisper requirements WHISPER-001 through WHISPER-014 pass
+- All VAD requirements VAD-001 through VAD-011 pass
 - All UI requirements UI-001 through UI-028 pass
 - All hotkey requirements HK-002 through HK-005 pass
-- All configuration requirements CFG-001 through CFG-013 pass
-- All error handling requirements ERR-001 through ERR-013 pass
+- All configuration requirements CFG-001 through CFG-013 and CFG-VAD-001 through CFG-VAD-003 pass
+- All error handling requirements ERR-001 through ERR-014 pass
 - **Window Geometry Tests**:
   - MainWindow is non-resizable (verified via `XGetWMNormalHints` showing `PMinSize` == `PMaxSize`)
   - TextWindow is resizable (verified via window manager resize capability)
@@ -2011,14 +2204,16 @@ The application shall provide a model download script (`packaging/download-model
 
 **Traceability**: TEST-010 → All security requirements
 
-### 13.4 Performance Benchmarks
+### 14.4 Performance Benchmarks
 
 #### TEST-011: Latency Benchmark
-- **Metric**: Click to text display
-- **Target**: < 35 seconds for 30s recording
+- **Metric**: Speech end to text display (for VAD-triggered segments)
+- **Target**: < 5 seconds from silence detection to text appearing in TextWindow
+- **Metric**: Click to first text display (for short speech with pause)
+- **Target**: < 10 seconds
 - **Measurement**: System timer
 
-### 13.5 Edge Case Scenarios
+### 14.5 Edge Case Scenarios
 
 #### TEST-012: Edge Case - Audio Device Change
 - **Scenario**: Audio device disconnected during recording
@@ -2034,9 +2229,9 @@ The application shall provide a model download script (`packaging/download-model
 
 ---
 
-## 14. Appendix
+## 15. Appendix
 
-### 14.1 Requirements Traceability Matrix
+### 15.1 Requirements Traceability Matrix
 
 | Requirement ID | Description | Section |
 |----------------|-------------|---------|
@@ -2067,7 +2262,7 @@ The application shall provide a model download script (`packaging/download-model
 | FR-028 | Cancel Configuration | 3.7 |
 | FR-029 | Configuration Persistence | 3.7 |
 | FR-030 | Model Verification on Startup | 3.7 |
-| FR-031 | Maximum Session Duration | 3.8 |
+| FR-031 | Maximum Recording Duration | 3.8 |
 | FR-032 | Complete Session Transcription | 3.8 |
 | FR-033 | Text Area Display | 3.8 |
 | FR-034 | Manual Stop Behavior | 3.8 |
@@ -2121,122 +2316,139 @@ The application shall provide a model download script (`packaging/download-model
 | WHISPER-010 | Retry Logic | 6.3 |
 | WHISPER-011 | Thread Safety | 6.3 |
 | WHISPER-012 | Model File Verification (Connection Check) | 6.4 |
-| UI-001 | Microphone Icon Display | 7.1 |
-| UI-002 | Window Properties | 7.1 |
-| UI-003 | Click Event Handling | 7.1 |
-| UI-004 | Sine Wave Animation | 7.1 |
-| UI-005 | Animation Control | 7.1 |
-| UI-006 | Text Area Display | 7.2 |
-| UI-007 | Text Area Positioning | 7.2 |
-| UI-008 | Copy Event Handling | 7.2 |
-| UI-009 | Clipboard API | 7.2 |
-| UI-010 | Text Area Persistence | 7.2 |
-| UI-011 | Configuration Button | 7.3 |
-| UI-012 | Configuration Dialog | 7.3 |
-| UI-013 | Save Button | 7.3 |
-| UI-014 | Transcription Text Display | 7.1 |
-| UI-015 | Microphone Selection Dropdown | 7.3 |
-| UI-016 | Text Area Editability | 7.2 |
-| UI-017 | Text Area Selection | 7.2 |
-| UI-018 | Window Size and Background Attachment | 7.1 |
-| UI-019 | Sine Wave Background Transparency | 7.1 |
-| UI-020 | Sine Wave Line Thickness | 7.1 |
-| UI-021 | Model Availability Status Indicator | 7.1 |
-| UI-022 | Model Availability Status Color | 7.1 |
-| UI-023 | Loading State Indicator | 7.1 |
-| UI-024 | Interactive Connection Status Indicator | 7.3 |
+| UI-001 | Microphone Icon Display | 8.1 |
+| UI-002 | Window Properties | 8.1 |
+| UI-003 | Click Event Handling | 8.1 |
+| UI-004 | Sine Wave Animation | 8.1 |
+| UI-005 | Animation Control | 8.1 |
+| UI-006 | Text Area Display | 8.2 |
+| UI-007 | Text Area Positioning | 8.2 |
+| UI-008 | Copy Event Handling | 8.2 |
+| UI-009 | Clipboard API | 8.2 |
+| UI-010 | Text Area Persistence | 8.2 |
+| UI-011 | Configuration Button | 8.3 |
+| UI-012 | Configuration Dialog | 8.3 |
+| UI-013 | Save Button | 8.3 |
+| UI-014 | Transcription Text Display | 8.1 |
+| UI-015 | Microphone Selection Dropdown | 8.3 |
+| UI-016 | Text Area Editability | 8.2 |
+| UI-017 | Text Area Selection | 8.2 |
+| UI-018 | Window Size and Background Attachment | 8.1 |
+| UI-019 | Sine Wave Background Transparency | 8.1 |
+| UI-020 | Sine Wave Line Thickness | 8.1 |
+| UI-021 | Model Availability Status Indicator | 8.1 |
+| UI-022 | Model Availability Status Color | 8.1 |
+| UI-023 | Loading State Indicator | 8.1 |
+| UI-024 | Interactive Connection Status Indicator | 8.3 |
 | FR-037 | Manual Model Verification | 3.7 |
 | WHISPER-013 | Model Metadata Extraction | 6.4 |
 | WHISPER-014 | Lazy Model Loading via Background Thread | 6.4 |
-| HK-002 | D-Bus Toggle Method | 8.5 |
-| HK-003 | Documentation | 8.5 |
-| HK-004 | D-Bus Call Fails — No Running Instance | 8.6 |
-| HK-005 | D-Bus Session Bus Unavailable | 8.6 |
-| CFG-001 | File Location | 9.1 |
-| CFG-002 | File Format | 9.1 |
-| CFG-003 | Default Configuration | 9.1 |
-| CFG-004 | Window Position | 9.2 |
-| CFG-005 | Model Path | 9.2 |
-| CFG-006 | Audio Device | 9.2 |
-| CFG-010 | Microphone Selection | 9.2 |
-| CFG-011 | Load on Startup | 9.3 |
-| CFG-012 | Auto-Create Configuration File | 9.1 |
-| CFG-013 | Reload on Request | 9.3 |
-| CFG-014 | Max Recording Duration | 9.2 |
-| ERR-001 | File System Errors | 10.1 |
-| ERR-002 | Audio Capture Errors | 10.1 |
-| ERR-003 | Transcription Errors | 10.1 |
-| ERR-004 | GTK/GDK Errors | 10.1 |
-| ERR-005 | TextWindow Error Messages | 10.2 |
-| ERR-007 | Partial Functionality | 10.3 |
-| ERR-008 | Retry Mechanism | 10.3 |
-| ERR-009 | Audio Device Unavailable | 10.4 |
-| ERR-010 | Model Load Failure | 10.4 |
-| ERR-011 | Display Connection Failed | 10.4 |
-| ERR-013 | Hotkey Toggle Errors | 10.4 |
-| ERR-014 | Pre-Recording Model Availability Check | 10.4 |
-| DEP-001 | C/C++ Compiler | 11.1 |
-| DEP-002 | CMake | 11.1 |
-| DEP-003 | pkg-config | 11.1 |
-| DEP-005 | Temporary File Storage | 11.2 |
-| DEP-006 | ALSA Library | 11.2 |
-| DEP-007 | whisper.cpp Library | 11.2 |
-| DEP-009 | GTK3 Clipboard (Native) | 11.2 |
-| DEP-010 | Memory Buffer Scrubbing | 11.2 |
-| DEP-011 | JSON Library (cJSON) | 11.2 |
-| DEP-013 | D-Bus Library | 11.2 |
-| DEP-014 | GTK3 | 11.3 |
-| GAP-001 | XWayland Clipboard Boundary | 16.1 |
-| GAP-002 | memset_s glibc Trap | 16.2 |
-| GAP-003 | Concurrency Race Condition | 16.3 |
-| DEPLOY-001 | Create Configuration Directory | 12.1 |
-| DEPLOY-002 | Install Binary | 12.1 |
-| DEPLOY-003 | Set Permissions | 12.1 |
-| DEPLOY-004 | Application Launch | 12.2 |
-| DEPLOY-005 | Window Creation | 12.2 |
-| DEPLOY-006 | Configuration File Creation | 12.2 |
-| DEPLOY-007 | Binary Permissions | 12.3 |
-| DEPLOY-008 | Config Permissions | 12.3 |
-| DEPLOY-009 | D-Bus Activation Service File | 12.4 |
-| DEPLOY-019 | Desktop Entry File | 12.5 |
-| DEPLOY-010 | Hicolor Icon Theme PNG Assets | 12.6 |
-| DEPLOY-011 | Debian Package Structure | 12.7 |
-| DEPLOY-012 | Package Metadata | 12.7 |
-| DEPLOY-013 | Build Rules | 12.7 |
-| DEPLOY-014 | Maintainer Scripts | 12.7 |
-| DEPLOY-015 | Build Script | 12.7 |
-| DEPLOY-016 | Package Version and Changelog | 12.7 |
-| DEPLOY-017 | Source Package Format | 12.7 |
-| DEPLOY-018 | Model Download Script | 12.8 |
-| TEST-001 | Configuration Loading | 13.1 |
-| TEST-002 | Audio Recording | 13.1 |
-| TEST-003 | TextWindow Display | 13.1 |
-| TEST-004 | Window Operations | 13.1 |
-| TEST-005 | Full Workflow | 13.2 |
-| TEST-006 | Error Recovery | 13.2 |
-| TEST-007 | Configuration Persistence | 13.2 |
-| TEST-008 | Functional Acceptance | 13.3 |
-| TEST-009 | Performance Acceptance | 13.3 |
-| TEST-010 | Security Acceptance | 13.3 |
-| TEST-011 | Latency Benchmark | 13.4 |
-| TEST-012 | Edge Case - Audio Device Change | 13.5 |
-| TEST-013 | Edge Case - Model File Removal | 13.5 |
-| TEST-014 | Edge Case - Configuration Corruption | 13.5 |
-| TEST-015 | Hotkey Toggle | 13.1 |
+| VAD-001 | Voice Activity Detection Module | 7.1 |
+| VAD-002 | VAD Integration in Audio Capture Thread | 7.1 |
+| VAD-003 | Silence Detection and Segment Flush | 7.2 |
+| VAD-004 | Segment Flush Timer as Fallback | 7.2 |
+| VAD-005 | Session Duration Timer | 7.2 |
+| VAD-006 | VAD Aggressiveness Mode | 7.3 |
+| VAD-007 | Silence Timeout Configuration | 7.3 |
+| VAD-008 | Session Duration Configuration | 7.3 |
+| VAD-009 | Asynchronous Segment Transcription | 7.4 |
+| VAD-010 | Transcription Result Handling During Recording | 7.4 |
+| VAD-011 | Final Segment Transcription | 7.4 |
+| CFG-VAD-001 | VAD Aggressiveness Mode | 10.2 |
+| CFG-VAD-002 | VAD Silence Timeout | 10.2 |
+| CFG-VAD-003 | Session Duration Limit | 10.2 |
+| HK-002 | D-Bus Toggle Method | 9.5 |
+| HK-003 | Documentation | 9.5 |
+| HK-004 | D-Bus Call Fails — No Running Instance | 9.6 |
+| HK-005 | D-Bus Session Bus Unavailable | 9.6 |
+| CFG-001 | File Location | 10.1 |
+| CFG-002 | File Format | 10.1 |
+| CFG-003 | Default Configuration | 10.1 |
+| CFG-004 | Window Position | 10.2 |
+| CFG-005 | Model Path | 10.2 |
+| CFG-006 | Audio Device | 10.2 |
+| CFG-010 | Microphone Selection | 10.2 |
+| CFG-011 | Load on Startup | 10.3 |
+| CFG-012 | Auto-Create Configuration File | 10.1 |
+| CFG-013 | Reload on Request | 10.3 |
+| CFG-014 | Max Recording Duration | 10.2 |
+| ERR-001 | File System Errors | 11.1 |
+| ERR-002 | Audio Capture Errors | 11.1 |
+| ERR-003 | Transcription Errors | 11.1 |
+| ERR-004 | GTK/GDK Errors | 11.1 |
+| ERR-005 | TextWindow Error Messages | 11.2 |
+| ERR-007 | Partial Functionality | 11.3 |
+| ERR-008 | Retry Mechanism | 11.3 |
+| ERR-009 | Audio Device Unavailable | 11.4 |
+| ERR-010 | Model Load Failure | 11.4 |
+| ERR-011 | Display Connection Failed | 11.4 |
+| ERR-013 | Hotkey Toggle Errors | 11.4 |
+| ERR-014 | Pre-Recording Model Availability Check | 11.4 |
+| DEP-001 | C/C++ Compiler | 12.1 |
+| DEP-002 | CMake | 12.1 |
+| DEP-003 | pkg-config | 12.1 |
+| DEP-005 | Temporary File Storage | 12.2 |
+| DEP-006 | ALSA Library | 12.2 |
+| DEP-007 | whisper.cpp Library | 12.2 |
+| DEP-008 | WebRTC VAD Library | 12.2 |
+| DEP-009 | GTK3 Clipboard (Native) | 12.2 |
+| DEP-010 | Memory Buffer Scrubbing | 12.2 |
+| DEP-011 | JSON Library (cJSON) | 12.2 |
+| DEP-013 | D-Bus Library | 12.2 |
+| DEP-014 | GTK3 | 12.3 |
+| GAP-001 | XWayland Clipboard Boundary | 15.1 |
+| GAP-002 | memset_s glibc Trap | 15.2 |
+| GAP-003 | Concurrency Race Condition | 15.3 |
+| DEPLOY-001 | Create Configuration Directory | 13.1 |
+| DEPLOY-002 | Install Binary | 13.1 |
+| DEPLOY-003 | Set Permissions | 13.1 |
+| DEPLOY-004 | Application Launch | 13.2 |
+| DEPLOY-005 | Window Creation | 13.2 |
+| DEPLOY-006 | Configuration File Creation | 13.2 |
+| DEPLOY-007 | Binary Permissions | 13.3 |
+| DEPLOY-008 | Config Permissions | 13.3 |
+| DEPLOY-009 | D-Bus Activation Service File | 13.4 |
+| DEPLOY-019 | Desktop Entry File | 13.5 |
+| DEPLOY-010 | Hicolor Icon Theme PNG Assets | 13.6 |
+| DEPLOY-011 | Debian Package Structure | 13.7 |
+| DEPLOY-012 | Package Metadata | 13.7 |
+| DEPLOY-013 | Build Rules | 13.7 |
+| DEPLOY-014 | Maintainer Scripts | 13.7 |
+| DEPLOY-015 | Build Script | 13.7 |
+| DEPLOY-016 | Package Version and Changelog | 13.7 |
+| DEPLOY-017 | Source Package Format | 13.7 |
+| DEPLOY-018 | Model Download Script | 13.8 |
+| TEST-001 | Configuration Loading | 14.1 |
+| TEST-002 | Audio Recording | 14.1 |
+| TEST-003 | TextWindow Display | 14.1 |
+| TEST-004 | Window Operations | 14.1 |
+| TEST-005 | Full Workflow | 14.2 |
+| TEST-006 | Error Recovery | 14.2 |
+| TEST-007 | Configuration Persistence | 14.2 |
+| TEST-008 | Functional Acceptance | 14.3 |
+| TEST-009 | Performance Acceptance | 14.3 |
+| TEST-010 | Security Acceptance | 14.3 |
+| TEST-011 | Latency Benchmark | 14.4 |
+| TEST-012 | Edge Case - Audio Device Change | 14.5 |
+| TEST-013 | Edge Case - Model File Removal | 14.5 |
+| TEST-014 | Edge Case - Configuration Corruption | 14.5 |
+| TEST-015 | Hotkey Toggle | 14.1 |
 
-### 14.2 Configuration File Example
+### 15.2 Configuration File Example
 
 ```json
 {
   "window_position": {"x": 100, "y": 100},
   "model_path": "~/.cache/whisper/ggml-base.bin",
   "audio_device": "default",
-  "max_duration": 30,
-  "gpu_mode": "auto"
+  "max_duration": 60,
+  "gpu_mode": "auto",
+  "vad_mode": 1,
+  "vad_silence_ms": 1000
 }
 ```
 
-### 14.3 Local Whisper Transcription (whisper.cpp)
+### 15.3 Local Whisper Transcription (whisper.cpp)
 
 The application uses whisper.cpp for local, offline transcription. No network requests are made.
 
@@ -2274,7 +2486,7 @@ The application resolves model paths in the following order:
 
 Transcription can be cancelled via `whisper_client_cancel()`, which sets an atomic flag checked periodically by whisper.cpp's `abort_callback` mechanism during `whisper_full()` execution.
 
-### 14.3a Append Transcription Text Mode
+### 15.3a Append Transcription Text Mode
 
 The application supports two modes for handling transcription text in the TextWindow:
 
@@ -2283,7 +2495,7 @@ The application supports two modes for handling transcription text in the TextWi
 
 This is controlled by the `append_transcription_text` configuration parameter (CFG-TEXT-001).
 
-### 14.4 System Tray Icon
+### 15.4 System Tray Icon
 
 The System Tray module (`app_tray.c`) provides notification area presence via libappindicator (Ayatana fork preferred).
 

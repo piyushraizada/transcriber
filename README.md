@@ -181,6 +181,14 @@ dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/
 
 Configure this command as a custom shortcut in your desktop environment's keyboard settings (e.g., GNOME Settings → Keyboard → Custom Shortcuts). The D-Bus activation service file (`org.xvoice.Controller.service`) also enables the application to autolaunch from the dock when no instance is running.
 
+## Third-Party Software
+
+Transcriber bundles the following third-party components:
+
+### WebRTC VAD (Voice Activity Detection)
+
+Voice activity detection is provided by the **WebRTC VAD** library, packaged and maintained by **[CPUImage](https://github.com/cpuimage/webrtc_vad)**. The original implementation is part of Google's WebRTC project. The source code resides in `third_party/webrtc_vad/` and is distributed under the **BSD-3-Clause** license. Full license text is available in [`third_party/webrtc_vad/LICENSE`](third_party/webrtc_vad/LICENSE).
+
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
