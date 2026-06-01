@@ -42,3 +42,6 @@ desktop.ini
 # Dependencies downloaded by CMake
 *_subbuild/
 *_populate-prefix/
+
+# Plans directory (internal documentation, not for source control)
+plans/
