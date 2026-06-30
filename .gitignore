@@ -45,3 +45,6 @@ desktop.ini
 
 # Plans directory (internal documentation, not for source control)
 plans/
+
+# AI agent instructions (local-only, not for source control)
+AGENTS.md

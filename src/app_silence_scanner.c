@@ -89,7 +89,7 @@ static void *scanner_thread_func(void *arg)
     while (!atomic_load(&scanner->stop_flag)) {
         size_t available;
         size_t read_count;
-        bool is_voice;
+        bool is_voice = false;
 
         /* Get available samples in ring buffer */
         available = ring_buffer_available(scanner->ring_buffer);
@@ -143,7 +143,8 @@ static void *scanner_thread_func(void *arg)
         seg_transcribed = scanner->transcribed_offset;
         pthread_mutex_unlock(&scanner->mutex);
         size_t seg_samples = (seg_scan > seg_transcribed) ? (seg_scan - seg_transcribed) : 0;
-        int seg_ms = (int)((double)seg_samples / SCANNER_SAMPLE_RATE * 1000.0);
+        double seg_ms_d = (double)seg_samples / SCANNER_SAMPLE_RATE * 1000.0;
+        int seg_ms = (seg_ms_d > (double)INT_MAX) ? INT_MAX : (int)seg_ms_d;
 
         /* Run VAD on this chunk — subdivide into smaller 20ms frames for
          * more accurate detection. WebRTC VAD is designed for 20ms frames.
@@ -155,16 +156,16 @@ static void *scanner_thread_func(void *arg)
          * occasional false-positive voice frames, while still reliably detecting
          * genuine speech which would have most frames classified as voice. */
         {
-            /* Snapshot VAD detector under mutex to prevent use-after-free if
-             * silence_scanner_reset() recreates the detector concurrently. */
-            VadDetector *vad_snapshot;
-            pthread_mutex_lock(&scanner->mutex);
-            vad_snapshot = scanner->vad_detector;
-            pthread_mutex_unlock(&scanner->mutex);
-
+            /* Hold mutex across all vad_process_frame() calls to prevent use-after-free.
+             * silence_scanner_reset() destroys and recreates vad_detector under the same
+             * mutex, so holding it here ensures the detector remains valid for the full
+             * duration of VAD processing. Each frame takes ~microseconds, so contention
+             * is negligible. */
             size_t frame_samples = 320;  /* 20ms at 16kHz */
             size_t n_frames = SCANNER_CHUNK_SAMPLES / frame_samples;  /* 25 frames */
             int voice_frames = 0;
+            pthread_mutex_lock(&scanner->mutex);
+            VadDetector *vad_snapshot = scanner->vad_detector;
             for (size_t f = 0; f < n_frames; f++) {
                 size_t off = f * frame_samples;
                 bool frame_voice = vad_process_frame(vad_snapshot,
@@ -175,6 +176,7 @@ static void *scanner_thread_func(void *arg)
                     voice_frames++;
                 }
             }
+            pthread_mutex_unlock(&scanner->mutex);
             /* Require majority of frames to be voice (>50%) */
             is_voice = (voice_frames > (int)(n_frames / 2));
         }

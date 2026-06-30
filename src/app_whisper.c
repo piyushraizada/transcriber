@@ -57,6 +57,7 @@ static const char *DEFAULT_MODEL_DIRS[] = {
 struct _WhisperClient {
     struct whisper_context *ctx;       // whisper.cpp context (loaded model)
     char model_path[MAX_PATH_LEN];
+    char language[16];                 // Language code: "auto", "en", "fr", etc.
     int n_threads;
     int gpu_index;                     // -3 = auto by free mem, -2 = CPU-only, >=0 = specific GPU
     char error_message[256];
@@ -463,7 +464,7 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
 
     // Validate data_size to prevent excessive memory allocation from malicious WAV files.
     // Cap at 30 minutes of 16kHz/16-bit/mono audio = ~57.6 MB.
-    #define MAX_WAV_DATA_SIZE (30UL * 60 * 16000 * 2)
+    #define MAX_WAV_DATA_SIZE (30UL * 60UL * 16000UL * 2UL)
     if ((uint64_t)data_size > MAX_WAV_DATA_SIZE) {
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
               "[whisper] WAV data chunk too large: %u bytes (max %lu) — aborting\n",
@@ -551,6 +552,8 @@ WhisperClient* whisper_client_create(void) {
     client->n_threads = DEFAULT_THREADS;
     client->gpu_index = GPU_INDEX_AUTO_MEMORY;  // Auto-select by free memory
     client->model_path[0] = '\0';
+    strncpy(client->language, "auto", sizeof(client->language) - 1);
+    client->language[sizeof(client->language) - 1] = '\0';
     client->error_message[0] = '\0';
     client->error_code = 0;
     atomic_store(&client->cancel_requested, 0);
@@ -619,6 +622,26 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
 }
 
 /* ===================================================================
+ * Public API: whisper_client_set_language
+ * =================================================================== */
+bool whisper_client_set_language(WhisperClient* client, const char* language) {
+    if (!client) return false;
+
+    pthread_mutex_lock(&client->mutex);
+
+    if (language && language[0] != '\0') {
+        strncpy(client->language, language, sizeof(client->language) - 1);
+        client->language[sizeof(client->language) - 1] = '\0';
+    } else {
+        strncpy(client->language, "auto", sizeof(client->language) - 1);
+        client->language[sizeof(client->language) - 1] = '\0';
+    }
+
+    pthread_mutex_unlock(&client->mutex);
+    return true;
+}
+
+/* ===================================================================
  * Public API: whisper_transcribe
  * Mutex is now held only to access shared state (context,
  * config), then released before the actual transcription runs. This
@@ -658,6 +681,9 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
     // Copy needed config while holding mutex
     struct whisper_context *ctx = client->ctx;
     int n_threads_cfg = client->n_threads;
+    char lang[16];
+    strncpy(lang, client->language, sizeof(lang));
+    lang[sizeof(lang) - 1] = '\0';
 
     pthread_mutex_unlock(&client->mutex);
     // --- Mutex released: now run long operations without holding it ---
@@ -690,8 +716,12 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
     params.abort_callback = whisper_abort_callback;
     params.abort_callback_user_data = &client->cancel_requested;
 
-    // Always auto-detect language
-    params.language = NULL;
+    // Set language: "auto" or empty means auto-detect, otherwise use specified language
+    if (lang[0] == '\0' || strcmp(lang, "auto") == 0) {
+        params.language = NULL;  // Auto-detect
+    } else {
+        params.language = lang;
+    }
 
     // Run transcription WITHOUT holding the mutex
     int result = whisper_full(ctx, params, samples, n_samples);
@@ -807,6 +837,9 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
     // Copy needed config while holding mutex
     struct whisper_context *ctx = client->ctx;
     int n_threads_cfg = client->n_threads;
+    char lang[16];
+    strncpy(lang, client->language, sizeof(lang));
+    lang[sizeof(lang) - 1] = '\0';
 
     pthread_mutex_unlock(&client->mutex);
     // --- Mutex released ---
@@ -836,7 +869,13 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
     params.no_timestamps = true;
     params.abort_callback = whisper_abort_callback;
     params.abort_callback_user_data = &client->cancel_requested;
-    params.language = NULL;  // auto-detect
+
+    // Set language: "auto" or empty means auto-detect
+    if (lang[0] == '\0' || strcmp(lang, "auto") == 0) {
+        params.language = NULL;  // Auto-detect
+    } else {
+        params.language = lang;
+    }
 
     // Run transcription
     int result = whisper_full(ctx, params, float_samples, n_samples);

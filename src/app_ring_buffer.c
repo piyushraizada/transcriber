@@ -209,7 +209,8 @@ size_t ring_buffer_read_range(const AudioRingBuffer *rb,
         pthread_mutex_unlock(&nonconst->mutex);
         return 0;
     }
-    if (offset + count > available) {
+    /* Use subtraction form to avoid size_t wrap-around in offset + count */
+    if (count > available - offset) {
         count = available - offset;
     }
 

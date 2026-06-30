@@ -249,6 +249,10 @@ void config_set_defaults(AppConfig* config)
     config->scanner_silence_ms = 2000;       // 2s silence before checking segment
     config->scanner_min_segment_ms = 5000;   // Minimum 5s audio before transcribing
 
+    /* Language — default to auto-detect */
+    strncpy(config->language, "auto", sizeof(config->language) - 1);
+    config->language[sizeof(config->language) - 1] = '\0';
+
     set_error(NULL);
 }
 
@@ -467,6 +471,13 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
+    /* Language */
+    item = cJSON_GetObjectItemCaseSensitive(root, "language");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        strncpy(config->language, item->valuestring, sizeof(config->language) - 1);
+        config->language[sizeof(config->language) - 1] = '\0';
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -540,6 +551,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     /* Scanner settings */
     cJSON_AddNumberToObject(root, "scanner_silence_ms", config->scanner_silence_ms);
     cJSON_AddNumberToObject(root, "scanner_min_segment_ms", config->scanner_min_segment_ms);
+
+    /* Language */
+    cJSON_AddStringToObject(root, "language", config->language);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -863,4 +877,26 @@ int config_get_scanner_min_segment_ms(const AppConfig* config)
 {
     if (!config) return 5000;
     return config->scanner_min_segment_ms;
+}
+
+/* ----------------------------------------------------------------
+ * Language configuration accessors
+ * ---------------------------------------------------------------- */
+
+void config_set_language(AppConfig* config, const char* lang)
+{
+    if (!config) return;
+    if (lang) {
+        strncpy(config->language, lang, sizeof(config->language) - 1);
+        config->language[sizeof(config->language) - 1] = '\0';
+    } else {
+        strncpy(config->language, "auto", sizeof(config->language) - 1);
+        config->language[sizeof(config->language) - 1] = '\0';
+    }
+}
+
+const char* config_get_language(const AppConfig* config)
+{
+    if (!config || config->language[0] == '\0') return "auto";
+    return config->language;
 }

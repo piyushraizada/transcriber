@@ -139,11 +139,12 @@ typedef struct _AppConfig {
                                          ///< this to Whisper. Short segments are absorbed into
                                          ///< the next batch. Range: 1000-30000 ms. Default: 5000.
 
-    /* NOTE: Language field removed.
-     * The SRS originally specified a language configuration field
-     * (CFG-007, WHISPER-005), but this was removed in favor of using
-     * multilingual-only models which auto-detect the input language.
-     * The SRS should be updated to reflect this deviation. */
+    /* Language Settings */
+    char language[16];              ///< Language code for transcription (e.g., "en", "fr", "es", "auto")
+                                       ///< "auto" = auto-detect language (default)
+                                       ///< ISO 639-1 two-letter codes: "en", "fr", "de", "es", "ja", etc.
+                                       ///< Empty string "" is treated as "auto".
+                                       ///< @see CFG-007: Language
 
 } AppConfig;
 
@@ -558,6 +559,26 @@ void config_set_scanner_silence_ms(AppConfig* config, int ms);
 int config_get_scanner_silence_ms(const AppConfig* config);
 void config_set_scanner_min_segment_ms(AppConfig* config, int ms);
 int config_get_scanner_min_segment_ms(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6.6: Language Configuration Accessors
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Set the transcription language.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param lang    Language code string (e.g., "en", "fr", "auto"). Copied internally.
+ *                "auto" or empty string = auto-detect. Must not be NULL.
+ */
+void config_set_language(AppConfig* config, const char* lang);
+
+/**
+ * Get the transcription language.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return The language code string (internal, must NOT be freed or modified).
+ *         Returns "auto" if not set.
+ */
+const char* config_get_language(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

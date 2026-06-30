@@ -42,8 +42,8 @@ struct _ConfigDialog {
     GtkButton *model_browse_button;
     GtkLabel *model_info_label;
     GtkComboBox *device_combo;
+    GtkComboBox *language_combo;
     GtkComboBox *gpu_mode_combo;
-    /* Language selection removed - multilingual models only */
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
@@ -215,8 +215,6 @@ GtkListStore * config_dialog_get_audio_devices(void) {
     return store;
 }
 
-/* Language list section removed — language selection removed. */
-
 /* ===================================================================
  * Hotkey command display
  * =================================================================== */
@@ -360,6 +358,20 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     config_set_continuous_dictation(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
 
+    /* Save Language */
+    if (dlg->language_combo) {
+        GtkTreeIter lang_iter;
+        GtkTreeModel *lang_model = GTK_TREE_MODEL(gtk_combo_box_get_model(dlg->language_combo));
+        if (gtk_combo_box_get_active_iter(dlg->language_combo, &lang_iter)) {
+            gchar *lang_code = NULL;
+            gtk_tree_model_get(lang_model, &lang_iter, 1, &lang_code, -1);
+            if (lang_code) {
+                config_set_language(dlg->config, lang_code);
+                g_free(lang_code);
+            }
+        }
+    }
+
     /* Save config to file */
     config_save(dlg->config);
 
@@ -386,18 +398,22 @@ typedef struct {
     guint idle_id;  /* Store the idle source ID so we can track/cancel it */
 } ModelInfoLoadData;
 
+static void model_info_load_data_free(gpointer user_data) {
+    ModelInfoLoadData *data = (ModelInfoLoadData *)user_data;
+    g_free(data->path);
+    g_free(data);
+}
+
 static gboolean model_info_load_callback(gpointer user_data) {
     ModelInfoLoadData *data = (ModelInfoLoadData *)user_data;
     ConfigDialog *dlg = data->dlg;
-    char *path = data->path;  /* Non-const to allow g_free */
+    char *path = data->path;
 
     /* Safety check: verify the dialog widget is still alive before accessing it.
      * This prevents use-after-free if the dialog was closed before the callback ran. */
     if (!GTK_IS_WIDGET(GTK_WIDGET(dlg->dialog)) ||
         !gtk_widget_get_realized(GTK_WIDGET(dlg->dialog))) {
-        g_free(path);
-        g_free(data);
-        return FALSE;
+        return FALSE;  /* destroy notify frees data and path */
     }
 
     /* Load model metadata */
@@ -431,9 +447,7 @@ static gboolean model_info_load_callback(gpointer user_data) {
         dlg->model_info_idle_id = 0;
     }
 
-    g_free(path);
-    g_free(data);
-    return FALSE;  /* One-shot */
+    return FALSE;  /* One-shot; destroy notify frees data and path */
 }
 
 static void update_model_info_label(ConfigDialog *dlg, const char *path) {
@@ -454,7 +468,8 @@ static void update_model_info_label(ConfigDialog *dlg, const char *path) {
     ModelInfoLoadData *data = g_new0(ModelInfoLoadData, 1);
     data->dlg = dlg;
     data->path = g_strdup(path);
-    data->idle_id = g_idle_add(model_info_load_callback, data);
+    data->idle_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, model_info_load_callback, data,
+                                    model_info_load_data_free);
     dlg->model_info_idle_id = data->idle_id;  /* Track so we can cancel on dialog close */
 }
 
@@ -783,7 +798,143 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->device_combo), FALSE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
 
-    /* Language selection removed - using multilingual models only */
+    /* ---- Language ---- */
+    {
+        GtkWidget *lang_label = gtk_label_new("Language:");
+        gtk_label_set_xalign(GTK_LABEL(lang_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), lang_label, FALSE, FALSE, 0);
+
+        /* Language options: display name -> code */
+        struct {
+            const char *display;
+            const char *code;
+        } languages[] = {
+            { "Auto-detect", "auto" },
+            { "English", "en" },
+            { "Chinese (中文)", "zh" },
+            { "German (Deutsch)", "de" },
+            { "Spanish (Español)", "es" },
+            { "Russian (Русский)", "ru" },
+            { "Korean (한국어)", "ko" },
+            { "French (Français)", "fr" },
+            { "Japanese (日本語)", "ja" },
+            { "Portuguese (Português)", "pt" },
+            { "Turkish (Türkçe)", "tr" },
+            { "Polish (Polski)", "pl" },
+            { "Catalan (Català)", "ca" },
+            { "Dutch (Nederlands)", "nl" },
+            { "Arabic (العربية)", "ar" },
+            { "Swedish (Svenska)", "sv" },
+            { "Italian (Italiano)", "it" },
+            { "Indonesian (Bahasa)", "id" },
+            { "Hindi (हिन्दी)", "hi" },
+            { "Finnish (Suomi)", "fi" },
+            { "Vietnamese (Tiếng Việt)", "vi" },
+            { "Hebrew (עברית)", "he" },
+            { "Ukrainian (Українська)", "uk" },
+            { "Greek (Ελληνικά)", "el" },
+            { "Malay (Bahasa Melayu)", "ms" },
+            { "Czech (Čeština)", "cs" },
+            { "Romanian (Română)", "ro" },
+            { "Danish (Dansk)", "da" },
+            { "Hungarian (Magyar)", "hu" },
+            { "Tamil (தமிழ்)", "ta" },
+            { "Norwegian (Norsk)", "no" },
+            { "Thai (ไทย)", "th" },
+            { "Urdu (اردو)", "ur" },
+            { "HR Croatian (Hrvatski)", "hr" },
+            { "Bengali (বাংলা)", "bn" },
+            { "Lithuanian (Lietuvių)", "lt" },
+            { "Punjabi (ਪੰਜਾਬੀ)", "pa" },
+            { "Latvian (Latviešu)", "lv" },
+            { "Burmese (မြန်မာ)", "my" },
+            { "Belarusian (Беларуская)", "be" },
+            { "Assamese (অসমীয়া)", "as" },
+            { "Slovenian (Slovenščina)", "sl" },
+            { "Tagalog (Filipino)", "tl" },
+            { "Slovak (Slovenčina)", "sk" },
+            { "Macedonian (Македонски)", "mk" },
+            { "Montenegrin (Crnogorski)", "mn" },
+            { "Bosnian (Bosanski)", "bs" },
+            { "Kazakh (Қазақ)", "kk" },
+            { "Azerbaijani (Azərbaycan)", "az" },
+            { "Sinhala (සිංහල)", "si" },
+            { "Khmer (ខ្មែរ)", "km" },
+            { "Shona (ChiShona)", "sn" },
+            { "Yoruba (Yorùbá)", "yo" },
+            { "Somali (Soomaaliga)", "so" },
+            { "Afrikaans (Afrikaans)", "af" },
+            { "Occitan (Occitan)", "oc" },
+            { "Malayalam (മലയാളം)", "ml" },
+            { "Maltese (Malti)", "mt" },
+            { "Sanskrit (संस्कृत)", "sa" },
+            { "Luxembourgish (Lëtzebuergesch)", "lb" },
+            { "Mongolian (Монгол)", "mg" },
+            { "Marathi (मराठी)", "mr" },
+            { "Nepali (नेपाली)", "ne" },
+            { "Oromo (Afaan Oromoo)", "om" },
+            { "Pashto (پښتو)", "ps" },
+            { "Albanian (Shqip)", "sq" },
+            { "Serbian (Српски)", "sr" },
+            { "Gujarati (ગુજરાતી)", "gu" },
+            { "Kannada (ಕನ್ನಡ)", "kn" },
+            { "Estonian (Eesti)", "et" },
+            { "Basque (Euskara)", "eu" },
+            { "Icelandic (Íslenska)", "is" },
+            { "Armenian (Հայերեն)", "hy" },
+            { "Nepali (नेपाली)", "ne" },
+            { "Javanese (Basa Jawa)", "jv" },
+            { "Sanjo (ᱥᱟᱱᱰᱤ)", "sd" },
+            { "Sundanese (Basa Sunda)", "su" },
+            { "Welsh (Cymraeg)", "cy" },
+            { NULL, NULL }
+        };
+
+        GtkListStore *lang_store = GTK_LIST_STORE(gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING));
+        GtkTreeIter iter;
+        for (int i = 0; languages[i].display != NULL; i++) {
+            gtk_list_store_append(lang_store, &iter);
+            gtk_list_store_set(lang_store, &iter,
+                0, languages[i].display,
+                1, languages[i].code,
+                -1);
+        }
+
+        dlg->language_combo = GTK_COMBO_BOX(gtk_combo_box_new_with_model(GTK_TREE_MODEL(lang_store)));
+        g_object_unref(lang_store);
+
+        GtkCellRenderer *lang_renderer = gtk_cell_renderer_text_new();
+        gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(dlg->language_combo), lang_renderer, TRUE);
+        gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(dlg->language_combo), lang_renderer,
+                                       "text", 0, NULL);
+
+        /* Select current language from config */
+        const char *current_lang = config_get_language(config);
+        GtkTreeModel *lang_model = GTK_TREE_MODEL(gtk_combo_box_get_model(dlg->language_combo));
+        if (gtk_tree_model_get_iter_first(lang_model, &iter)) {
+            do {
+                gchar *code = NULL;
+                gtk_tree_model_get(lang_model, &iter, 1, &code, -1);
+                if (code && g_strcmp0(code, current_lang) == 0) {
+                    gtk_combo_box_set_active_iter(dlg->language_combo, &iter);
+                    g_free(code);
+                    break;
+                }
+                g_free(code);
+            } while (gtk_tree_model_iter_next(lang_model, &iter));
+        }
+
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->language_combo), FALSE, TRUE, 0);
+
+        GtkWidget *lang_help = gtk_label_new(
+            "Select the input language for transcription. Use Auto-detect for multilingual input.");
+        gtk_label_set_xalign(GTK_LABEL(lang_help), 0);
+        gtk_widget_set_opacity(lang_help, 0.6);
+        gtk_label_set_line_wrap(GTK_LABEL(lang_help), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), lang_help, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+    }
 
     /* ---- Max Duration ---- */
     GtkWidget *dur_label = gtk_label_new("Max Recording Duration (seconds):");

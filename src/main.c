@@ -126,7 +126,7 @@ typedef struct TranscriberApp {
     guint volume_poll_source_id;
 
     /* WAV path for transcription (protected by wav_path_mutex) */
-    char current_wav_path[PATH_MAX];
+    char *current_wav_path;
     pthread_mutex_t wav_path_mutex;
 
     /* Model loading state */
@@ -428,10 +428,15 @@ static gboolean restart_watchdog_idle(gpointer user_data)
     stop_watchdog_timer(app);
     start_watchdog_timer(app);
     /* Restart the UI countdown timer so the user sees the full duration reset
-     * after each successfully transcribed segment in continuous mode. */
+     * after each successfully transcribed segment — but only in non-continuous mode.
+     * In continuous mode, the countdown is not shown at all. */
     if (app->main_window) {
-        app_window_stop_countdown(app->main_window);
-        app_window_start_countdown(app->main_window);
+        bool continuous = app->controller.config
+            ? config_get_continuous_dictation(app->controller.config) : false;
+        if (!continuous) {
+            app_window_stop_countdown(app->main_window);
+            app_window_start_countdown(app->main_window);
+        }
     }
     return G_SOURCE_REMOVE;
 }
@@ -552,17 +557,23 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
           "[main] Scanner segment: %zu samples (%.1fs) — transcribing\n",
           count, (double)count / 16000.0);
 
-    /* Transcribe samples directly (no WAV file needed) */
+    /* Acquire mutex before calling whisper_transcribe_samples to prevent
+     * concurrent access to the whisper.cpp context (not thread-safe).
+     * The blocking transcription call is made inside the critical section,
+     * but we minimize post-transcription work under the lock by extracting
+     * the result data and freeing the response before unlocking. */
     pthread_mutex_lock(&app->scanner_transcribe_mutex);
-
     WhisperResponse *response = whisper_transcribe_samples(app->whisper_client, samples, (int)count);
-    g_free(samples);  /* Free scanner-allocated samples */
+    pthread_mutex_unlock(&app->scanner_transcribe_mutex);
+
+    g_free(samples);  /* Free scanner-allocated samples outside mutex */
 
     if (response && response->success && response->text && response->text[0] != '\0') {
         /* Marshal success to GTK main thread */
         IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
         icd->app = app;
         icd->data = g_strdup(response->text);
+        whisper_response_free(response);
         g_idle_add(on_transcription_result_idle, icd);
 
         /* Restart watchdog timer so continuous recording doesn't expire */
@@ -583,14 +594,9 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
         IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
         icd->app = app;
         icd->data = g_strdup(error);
+        whisper_response_free(response);
         g_idle_add(on_transcription_error_idle, icd);
     }
-
-    if (response) {
-        whisper_response_free(response);
-    }
-
-    pthread_mutex_unlock(&app->scanner_transcribe_mutex);
 }
 
 /* ------------------------------------------------------------------ */
@@ -616,6 +622,10 @@ static void handle_enter_listening(TranscriberApp *app) {
     /* Update the UI */
     if (app->main_window) {
         app_window_set_state(app->main_window, STATE_LISTENING);
+        /* In continuous mode, do not show the countdown timer. */
+        if (continuous_dictation) {
+            app_window_stop_countdown(app->main_window);
+        }
     }
 
     /* Update tray icon (tray now sets ATTENTION status for pulse in dock) */
@@ -736,24 +746,17 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
 
     /* Store the WAV path for transcription */
     pthread_mutex_lock(&app->wav_path_mutex);
+    
+    /* Free previous path before allocating new one */
+    g_free(app->current_wav_path);
+    app->current_wav_path = NULL;
+
     if (wav_path) {
-        size_t len = strlen(wav_path);
-        if (len >= sizeof(app->current_wav_path)) {
-            g_log("main", G_LOG_LEVEL_WARNING,
-                  "[main] WAV path truncated: %.100s... (len=%zu, max=%zu)\n",
-                  wav_path, len, sizeof(app->current_wav_path) - 1);
-        }
-        g_strlcpy(app->current_wav_path, wav_path, sizeof(app->current_wav_path));
+        app->current_wav_path = g_strdup(wav_path);
     } else if (app->audio_recorder) {
         const char *path = audio_recorder_get_wav_path(app->audio_recorder);
         if (path) {
-            size_t len = strlen(path);
-            if (len >= sizeof(app->current_wav_path)) {
-                g_log("main", G_LOG_LEVEL_WARNING,
-                      "[main] WAV path truncated: %.100s... (len=%zu, max=%zu)\n",
-                      path, len, sizeof(app->current_wav_path) - 1);
-            }
-            g_strlcpy(app->current_wav_path, path, sizeof(app->current_wav_path));
+            app->current_wav_path = g_strdup(path);
         }
     }
     pthread_mutex_unlock(&app->wav_path_mutex);
@@ -764,9 +767,12 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
      * as the whisper client exists. */
     bool continuous = app->controller.config
         ? config_get_continuous_dictation(app->controller.config) : false;
-    if (app->whisper_client && (app->current_wav_path[0] != '\0' || continuous)) {
-        /* Start transcription watchdog (30s constant timeout) */
-        start_transcription_watchdog(app);
+    if (app->whisper_client &&
+        ((app->current_wav_path != NULL && app->current_wav_path[0] != '\0') || continuous)) {
+        /* Start transcription watchdog (30s constant timeout) — disabled in continuous mode */
+        if (!continuous) {
+            start_transcription_watchdog(app);
+        }
 
         /* Store thread handle for clean shutdown.
          * Join any previous transcription thread before overwriting,
@@ -813,6 +819,8 @@ static gpointer transcribe_thread_func(gpointer data) {
 
     const char *model_path = config_get_model_path(app->controller.config);
     whisper_client_set_model_path(app->whisper_client, model_path);
+    const char *language = config_get_language(app->controller.config);
+    whisper_client_set_language(app->whisper_client, language);
 
     /* Stop the silence scanner first to prevent it from reading the ring buffer
      * while we extract samples. The scanner thread and this transcription thread
@@ -930,18 +938,20 @@ static gpointer transcribe_thread_func(gpointer data) {
         if (continuous) {
             /* In continuous mode, VAD may have filtered out all remaining audio
              * as silence. Create a success response with empty text so the app
-             * transitions to IDLE without showing an error. */
+             * transitions to IDLE without showing an error. Using an empty string
+             * rather than NULL makes the semantic meaning clear: this is a valid
+             * result with no content, distinct from a failure or NULL pointer. */
             response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
             if (response) {
                 response->success = true;
-                response->text = NULL;  /* text is dynamically allocated, not inline */
+                response->text = g_strdup("");  /* Empty string — VAD-filtered silence */
             }
         } else {
             /* Non-continuous mode: show error */
             response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
             if (response) {
-                strncpy(response->error_message, "No audio data available for transcription",
-                        sizeof(response->error_message) - 1);
+                snprintf(response->error_message, sizeof(response->error_message),
+                         "No audio data available for transcription");
                 response->error_code = 10;
                 response->success = false;
             }
@@ -1073,9 +1083,11 @@ static void on_model_status_change(TranscriberApp *app, ModelStatus status) {
 static gpointer model_loading_thread_func(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
-    /* Set model path from config */
+    /* Set model path and language from config */
     const char *model_path = config_get_model_path(app->controller.config);
     whisper_client_set_model_path(app->whisper_client, model_path);
+    const char *language = config_get_language(app->controller.config);
+    whisper_client_set_language(app->whisper_client, language);
 
     /* Load the model with GPU mode from config.
      * gpu_mode can be "auto", "cpu", or "gpu:N".
@@ -1275,9 +1287,11 @@ static void on_microphone_toggle(void *user_data) {
              * so on_model_loaded_idle will auto-transition to LISTENING */
             atomic_store(&app->model_loading_from_toggle, 1);
 
-            /* Set model path */
+            /* Set model path and language */
             const char *mp = config_get_model_path(app->controller.config);
             whisper_client_set_model_path(app->whisper_client, mp);
+            const char *lang = config_get_language(app->controller.config);
+            whisper_client_set_language(app->whisper_client, lang);
 
             /* Show LOADING indicator and "WAIT" overlay */
             app_set_model_status(&app->controller, MODEL_LOADING);
@@ -1379,8 +1393,10 @@ static void perform_initial_model_load(TranscriberApp *app) {
         return;
     }
 
-    /* Set model path */
+    /* Set model path and language */
     whisper_client_set_model_path(app->whisper_client, model_path);
+    const char *lang = config_get_language(app->controller.config);
+    whisper_client_set_language(app->whisper_client, lang);
 
     /* Show LOADING indicator on the status bar */
     app_set_model_status(&app->controller, MODEL_LOADING);
@@ -1681,6 +1697,9 @@ static void app_destroy(TranscriberApp *app) {
 
     /* Cleanup state controller */
     app_state_controller_cleanup(&app->controller);
+
+    /* Free the current WAV path */
+    g_free(app->current_wav_path);
 
     /* Destroy mutexes */
     pthread_mutex_destroy(&app->wav_path_mutex);

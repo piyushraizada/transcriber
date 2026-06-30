@@ -280,17 +280,49 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
     }
 
     err = snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    if (err < 0) { snd_pcm_close(pcm); return false; }
+    if (err < 0) {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg), "[audio] Failed to set access mode for '%s': %s",
+                   device_name, snd_strerror(err));
+        set_audio_error(msg);
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "%s\n", msg);
+        snd_pcm_close(pcm);
+        return false;
+    }
 
     err = snd_pcm_hw_params_set_format(pcm, params, format);
-    if (err < 0) { snd_pcm_close(pcm); return false; }
+    if (err < 0) {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg), "[audio] Failed to set format for '%s': %s",
+                   device_name, snd_strerror(err));
+        set_audio_error(msg);
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "%s\n", msg);
+        snd_pcm_close(pcm);
+        return false;
+    }
 
     err = snd_pcm_hw_params_set_channels(pcm, params, channels);
-    if (err < 0) { snd_pcm_close(pcm); return false; }
+    if (err < 0) {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg), "[audio] Failed to set channels for '%s': %s",
+                   device_name, snd_strerror(err));
+        set_audio_error(msg);
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "%s\n", msg);
+        snd_pcm_close(pcm);
+        return false;
+    }
 
     unsigned int actual_rate = rate;
     err = snd_pcm_hw_params_set_rate_near(pcm, params, &actual_rate, 0);
-    if (err < 0) { snd_pcm_close(pcm); return false; }
+    if (err < 0) {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg), "[audio] Failed to set sample rate for '%s': %s",
+                   device_name, snd_strerror(err));
+        set_audio_error(msg);
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "%s\n", msg);
+        snd_pcm_close(pcm);
+        return false;
+    }
 
     /* Validate that the actual rate matches requested 16kHz.
      * Mismatched rates produce distorted audio. */
@@ -710,7 +742,15 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         pthread_mutex_unlock(&recorder->mutex);
         return false;
     }
-    g_strlcpy(recorder->wav_path, tmp_path, sizeof(recorder->wav_path));
+    if (g_strlcpy(recorder->wav_path, tmp_path, sizeof(recorder->wav_path)) >= sizeof(recorder->wav_path)) {
+        g_log("app-audio", G_LOG_LEVEL_ERROR, "[audio] Temporary path too long, aborting\n");
+        close(recorder->wav_fd);
+        recorder->wav_fd = -1;
+        unlink(tmp_path);
+        g_free(tmp_path);
+        pthread_mutex_unlock(&recorder->mutex);
+        return false;
+    }
     g_free(tmp_path);
     /* Use owner-only permissions (0600) for privacy. */
     chmod(recorder->wav_path, 0600);

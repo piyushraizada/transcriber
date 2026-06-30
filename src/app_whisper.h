@@ -129,6 +129,20 @@ void whisper_client_destroy(WhisperClient* client);
  */
 bool whisper_client_set_model_path(WhisperClient* client, const char* model_path);
 
+/**
+ * Set the transcription language.
+ *
+ * This function sets the language for transcription. Use "auto" for
+ * automatic language detection, or an ISO 639-1 two-letter language
+ * code (e.g., "en", "fr", "de", "es", "ja", etc.).
+ *
+ * @param client   Pointer to a valid WhisperClient. Must not be NULL.
+ * @param language Language code string. "auto" or NULL for auto-detect.
+ *
+ * @return true if the language was set successfully, false if invalid.
+ */
+bool whisper_client_set_language(WhisperClient* client, const char* language);
+
 /*---------------------------------------------------------------------------
  * Section 5: Core Transcription API
  *---------------------------------------------------------------------------
