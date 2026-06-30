@@ -227,7 +227,7 @@ void config_set_defaults(AppConfig* config)
 
     config->audio_device_display_name[0] = '\0';  /* No display name by default */
 
-    config->max_duration = 60;  /* 60 seconds — supports extended dictation sessions */
+    config->max_duration = 30;  /* 30 seconds — aligns with Whisper's optimal sample length */
 
     config->window_x = 100;  /* Default position */
     config->window_y = 100;  /* Default position */
@@ -734,7 +734,7 @@ bool config_set_max_duration(AppConfig* config, int duration)
 
 int config_get_max_duration(const AppConfig* config)
 {
-    if (!config) return 60;
+    if (!config) return 30;
     return config->max_duration;
 }
 
