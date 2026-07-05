@@ -656,6 +656,9 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
 
     g_free(samples);  /* Free scanner-allocated samples outside mutex */
 
+    bool is_continuous = app->controller.config
+        ? config_get_continuous_dictation(app->controller.config) : false;
+
     if (response && response->success && response->text && response->text[0] != '\0') {
         /* Marshal success to GTK main thread */
         IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
@@ -666,6 +669,14 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
 
         /* Restart watchdog timer so continuous recording doesn't expire */
         g_idle_add(restart_watchdog_idle, app);
+    } else if (response && response->success && is_continuous) {
+        /* Whisper succeeded but returned empty text — treat as silence in
+         * continuous mode. Do not show an error to the user. This happens
+         * when whisper processes audio containing only silence or very short
+         * speech segments below its detection threshold. */
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[flow] Scanner transcription succeeded but empty text — skipping in continuous mode\n");
+        whisper_response_free(response);
     } else {
         const char *error = "Scanner transcription returned empty result";
         if (response) {
@@ -1074,6 +1085,13 @@ static gpointer transcribe_thread_func(gpointer data) {
             icd->app = app;
             icd->data = g_strdup(response->text);
             g_idle_add(on_transcription_result_idle, icd);
+        } else if (response && response->success && continuous) {
+            /* Whisper succeeded but returned empty text — treat as silence in
+             * continuous mode. Do not show an error to the user. This happens
+             * when whisper processes audio containing only silence or very short
+             * speech segments below its detection threshold. */
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[flow] Transcription succeeded but empty text — skipping in continuous mode\n");
         } else {
             const char *error = whisper_client_get_error(app->whisper_client);
             if (!error || error[0] == '\0') {
@@ -1888,14 +1906,39 @@ int main(int argc, char *argv[]) {
 
     /* Install file-based log handlers BEFORE any subsystem initialization.
      * Registers transcriber_file_log_handler for every domain used by the app
-     * so all messages are captured to /tmp/transcriber.log. */
+     * so all g_log() messages are captured to /tmp/transcriber.log. */
     register_all_log_handlers();
 
-    /* Verify the log handler is active by writing a startup marker. */
+    /* Verify the log handler is active by writing a startup marker.
+     * This also ensures the static FILE* inside the handler has been opened,
+     * so we can safely reopen stderr into the same file below. */
     g_log("main", G_LOG_LEVEL_MESSAGE, "[startup] Log handlers installed — /tmp/transcriber.log active\n");
 
-    /* Initialize GTK */
+    /* Initialize GTK early so GIO/GDBus domains are registered before we set up
+     * catch-all log handlers and redirect stderr. If we register handlers or
+     * reopen stderr after gtk_init(), some GLib internal messages may have
+     * already been emitted to the original stderr and lost. */
     gtk_init(&argc, &argv);
+
+    /* Re-register all log handlers AFTER GTK init. This is critical because
+     * gtk_init() registers new GLib domains (GLib-GIO, GDBus, GVfs, etc.) that
+     * were not present before. Without this re-registration, messages from those
+     * domains fall through to the default stderr formatter and bypass our log file. */
+    register_all_log_handlers();
+
+    /* Set the default GLib log handler as a catch-all for any domain we haven't
+     * explicitly registered (e.g., GModule, GIO modules). This ensures every
+     * g_log() message lands in the log file regardless of its domain name. */
+    g_log_set_default_handler(transcriber_file_log_handler, NULL);
+
+    /* Redirect stderr to append into /tmp/transcriber.log so that messages from
+     * libraries not using GLib logging (e.g., whisper.cpp via fprintf(stderr))
+     * are also captured in the same log file. The g_log handler above opened the
+     * file with "w" mode and wrote the startup marker, so reopening stderr with
+     * "a" mode appends after that marker without truncating. */
+    if (freopen("/tmp/transcriber.log", "a", stderr)) {
+        setlinebuf(stderr);  /* Line-buffered for immediate flushing */
+    }
 
     /* Set the default application icon name for icon theme resolution. */
     gtk_window_set_default_icon_name("redmic");
