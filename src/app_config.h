@@ -104,11 +104,6 @@ typedef struct _AppConfig {
                                         ///< Default: true (append mode for backward compatibility).
 
     /* VAD (Voice Activity Detection) Settings */
-    bool vad_enabled;                ///< Enable VAD-based silence detection for auto-stop recording
-                                        ///< When true, the audio capture thread monitors for silence periods
-                                        ///< and triggers transcription automatically when speech ends.
-                                        ///< Default: false (disabled, use watchdog timer only).
-
     int vad_mode;                    ///< VAD aggressiveness mode (0-3)
                                         ///< 0 = Least aggressive (most sensitive, catches quiet speech)
                                         ///< 1 = Moderate
@@ -494,20 +489,6 @@ bool config_get_append_transcription_text(const AppConfig* config);
  *---------------------------------------------------------------------------
  * Getters and setters for VAD configuration fields.
  */
-
-/**
- * Enable or disable VAD-based silence detection.
- * @param config  Pointer to AppConfig. Must not be NULL.
- * @param enabled true to enable VAD, false to disable.
- */
-void config_set_vad_enabled(AppConfig* config, bool enabled);
-
-/**
- * Get VAD enabled status.
- * @param config Pointer to AppConfig. Must not be NULL.
- * @return true if VAD is enabled, false otherwise.
- */
-bool config_get_vad_enabled(const AppConfig* config);
 
 /**
  * Set VAD aggressiveness mode (0-3).

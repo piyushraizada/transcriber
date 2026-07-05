@@ -47,7 +47,6 @@ struct _ConfigDialog {
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
-    GtkCheckButton *vad_enabled_checkbox;
     GtkComboBox *vad_mode_combo;
     GtkSpinButton *vad_silence_spin;
     GtkCheckButton *continuous_dictation_checkbox;
@@ -294,7 +293,7 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     /* Validate duration */
     int duration = (int)gtk_spin_button_get_value(dlg->duration_spin);
     if (!config_dialog_validate_duration(duration)) {
-        config_dialog_show_error(dlg->duration_error, "Duration must be between 5 and 120 seconds");
+        config_dialog_show_error(dlg->duration_error, "Duration must be between 5 and 30 seconds");
         valid = FALSE;
     } else {
         config_dialog_clear_error(dlg->duration_error);
@@ -350,11 +349,9 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->append_text_checkbox)));
 
     /* Save VAD settings */
-    config_set_vad_enabled(dlg->config,
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox)));
     config_set_vad_mode(dlg->config, gtk_combo_box_get_active(dlg->vad_mode_combo));
-    config_set_vad_silence_ms(dlg->config,
-        (int)gtk_spin_button_get_value(dlg->vad_silence_spin));
+    config_set_scanner_silence_ms(dlg->config,
+        (int)(gtk_spin_button_get_value(dlg->vad_silence_spin) * 1000.0));
     config_set_continuous_dictation(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
 
@@ -547,12 +544,6 @@ static void on_duration_changed(GtkSpinButton *spin, ConfigDialog *dlg) {
     config_dialog_clear_error(dlg->duration_error);
 }
 
-static void on_vad_enabled_toggled(GtkCheckButton *check, ConfigDialog *dlg) {
-    UNUSED(check);
-    gboolean enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox));
-    gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_mode_combo), enabled);
-    gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_silence_spin), enabled);
-}
 
 /* Async model metadata loading to avoid blocking GTK main loop.
  * Previously, model_info_load() blocked the GTK thread for 5-15 seconds
@@ -1056,29 +1047,15 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
 
     /* ---- VAD (Voice Activity Detection) ---- */
     {
-        GtkWidget *vad_title = gtk_label_new("Voice Activity Detection (VAD):");
-        gtk_label_set_xalign(GTK_LABEL(vad_title), 0);
-        PangoAttrList *vad_attrs = pango_attr_list_new();
-        pango_attr_list_insert(vad_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(vad_title), vad_attrs);
-        pango_attr_list_unref(vad_attrs);
-        gtk_box_pack_start(GTK_BOX(vbox), vad_title, FALSE, FALSE, 0);
-
-        dlg->vad_enabled_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
-            "Enable VAD-based auto-stop on silence"));
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox),
-                                     config_get_vad_enabled(config));
-        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_enabled_checkbox), FALSE, FALSE, 0);
-
-        GtkWidget *vad_help = gtk_label_new(
-            "When enabled, recording stops automatically after a period of silence.\n"
-            "Transcription begins immediately without needing to click the mic icon.");
-        gtk_label_set_xalign(GTK_LABEL(vad_help), 0);
-        gtk_widget_set_opacity(vad_help, 0.6);
-        gtk_label_set_line_wrap(GTK_LABEL(vad_help), TRUE);
-        gtk_box_pack_start(GTK_BOX(vbox), vad_help, FALSE, FALSE, 0);
-
-        // VAD Mode (sensitivity)
+            GtkWidget *vad_title = gtk_label_new("Voice Activity Detection (VAD):");
+            gtk_label_set_xalign(GTK_LABEL(vad_title), 0);
+            PangoAttrList *vad_attrs = pango_attr_list_new();
+            pango_attr_list_insert(vad_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+            gtk_label_set_attributes(GTK_LABEL(vad_title), vad_attrs);
+            pango_attr_list_unref(vad_attrs);
+            gtk_box_pack_start(GTK_BOX(vbox), vad_title, FALSE, FALSE, 0);
+    
+            // VAD Mode (sensitivity)
         GtkWidget *vad_mode_label = gtk_label_new("  Sensitivity:");
         gtk_label_set_xalign(GTK_LABEL(vad_mode_label), 0);
         gtk_box_pack_start(GTK_BOX(vbox), vad_mode_label, FALSE, FALSE, 0);
@@ -1097,24 +1074,14 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_box_pack_start(GTK_BOX(vbox), vad_silence_label, FALSE, FALSE, 0);
 
         GtkWidget *silence_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0.5, 5.0, 0.1));
+        dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 10.0, 0.1));
         gtk_spin_button_set_value(dlg->vad_silence_spin,
-                                  (gdouble)config_get_vad_silence_ms(config) / 1000.0);
+                                  (gdouble)config_get_scanner_silence_ms(config) / 1000.0);
         gtk_box_pack_start(GTK_BOX(silence_box), GTK_WIDGET(dlg->vad_silence_spin), FALSE, FALSE, 0);
 
         GtkWidget *silence_unit = gtk_label_new("seconds");
         gtk_box_pack_start(GTK_BOX(silence_box), silence_unit, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), silence_box, FALSE, FALSE, 0);
-
-        // Connect toggle signal to enable/disable VAD controls
-        g_signal_connect(dlg->vad_enabled_checkbox, "toggled",
-                         G_CALLBACK(on_vad_enabled_toggled), dlg);
-
-        // Set initial sensitivity of VAD sub-controls based on enabled state
-        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->vad_enabled_checkbox))) {
-            gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_mode_combo), FALSE);
-            gtk_widget_set_sensitive(GTK_WIDGET(dlg->vad_silence_spin), FALSE);
-        }
 
         // Continuous dictation checkbox
         dlg->continuous_dictation_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(

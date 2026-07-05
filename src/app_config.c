@@ -239,8 +239,7 @@ void config_set_defaults(AppConfig* config)
     /* Transcription text mode — default to append (true) for backward compatibility */
     config->append_transcription_text = true;
 
-    /* VAD (Voice Activity Detection) — default enabled for hands-free operation */
-    config->vad_enabled = true;
+    /* VAD (Voice Activity Detection) settings */
     config->vad_mode = 1;              // Moderate aggressiveness
     config->vad_silence_ms = 2500;     // 2.5 seconds of silence triggers auto-stop (allows natural pauses)
     config->continuous_dictation = true; // Continuous dictation mode by default
@@ -415,12 +414,6 @@ bool config_load_from_path(AppConfig* config, const char* path)
         config->append_transcription_text = cJSON_IsTrue(item);
     }
 
-    /* VAD settings */
-    item = cJSON_GetObjectItemCaseSensitive(root, "vad_enabled");
-    if (item && cJSON_IsBool(item)) {
-        config->vad_enabled = cJSON_IsTrue(item);
-    }
-
     item = cJSON_GetObjectItemCaseSensitive(root, "vad_mode");
     if (item && cJSON_IsNumber(item)) {
         int mode = (int)item->valueint;
@@ -543,7 +536,6 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddBoolToObject(root, "append_transcription_text", config->append_transcription_text);
 
     /* VAD settings */
-    cJSON_AddBoolToObject(root, "vad_enabled", config->vad_enabled);
     cJSON_AddNumberToObject(root, "vad_mode", config->vad_mode);
     cJSON_AddNumberToObject(root, "vad_silence_ms", config->vad_silence_ms);
     cJSON_AddBoolToObject(root, "continuous_dictation", config->continuous_dictation);
@@ -794,18 +786,6 @@ bool config_get_append_transcription_text(const AppConfig* config)
 }
 
 // VAD configuration accessors
-
-void config_set_vad_enabled(AppConfig* config, bool enabled)
-{
-    if (!config) return;
-    config->vad_enabled = enabled;
-}
-
-bool config_get_vad_enabled(const AppConfig* config)
-{
-    if (!config) return false;
-    return config->vad_enabled;
-}
 
 void config_set_vad_mode(AppConfig* config, int mode)
 {

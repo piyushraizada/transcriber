@@ -225,6 +225,13 @@ typedef struct TranscriberApp {
 
     /* Mutex for scanner segment callback — protects concurrent transcription */
     pthread_mutex_t scanner_transcribe_mutex;
+
+    /* Accumulated transcribed text for clipboard in continuous mode.
+     * Each successful transcription appends to this buffer so the clipboard
+     * always holds the full transcript, not just the last segment. Protected
+     * by continuous_clipboard_mutex. */
+    char *continuous_clipboard_text;
+    pthread_mutex_t continuous_clipboard_mutex;
 } TranscriberApp;
 
 /* ------------------------------------------------------------------ */
@@ -736,25 +743,18 @@ static void handle_enter_listening(TranscriberApp *app) {
     }
 
     /* Configure VAD before starting recording.
-     * Continuous mode: disable VAD auto-stop (scanner handles it).
-     * On-demand mode: enable VAD auto-stop with callback. */
+     * VAD auto-stop is always disabled - recordings stop via timer or manual click.
+     * In continuous mode, the silence scanner handles segment detection. */
     if (app->audio_recorder && app->controller.config) {
-        bool vad_enabled = config_get_vad_enabled(app->controller.config);
         bool continuous_dictation = config_get_continuous_dictation(app->controller.config);
 
-        if (continuous_dictation) {
-            /* Continuous mode: disable VAD auto-stop, use silence scanner instead */
-            audio_recorder_configure_vad(app->audio_recorder, false,
-                                         config_get_vad_mode(app->controller.config),
-                                         config_get_vad_silence_ms(app->controller.config));
-        } else {
-            /* On-demand mode: enable VAD auto-stop with callback */
-            audio_recorder_configure_vad(
-                app->audio_recorder,
-                vad_enabled,
-                config_get_vad_mode(app->controller.config),
-                config_get_vad_silence_ms(app->controller.config)
-            );
+        /* Always disable VAD auto-stop. */
+        audio_recorder_configure_vad(app->audio_recorder, false,
+                                     config_get_vad_mode(app->controller.config),
+                                     config_get_vad_silence_ms(app->controller.config));
+
+        if (!continuous_dictation) {
+            /* On-demand mode: use manual stop callback for timer-based stopping */
             audio_recorder_set_vad_stop_callback(app->audio_recorder,
                                                  on_vad_silence_stop, app);
         }
@@ -1130,8 +1130,13 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
     /* Stop transcription watchdog on result */
     stop_transcription_watchdog(app);
 
+    /* Check continuous mode early so clipboard logic can use it below. */
+    bool continuous = false;
+    if (app->controller.config) {
+        continuous = config_get_continuous_dictation(app->controller.config);
+    }
+
     if (success && text_or_error) {
-        /* Log the raw transcription output for debugging */
         /* Log the raw transcription output for debugging */
         g_log("main", G_LOG_LEVEL_WARNING,
               "[flow] Transcription SUCCESS — appending '%.80s...'\n", text_or_error);
@@ -1141,12 +1146,32 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
             app_text_window_append_text(app->text_window, text_or_error);
         }
 
-        /* Copy to clipboard (both PRIMARY and CLIPBOARD).
-          * This function is invoked from the GTK main thread via
-          * g_idle_add() in transcribe_thread_func(), so GTK clipboard
-          * operations are safe here without additional marshaling. */
-        if (clipboard_is_available(NULL)) {
-            clipboard_copy_text_both(NULL, text_or_error);
+        /* In continuous mode, accumulate all segments into a single buffer so
+         * the clipboard always holds the full transcript. In normal mode, just
+         * copy the current segment as before. */
+        if (continuous) {
+            pthread_mutex_lock(&app->continuous_clipboard_mutex);
+            char *accumulated = g_strdup_printf("%s%s%s",
+                app->continuous_clipboard_text ? app->continuous_clipboard_text : "",
+                app->continuous_clipboard_text ? " " : "",
+                text_or_error);
+            g_free(app->continuous_clipboard_text);
+            app->continuous_clipboard_text = accumulated;
+            pthread_mutex_unlock(&app->continuous_clipboard_mutex);
+
+            if (clipboard_is_available(NULL)) {
+                clipboard_copy_text_both(NULL, app->continuous_clipboard_text);
+            }
+        } else {
+            /* Normal mode: reset accumulator and copy just this segment. */
+            pthread_mutex_lock(&app->continuous_clipboard_mutex);
+            g_free(app->continuous_clipboard_text);
+            app->continuous_clipboard_text = NULL;
+            pthread_mutex_unlock(&app->continuous_clipboard_mutex);
+
+            if (clipboard_is_available(NULL)) {
+                clipboard_copy_text_both(NULL, text_or_error);
+            }
         }
 
         /* Delete the temporary WAV file after transcription */
@@ -1158,12 +1183,6 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
         if (app->text_window) {
             app_text_window_set_error(app->text_window, text_or_error);
         }
-    }
-
-    /* Check if continuous mode is enabled */
-    bool continuous = false;
-    if (app->controller.config) {
-        continuous = config_get_continuous_dictation(app->controller.config);
     }
 
     /* Check if user explicitly requested stop (click during LISTENING in continuous mode).
@@ -1476,12 +1495,12 @@ static void on_microphone_toggle(void *user_data) {
         }
     }
 
-    /* When user clicks during LISTENING in continuous mode, set the stop flag
+    /* When user clicks during LISTENING or TRANSCRIBING in continuous mode, set the stop flag
      * so that on_transcription_result knows this was an explicit user stop
      * and should transition to IDLE instead of restarting recording. */
-    if (current == STATE_LISTENING && app->controller.config) {
+    if (app->controller.config) {
         bool continuous = config_get_continuous_dictation(app->controller.config);
-        if (continuous) {
+        if (continuous && (current == STATE_LISTENING || current == STATE_TRANSCRIBING)) {
             atomic_store(&app->user_requested_stop, 1);
         }
     }
@@ -1767,7 +1786,8 @@ static TranscriberApp *app_create(void) {
     if (pthread_mutex_init(&app->wav_path_mutex, NULL) != 0 ||
         pthread_mutex_init(&app->transcribe_thread_mutex, NULL) != 0 ||
         pthread_mutex_init(&app->model_load_thread_mutex, NULL) != 0 ||
-        pthread_mutex_init(&app->scanner_transcribe_mutex, NULL) != 0) {
+        pthread_mutex_init(&app->scanner_transcribe_mutex, NULL) != 0 ||
+        pthread_mutex_init(&app->continuous_clipboard_mutex, NULL) != 0) {
         app_destroy(app);
         return NULL;
     }
@@ -1875,10 +1895,14 @@ static void app_destroy(TranscriberApp *app) {
     /* Free the current WAV path */
     g_free(app->current_wav_path);
 
+    /* Free accumulated continuous-mode clipboard text */
+    g_free(app->continuous_clipboard_text);
+
     /* Destroy mutexes */
     pthread_mutex_destroy(&app->wav_path_mutex);
     pthread_mutex_destroy(&app->transcribe_thread_mutex);
     pthread_mutex_destroy(&app->model_load_thread_mutex);
+    pthread_mutex_destroy(&app->continuous_clipboard_mutex);
 
     /* Drain any pending GTK idle callbacks that may reference 'app' before
      * freeing it. Worker threads (scanner, transcription) queue idle callbacks
