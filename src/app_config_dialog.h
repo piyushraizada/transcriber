@@ -19,7 +19,7 @@
  *
  *   - Whisper model path (text entry)
  *   - Audio device selection (combo box dropdown)
- *   - Maximum recording duration (spin button — 5 to 120 seconds)
+ *   - Maximum recording duration (spin button — 5 to 30 seconds)
  *   - Window position reset (button)
  *   - D-Bus hotkey command display (read-only label)
  *

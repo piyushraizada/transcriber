@@ -376,7 +376,7 @@ bool config_load_from_path(AppConfig* config, const char* path)
     if (item && cJSON_IsNumber(item)) {
         int dur = (int)item->valueint;
         if (dur < 5) config->max_duration = 5;
-        else if (dur > 120) config->max_duration = 120;
+        else if (dur > 30) config->max_duration = 30;
         else config->max_duration = dur;
     }
 
@@ -629,9 +629,9 @@ bool config_validate(const AppConfig* config)
         return false;
     }
 
-    /* Validate max_duration — must be in [5, 120] per SRS */
-    if (config->max_duration < 5 || config->max_duration > 120) {
-        set_error("max_duration must be between 5 and 120 seconds");
+    /* Validate max_duration — must be in [5, 30] per SRS */
+    if (config->max_duration < 5 || config->max_duration > 30) {
+        set_error("max_duration must be between 5 and 30 seconds");
         return false;
     }
 
@@ -727,7 +727,7 @@ bool config_set_max_duration(AppConfig* config, int duration)
         return false;
     }
     if (duration < 5) duration = 5;
-    if (duration > 120) duration = 120;
+    if (duration > 30) duration = 30;
     config->max_duration = duration;
     return true;
 }

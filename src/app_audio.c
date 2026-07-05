@@ -788,6 +788,10 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         }
     }
 
+    g_log("app-audio", G_LOG_LEVEL_WARNING,
+          "[flow] audio_recorder_start() — created WAV '%s', ring_buffer=%p\n",
+          recorder->wav_path, (void*)recorder->ring_buffer);
+
     int err = pthread_create(&recorder->capture_thread, NULL, capture_thread_func, recorder);
     if (err != 0) {
         char msg[512];
@@ -824,11 +828,15 @@ bool audio_recorder_stop(AudioRecorder *recorder) {
 
     /* Guard: if not recording, bail out */
     if (!recorder->is_recording) {
+        g_log("app-audio", G_LOG_LEVEL_WARNING,
+              "[flow] audio_recorder_stop() — NOT recording (already stopped)\n");
         pthread_mutex_unlock(&recorder->mutex);
         return false;
     }
 
     /* Use atomic store for portable thread safety */
+    g_log("app-audio", G_LOG_LEVEL_WARNING,
+          "[flow] audio_recorder_stop() — stopping active recording\n");
     atomic_store(&recorder->stop_flag, true);
 
     pthread_mutex_unlock(&recorder->mutex);

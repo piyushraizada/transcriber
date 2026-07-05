@@ -79,7 +79,7 @@ typedef struct _AppConfig {
                                            ///< Stored for readability in config file; not used for device opening.
                                            ///< @see CFG-006: Audio Device
 
-    int max_duration;            ///< Maximum recording duration in seconds (5-120)
+    int max_duration;            ///< Maximum recording duration in seconds (5-30)
                                    ///< @see CFG-014: Max Recording Duration
                                    ///< @see FR-007a: Maximum Session Limit
 

@@ -941,7 +941,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     gtk_label_set_xalign(GTK_LABEL(dur_label), 0);
     gtk_box_pack_start(GTK_BOX(vbox), dur_label, FALSE, FALSE, 0);
 
-    dlg->duration_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(5, 120, 1));
+    dlg->duration_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(5, 30, 1));
     gtk_spin_button_set_value(dlg->duration_spin, (gdouble)config_get_max_duration(config));
     gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->duration_spin), FALSE, TRUE, 0);
 

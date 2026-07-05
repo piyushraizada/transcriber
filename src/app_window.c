@@ -1141,10 +1141,14 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
     gboolean has_content = !gtk_text_iter_equal(&start, &end);
 
+    gint chars_before = gtk_text_buffer_get_char_count(tw->buffer);
+
     if (has_content) {
         gtk_text_buffer_insert(tw->buffer, &end, " ", 1);
     }
     gtk_text_buffer_insert(tw->buffer, &end, text, -1);
+
+    gint chars_after = gtk_text_buffer_get_char_count(tw->buffer);
 
     /* Show the window without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
@@ -1153,8 +1157,16 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
     gtk_widget_show_all(GTK_WIDGET(tw->window));
     gtk_window_deiconify(tw->window);
 
-    /* Scroll to the end */
+    /* Scroll to the end — DIAGNOSTIC LOGGING for auto-scroll investigation.
+     * Current call uses use_align=FALSE, which only scrolls if iter is NOT visible.
+     * Log buffer size and scroll parameters to validate whether this causes missed scrolls. */
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
+
+    g_log("app_window", G_LOG_LEVEL_DEBUG,
+          "[scroll] append_text: chars_before=%d chars_after=%d appended_len=%zu "
+          "use_align=FALSE xalign=0 yalign=0",
+          chars_before, chars_after, strlen(text));
+
     gtk_text_view_scroll_to_iter(tw->text_view, &end, 0, FALSE, 0, 0);
 }
 

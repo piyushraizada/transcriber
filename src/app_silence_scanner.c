@@ -267,6 +267,19 @@ static void *scanner_thread_func(void *arg)
     }
 
     g_free(chunk);
+    /* Thread exit is expected when:
+     *   - transcribe_thread_func() stops the scanner before extracting samples
+     *   - handle_enter_listening() destroys the old scanner on restart
+     *   - application shutdown
+     * Log at DEBUG level to avoid alarming users. */
+    g_log("app-scanner", G_LOG_LEVEL_DEBUG,
+          "[scanner] Scanner thread exiting\n");
+
+    /* Signal that scanner is done */
+    pthread_mutex_lock(&scanner->mutex);
+    scanner->running = false;
+    pthread_mutex_unlock(&scanner->mutex);
+
     g_log("app-scanner", G_LOG_LEVEL_MESSAGE,
           "[scanner] Thread exited\n");
     return NULL;
