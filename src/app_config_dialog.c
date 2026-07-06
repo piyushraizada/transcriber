@@ -49,6 +49,7 @@ struct _ConfigDialog {
     /* VAD controls */
     GtkComboBox *vad_mode_combo;
     GtkSpinButton *vad_silence_spin;
+    GtkSpinButton *min_segment_spin;
     GtkCheckButton *continuous_dictation_checkbox;
     GtkLabel *model_path_error;
     GtkLabel *duration_error;
@@ -349,6 +350,8 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     config_set_vad_mode(dlg->config, gtk_combo_box_get_active(dlg->vad_mode_combo));
     config_set_scanner_silence_ms(dlg->config,
         (int)(gtk_spin_button_get_value(dlg->vad_silence_spin) * 1000.0));
+    config_set_scanner_min_segment_ms(dlg->config,
+        (int)(gtk_spin_button_get_value(dlg->min_segment_spin) * 1000.0));
     config_set_continuous_dictation(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
 
@@ -1079,6 +1082,21 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         GtkWidget *silence_unit = gtk_label_new("seconds");
         gtk_box_pack_start(GTK_BOX(silence_box), silence_unit, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), silence_box, FALSE, FALSE, 0);
+
+        // Minimum segment duration — shortest audio before sending to Whisper
+        GtkWidget *min_seg_label = gtk_label_new("  Minimum segment length:");
+        gtk_label_set_xalign(GTK_LABEL(min_seg_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), min_seg_label, FALSE, FALSE, 0);
+
+        GtkWidget *min_seg_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        dlg->min_segment_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 30.0, 0.5));
+        gtk_spin_button_set_value(dlg->min_segment_spin,
+                                  (gdouble)config_get_scanner_min_segment_ms(config) / 1000.0);
+        gtk_box_pack_start(GTK_BOX(min_seg_box), GTK_WIDGET(dlg->min_segment_spin), FALSE, FALSE, 0);
+
+        GtkWidget *min_seg_unit = gtk_label_new("seconds");
+        gtk_box_pack_start(GTK_BOX(min_seg_box), min_seg_unit, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), min_seg_box, FALSE, FALSE, 0);
 
         // Continuous dictation checkbox
         dlg->continuous_dictation_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
