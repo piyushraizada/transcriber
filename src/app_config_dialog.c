@@ -921,7 +921,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
             } while (gtk_tree_model_iter_next(lang_model, &iter));
         }
 
-        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->language_combo), FALSE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->language_combo), FALSE, FALSE, 0);
 
         GtkWidget *lang_help = gtk_label_new(
             "Select the input language for transcription. Use Auto-detect for multilingual input.");
