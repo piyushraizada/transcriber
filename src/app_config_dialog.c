@@ -21,6 +21,7 @@
 #include "app_gpu.h"
 
 #include <gtk/gtk.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -48,7 +49,7 @@ struct _ConfigDialog {
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
     GtkComboBox *vad_mode_combo;
-    GtkSpinButton *vad_silence_spin;
+    GtkComboBox   *vad_silence_combo;
     GtkSpinButton *min_segment_spin;
     GtkCheckButton *continuous_dictation_checkbox;
     GtkLabel *model_path_error;
@@ -348,8 +349,13 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
 
     /* Save VAD settings */
     config_set_vad_mode(dlg->config, gtk_combo_box_get_active(dlg->vad_mode_combo));
-    config_set_scanner_silence_sec(dlg->config,
-        (float)gtk_spin_button_get_value(dlg->vad_silence_spin));
+    {
+        int silence_idx = gtk_combo_box_get_active(dlg->vad_silence_combo);
+        static const float kSilenceValues[] = {0.5f, 1.0f, 1.5f, 2.0f};
+        if (silence_idx >= 0 && (unsigned)silence_idx <= G_N_ELEMENTS(kSilenceValues)) {
+            config_set_scanner_silence_sec(dlg->config, kSilenceValues[silence_idx]);
+        }
+    }
     config_set_scanner_min_segment_sec(dlg->config,
         (float)gtk_spin_button_get_value(dlg->min_segment_spin));
     config_set_continuous_dictation(dlg->config,
@@ -1073,15 +1079,24 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_label_set_xalign(GTK_LABEL(scanner_silence_label), 0);
         gtk_box_pack_start(GTK_BOX(vbox), scanner_silence_label, FALSE, FALSE, 0);
 
-        GtkWidget *silence_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 10.0, 0.1));
-        gtk_spin_button_set_value(dlg->vad_silence_spin,
-                                  (gdouble)config_get_scanner_silence_sec(config));
-        gtk_box_pack_start(GTK_BOX(silence_box), GTK_WIDGET(dlg->vad_silence_spin), FALSE, FALSE, 0);
-
-        GtkWidget *silence_unit = gtk_label_new("seconds");
-        gtk_box_pack_start(GTK_BOX(silence_box), silence_unit, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(vbox), silence_box, FALSE, FALSE, 0);
+        dlg->vad_silence_combo = GTK_COMBO_BOX(gtk_combo_box_text_new());
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_silence_combo), "0.5", "0.5 sec");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_silence_combo), "1.0", "1.0 sec");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_silence_combo), "1.5", "1.5 sec");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->vad_silence_combo), "2.0", "2.0 sec");
+        {
+            float silence_val = config_get_scanner_silence_sec(config);
+            static const float kSilenceValues[] = {0.5f, 1.0f, 1.5f, 2.0f};
+            int best_idx = 1; /* default to 1.0 */
+            for (size_t i = 0; i < G_N_ELEMENTS(kSilenceValues); i++) {
+                if (fabsf(silence_val - kSilenceValues[i]) < 0.05f) {
+                    best_idx = i;
+                    break;
+                }
+            }
+            gtk_combo_box_set_active(dlg->vad_silence_combo, best_idx);
+        }
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_silence_combo), FALSE, FALSE, 0);
 
         // Minimum segment duration — shortest audio before sending to Whisper
         GtkWidget *min_seg_label = gtk_label_new("  Minimum segment length:");

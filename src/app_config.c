@@ -242,7 +242,7 @@ void config_set_defaults(AppConfig* config)
     config->continuous_dictation = true; // Continuous dictation mode by default
 
     /* Silence Scanner — only active in continuous dictation mode */
-    config->scanner_silence_sec = 2.0f;      // 2 sec silence before checking segment
+    config->scanner_silence_sec = 1.0f;      // 1 sec silence before checking segment
     config->scanner_min_segment_sec = 5.0f;  // Minimum 5 sec audio before transcribing
 
     /* Language — default to auto-detect */
