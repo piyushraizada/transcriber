@@ -170,8 +170,8 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 30, range: 5–30)
 - **Continuous dictation** — enable or disable the silence-triggered recording/transcription loop (default: `true`)
 - **VAD mode** — aggressiveness level as an integer from 0 to 3, where 0 is least aggressive (most sensitive) and 3 is most aggressive (most restrictive; default: 1, moderate)
-- **Silence threshold** — silence duration in milliseconds before the scanner segments audio for transcription (default: 2000 ms, range: 1000–10000 ms)
-- **Scanner min segment** — minimum audio segment length in milliseconds before sending to Whisper (default: 5000 ms, range: 1000–30000 ms)
+- **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription (default: 2 sec, range: 1–10 sec)
+- **Scanner min segment** — minimum audio segment length in seconds before sending to Whisper (default: 5 sec, range: 1–30 sec)
 - **Append transcription text** — when `true`, new transcriptions are appended to existing text; when `false`, the text window is cleared at the start of each session (default: `true`)
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 

@@ -348,10 +348,10 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
 
     /* Save VAD settings */
     config_set_vad_mode(dlg->config, gtk_combo_box_get_active(dlg->vad_mode_combo));
-    config_set_scanner_silence_ms(dlg->config,
-        (int)(gtk_spin_button_get_value(dlg->vad_silence_spin) * 1000.0));
-    config_set_scanner_min_segment_ms(dlg->config,
-        (int)(gtk_spin_button_get_value(dlg->min_segment_spin) * 1000.0));
+    config_set_scanner_silence_sec(dlg->config,
+        (float)gtk_spin_button_get_value(dlg->vad_silence_spin));
+    config_set_scanner_min_segment_sec(dlg->config,
+        (float)gtk_spin_button_get_value(dlg->min_segment_spin));
     config_set_continuous_dictation(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
 
@@ -1076,7 +1076,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         GtkWidget *silence_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 10.0, 0.1));
         gtk_spin_button_set_value(dlg->vad_silence_spin,
-                                  (gdouble)config_get_scanner_silence_ms(config) / 1000.0);
+                                  (gdouble)config_get_scanner_silence_sec(config));
         gtk_box_pack_start(GTK_BOX(silence_box), GTK_WIDGET(dlg->vad_silence_spin), FALSE, FALSE, 0);
 
         GtkWidget *silence_unit = gtk_label_new("seconds");
@@ -1091,7 +1091,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         GtkWidget *min_seg_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         dlg->min_segment_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 30.0, 0.5));
         gtk_spin_button_set_value(dlg->min_segment_spin,
-                                  (gdouble)config_get_scanner_min_segment_ms(config) / 1000.0);
+                                  (gdouble)config_get_scanner_min_segment_sec(config));
         gtk_box_pack_start(GTK_BOX(min_seg_box), GTK_WIDGET(dlg->min_segment_spin), FALSE, FALSE, 0);
 
         GtkWidget *min_seg_unit = gtk_label_new("seconds");

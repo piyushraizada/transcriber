@@ -242,8 +242,8 @@ void config_set_defaults(AppConfig* config)
     config->continuous_dictation = true; // Continuous dictation mode by default
 
     /* Silence Scanner — only active in continuous dictation mode */
-    config->scanner_silence_ms = 2000;       // 2s silence before checking segment
-    config->scanner_min_segment_ms = 5000;   // Minimum 5s audio before transcribing
+    config->scanner_silence_sec = 2.0f;      // 2 sec silence before checking segment
+    config->scanner_min_segment_sec = 5.0f;  // Minimum 5 sec audio before transcribing
 
     /* Language — default to auto-detect */
     strncpy(config->language, "auto", sizeof(config->language) - 1);
@@ -419,33 +419,47 @@ bool config_load_from_path(AppConfig* config, const char* path)
     }
 
     /* Note: vad_silence_ms removed — VAD auto-stop was disabled.
-     * Scanner silence threshold is controlled by scanner_silence_ms instead. */
+     * Scanner silence threshold is controlled by scanner_silence_sec instead. */
 
     item = cJSON_GetObjectItemCaseSensitive(root, "continuous_dictation");
     if (item && cJSON_IsBool(item)) {
         config->continuous_dictation = cJSON_IsTrue(item);
     }
 
-    /* Scanner settings */
-    item = cJSON_GetObjectItemCaseSensitive(root, "scanner_silence_ms");
-    if (item && cJSON_IsNumber(item)) {
-        int ms = (int)item->valueint;
-        if (ms >= 1000 && ms <= 10000) {
-            config->scanner_silence_ms = ms;
-        } else {
-            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid scanner_silence_ms %d, clamping to 2000\n", ms);
-            config->scanner_silence_ms = 2000;
+    /* Scanner settings — prefer new _sec keys, fall back to legacy _ms keys */
+    {
+        cJSON *silence_item = cJSON_GetObjectItemCaseSensitive(root, "scanner_silence_sec");
+        bool is_legacy_silence = false;
+        if (!silence_item || !cJSON_IsNumber(silence_item)) {
+            /* Fallback: read old scanner_silence_ms key and convert */
+            silence_item = cJSON_GetObjectItemCaseSensitive(root, "scanner_silence_ms");
+            is_legacy_silence = true;
+        }
+        if (silence_item && cJSON_IsNumber(silence_item)) {
+            float sec = is_legacy_silence
+                ? (float)(int)silence_item->valueint / 1000.0f
+                : (float)silence_item->valuedouble;
+            if (sec < 1.0f) sec = 1.0f;
+            else if (sec > 10.0f) sec = 10.0f;
+            config->scanner_silence_sec = sec;
         }
     }
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "scanner_min_segment_ms");
-    if (item && cJSON_IsNumber(item)) {
-        int ms = (int)item->valueint;
-        if (ms >= 1000 && ms <= 30000) {
-            config->scanner_min_segment_ms = ms;
-        } else {
-            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid scanner_min_segment_ms %d, clamping to 5000\n", ms);
-            config->scanner_min_segment_ms = 5000;
+    {
+        cJSON *seg_item = cJSON_GetObjectItemCaseSensitive(root, "scanner_min_segment_sec");
+        bool is_legacy_seg = false;
+        if (!seg_item || !cJSON_IsNumber(seg_item)) {
+            /* Fallback: read old scanner_min_segment_ms key and convert */
+            seg_item = cJSON_GetObjectItemCaseSensitive(root, "scanner_min_segment_ms");
+            is_legacy_seg = true;
+        }
+        if (seg_item && cJSON_IsNumber(seg_item)) {
+            float sec = is_legacy_seg
+                ? (float)(int)seg_item->valueint / 1000.0f
+                : (float)seg_item->valuedouble;
+            if (sec < 1.0f) sec = 1.0f;
+            else if (sec > 30.0f) sec = 30.0f;
+            config->scanner_min_segment_sec = sec;
         }
     }
 
@@ -525,9 +539,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddNumberToObject(root, "vad_mode", config->vad_mode);
     cJSON_AddBoolToObject(root, "continuous_dictation", config->continuous_dictation);
 
-    /* Scanner settings */
-    cJSON_AddNumberToObject(root, "scanner_silence_ms", config->scanner_silence_ms);
-    cJSON_AddNumberToObject(root, "scanner_min_segment_ms", config->scanner_min_segment_ms);
+    /* Scanner settings — stored in seconds */
+    cJSON_AddNumberToObject(root, "scanner_silence_sec", config->scanner_silence_sec);
+    cJSON_AddNumberToObject(root, "scanner_min_segment_sec", config->scanner_min_segment_sec);
 
     /* Language */
     cJSON_AddStringToObject(root, "language", config->language);
@@ -777,32 +791,33 @@ bool config_get_continuous_dictation(const AppConfig* config)
  * Scanner configuration accessors
  * ---------------------------------------------------------------- */
 
-void config_set_scanner_silence_ms(AppConfig* config, int ms)
+
+void config_set_scanner_silence_sec(AppConfig* config, float sec)
 {
     if (!config) return;
-    if (ms >= 1000 && ms <= 10000) {
-        config->scanner_silence_ms = ms;
-    }
+    if (sec < 1.0f) sec = 1.0f;
+    else if (sec > 10.0f) sec = 10.0f;
+    config->scanner_silence_sec = sec;
 }
 
-int config_get_scanner_silence_ms(const AppConfig* config)
+float config_get_scanner_silence_sec(const AppConfig* config)
 {
-    if (!config) return 2000;
-    return config->scanner_silence_ms;
+    if (!config) return 2.0f;
+    return config->scanner_silence_sec;
 }
 
-void config_set_scanner_min_segment_ms(AppConfig* config, int ms)
+void config_set_scanner_min_segment_sec(AppConfig* config, float sec)
 {
     if (!config) return;
-    if (ms >= 1000 && ms <= 30000) {
-        config->scanner_min_segment_ms = ms;
-    }
+    if (sec < 1.0f) sec = 1.0f;
+    else if (sec > 30.0f) sec = 30.0f;
+    config->scanner_min_segment_sec = sec;
 }
 
-int config_get_scanner_min_segment_ms(const AppConfig* config)
+float config_get_scanner_min_segment_sec(const AppConfig* config)
 {
-    if (!config) return 5000;
-    return config->scanner_min_segment_ms;
+    if (!config) return 5.0f;
+    return config->scanner_min_segment_sec;
 }
 
 /* ----------------------------------------------------------------

@@ -114,15 +114,15 @@ typedef struct _AppConfig {
                                          ///< the mic icon, then stops. Default: true.
 
     /* Silence Scanner Settings — only used in continuous dictation mode */
-    int scanner_silence_ms;          ///< Silence duration (ms) before scanner checks segment
-                                         ///< When the scanner detects continuous silence for this
-                                         ///< duration, it checks if the audio segment meets the
-                                         ///< minimum duration. Range: 1000-10000 ms. Default: 2000.
+    float scanner_silence_sec;       ///< Silence duration (seconds) before scanner checks segment
+                                          ///< When the scanner detects continuous silence for this
+                                          ///< duration, it checks if the audio segment meets the
+                                          ///< minimum duration. Range: 1-10 sec. Default: 2.
 
-    int scanner_min_segment_ms;      ///< Minimum segment duration (ms) before transcribing
-                                         ///< The scanner will never send a segment shorter than
-                                         ///< this to Whisper. Short segments are absorbed into
-                                         ///< the next batch. Range: 1000-30000 ms. Default: 5000.
+    float scanner_min_segment_sec;   ///< Minimum segment duration (sec) before transcribing
+                                          ///< The scanner will never send a segment shorter than
+                                          ///< this to Whisper. Short segments are absorbed into
+                                          ///< the next batch. Range: 1-30 sec. Default: 5.
 
     /* Language Settings */
     char language[16];              ///< Language code for transcription (e.g., "en", "fr", "es", "auto")
@@ -496,10 +496,33 @@ bool config_get_continuous_dictation(const AppConfig* config);
  * Section 6.5: Scanner Configuration Accessors
  *---------------------------------------------------------------------------*/
 
-void config_set_scanner_silence_ms(AppConfig* config, int ms);
-int config_get_scanner_silence_ms(const AppConfig* config);
-void config_set_scanner_min_segment_ms(AppConfig* config, int ms);
-int config_get_scanner_min_segment_ms(const AppConfig* config);
+/**
+ * Set silence threshold in seconds.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param sec     Silence duration in seconds. Clamped to [1, 10].
+ */
+void config_set_scanner_silence_sec(AppConfig* config, float sec);
+
+/**
+ * Get silence threshold in seconds.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return Silence threshold in seconds, defaults to 2.
+ */
+float config_get_scanner_silence_sec(const AppConfig* config);
+
+/**
+ * Set minimum segment duration in seconds.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param sec     Minimum segment duration in seconds. Clamped to [1, 30].
+ */
+void config_set_scanner_min_segment_sec(AppConfig* config, float sec);
+
+/**
+ * Get minimum segment duration in seconds.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return Minimum segment duration in seconds, defaults to 5.
+ */
+float config_get_scanner_min_segment_sec(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 6.6: Language Configuration Accessors

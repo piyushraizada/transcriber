@@ -766,8 +766,8 @@ static void handle_enter_listening(TranscriberApp *app) {
                     app->silence_scanner = silence_scanner_create(
                         rb,
                         (VadMode)config_get_vad_mode(app->controller.config),
-                        config_get_scanner_silence_ms(app->controller.config),
-                        config_get_scanner_min_segment_ms(app->controller.config)
+                        (int)(config_get_scanner_silence_sec(app->controller.config) * 1000.0f),
+                        (int)(config_get_scanner_min_segment_sec(app->controller.config) * 1000.0f)
                     );
                     if (app->silence_scanner) {
                         silence_scanner_set_callback(app->silence_scanner,
