@@ -177,36 +177,33 @@ size_t ring_buffer_extract_all(AudioRingBuffer *rb, int16_t **out_samples)
     return extracted;
 }
 
-double ring_buffer_fill_ratio(const AudioRingBuffer *rb)
+double ring_buffer_fill_ratio(AudioRingBuffer *rb)
 {
     if (!rb || rb->capacity == 0) return 0.0;
     /* Capacity is immutable after creation; count is protected by mutex. */
-    AudioRingBuffer *nonconst = (AudioRingBuffer *)(const void *)rb;
     size_t c;
-    pthread_mutex_lock(&nonconst->mutex);
-    c = nonconst->count;
-    pthread_mutex_unlock(&nonconst->mutex);
+    pthread_mutex_lock(&rb->mutex);
+    c = rb->count;
+    pthread_mutex_unlock(&rb->mutex);
     return (double)c / (double)rb->capacity;
 }
 
-size_t ring_buffer_read_range(const AudioRingBuffer *rb,
+size_t ring_buffer_read_range(AudioRingBuffer *rb,
                               size_t offset,
                               int16_t *out,
                               size_t count)
 {
     if (!rb || !out || count == 0) return 0;
 
-    AudioRingBuffer *nonconst = (AudioRingBuffer *)(const void *)rb;
-
     /* Single critical section: read all state and perform the copy atomically
      * with respect to the writer. This eliminates the TOCTOU vulnerability
      * where the writer could advance write_pos/count between two separate
      * mutex acquisitions, causing stale bounds checks or out-of-bounds reads. */
-    pthread_mutex_lock(&nonconst->mutex);
+    pthread_mutex_lock(&rb->mutex);
 
-    size_t available = nonconst->count;
+    size_t available = rb->count;
     if (offset >= available) {
-        pthread_mutex_unlock(&nonconst->mutex);
+        pthread_mutex_unlock(&rb->mutex);
         return 0;
     }
     /* Use subtraction form to avoid size_t wrap-around in offset + count */
@@ -216,28 +213,28 @@ size_t ring_buffer_read_range(const AudioRingBuffer *rb,
 
     /* Calculate the physical read position for the oldest sample */
     size_t oldest_pos;
-    if (nonconst->count >= nonconst->capacity) {
-        oldest_pos = nonconst->write_pos;  /* Full: oldest = write_pos */
+    if (rb->count >= rb->capacity) {
+        oldest_pos = rb->write_pos;  /* Full: oldest = write_pos */
     } else {
-        oldest_pos = (nonconst->write_pos + nonconst->capacity - nonconst->count) % nonconst->capacity;
+        oldest_pos = (rb->write_pos + rb->capacity - rb->count) % rb->capacity;
     }
 
     /* Apply offset to get actual read position */
-    size_t read_pos = (oldest_pos + offset) % nonconst->capacity;
+    size_t read_pos = (oldest_pos + offset) % rb->capacity;
 
     /* Copy in two chunks to handle wrap-around */
-    size_t first_chunk = nonconst->capacity - read_pos;
+    size_t first_chunk = rb->capacity - read_pos;
     if (first_chunk > count) {
         first_chunk = count;
     }
-    memcpy(out, nonconst->buffer + read_pos, first_chunk * sizeof(int16_t));
+    memcpy(out, rb->buffer + read_pos, first_chunk * sizeof(int16_t));
 
     size_t second_chunk = count - first_chunk;
     if (second_chunk > 0) {
-        memcpy(out + first_chunk, nonconst->buffer, second_chunk * sizeof(int16_t));
+        memcpy(out + first_chunk, rb->buffer, second_chunk * sizeof(int16_t));
     }
 
-    pthread_mutex_unlock(&nonconst->mutex);
+    pthread_mutex_unlock(&rb->mutex);
     return count;
 }
 

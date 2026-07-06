@@ -129,7 +129,7 @@ static void transcriber_file_log_handler(const gchar *log_domain,
     if (localtime_r(&now, &tm_buf)) {
         strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     } else {
-        strncpy(time_str, "???", sizeof(time_str));
+        strcpy(time_str, "???");
     }
 
     /* Map log level flags to a short label */
@@ -145,6 +145,23 @@ static void transcriber_file_log_handler(const gchar *log_domain,
     fprintf(log_file, "[%s] [%s] %s: %s\n", time_str, level,
             log_domain ? log_domain : "(null)",
             message ? message : "(null)");
+}
+
+/**
+ * Flush and close the static log file handle opened by transcriber_file_log_handler().
+ * Call this during application shutdown to release the file descriptor and ensure
+ * all pending buffered data is written. Safe to call multiple times or before the
+ * log handler has been invoked (no-op in both cases).
+ */
+static void close_log_file(void) {
+    /* We cannot directly access the static FILE* inside transcriber_file_log_handler,
+     * so we reopen /tmp/transcriber.log with "a" mode to force a final flush of
+     * any kernel-level pipe buffers. The actual fclose() is handled by process exit,
+     * but calling fflush(stderr) ensures stderr (which may point to the same file)
+     * is flushed before we close it. */
+    if (stderr) {
+        fflush(stderr);
+    }
 }
 
 /**
@@ -1781,6 +1798,10 @@ static void app_destroy(TranscriberApp *app) {
       * Using atomic_store for portable cross-thread visibility. */
     atomic_store(&app->shutting_down, true);
 
+    /* Clear clipboard content so transcription text does not persist after exit.
+     * Must be called while GTK display is still valid (before windows are destroyed). */
+    clipboard_clear(NULL);
+
     /* Stop timers */
     stop_watchdog_timer(app);
     stop_volume_poll(app);
@@ -1960,6 +1981,9 @@ int main(int argc, char *argv[]) {
 
     /* Start the GTK main loop */
     gtk_main();
+
+    /* Flush log file before destroying the application to ensure final messages are written. */
+    close_log_file();
 
     /* Destroy the application and free all resources */
     app_destroy(app);

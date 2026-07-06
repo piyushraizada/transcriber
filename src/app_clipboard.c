@@ -101,8 +101,37 @@ bool clipboard_copy_text_both(GdkDisplay* display, const char* text)
     return clipboard_ok;
 }
 
-/* Removed unused clipboard_copy_from_text_view(), clipboard_clear(),
- * clipboard_get_clipboard(), and clipboard_get_primary(). */
+/*---------------------------------------------------------------------------
+ * Clipboard Clear — remove application content on shutdown
+ *---------------------------------------------------------------------------*/
+
+bool clipboard_clear(GdkDisplay* display)
+{
+    UNUSED(display); /* not required for clipboard operations */
+
+    bool cleared = true;
+
+    /* Clear CLIPBOARD selection */
+    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    if (clipboard) {
+        gtk_clipboard_set_text(clipboard, "", -1);
+        /* Do NOT store: we want the empty text to be cleared immediately on
+         * exit without persisting. Calling store() here would keep an empty
+         * string in the clipboard manager after process exit. */
+    } else {
+        cleared = false;
+    }
+
+    /* Clear PRIMARY selection if available */
+    GtkClipboard* primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    if (primary) {
+        gtk_clipboard_set_text(primary, "", -1);
+    }
+    /* PRIMARY unavailable on native Wayland — not an error */
+
+    set_error(NULL);
+    return cleared;
+}
 
 /*---------------------------------------------------------------------------
  * Section 3: Clipboard Utilities

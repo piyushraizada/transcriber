@@ -135,7 +135,7 @@ size_t ring_buffer_extract_all(AudioRingBuffer *rb, int16_t **out_samples);
  * @param count    Number of samples to read.
  * @return Number of samples actually read (may be less than count if offset+count exceeds available data).
  */
-size_t ring_buffer_read_range(const AudioRingBuffer *rb,
+size_t ring_buffer_read_range(AudioRingBuffer *rb,
                               size_t offset,
                               int16_t *out,
                               size_t count);
@@ -158,7 +158,7 @@ void ring_buffer_reset(AudioRingBuffer *rb);
  * @param rb Ring buffer instance.
  * @return Fill ratio, or 0.0 if NULL.
  */
-double ring_buffer_fill_ratio(const AudioRingBuffer *rb);
+double ring_buffer_fill_ratio(AudioRingBuffer *rb);
 
 #ifdef __cplusplus
 }

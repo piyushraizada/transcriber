@@ -103,7 +103,21 @@ bool clipboard_copy_text(GdkDisplay* display, const char* text);
  */
 bool clipboard_copy_text_both(GdkDisplay* display, const char* text);
 
-/* Removed unused clipboard_copy_from_text_view() and clipboard_clear(). */
+/**
+ * Clear the application's owned content from both CLIPBOARD and PRIMARY selections.
+ *
+ * This function sets an empty string on both clipboard selections, effectively
+ * clearing any transcription text placed by this application. It should be called
+ * during application shutdown to ensure leftover text does not persist in the
+ * system clipboard after the process exits (a known behavior of gtk_clipboard_store()
+ * on X11).
+ *
+ * @param display A GdkDisplay* for the clipboard. Pass NULL to use the
+ *                default display.
+ *
+ * @return true if both selections were cleared successfully, false otherwise.
+ */
+bool clipboard_clear(GdkDisplay* display);
 
 /*---------------------------------------------------------------------------
  * Section 3: Clipboard Utilities
