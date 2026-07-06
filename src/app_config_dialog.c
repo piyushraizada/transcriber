@@ -1069,7 +1069,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_mode_combo), FALSE, FALSE, 0);
 
         // Scanner silence duration — controls when silence scanner triggers transcription
-        GtkWidget *scanner_silence_label = gtk_label_new("  Auto-stop after silence:");
+        GtkWidget *scanner_silence_label = gtk_label_new("  Silence threshold:");
         gtk_label_set_xalign(GTK_LABEL(scanner_silence_label), 0);
         gtk_box_pack_start(GTK_BOX(vbox), scanner_silence_label, FALSE, FALSE, 0);
 
