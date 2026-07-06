@@ -74,12 +74,7 @@ typedef struct _AppConfig {
                                   ///< @see CFG-010: Microphone Selection
                                   ///< @see CFG-015: Audio Device Validation
 
-    char audio_device_display_name[256];  ///< User-friendly display name for the audio device
-                                           ///< Examples: "Built-in Microphone", "BlueSnowball"
-                                           ///< Stored for readability in config file; not used for device opening.
-                                           ///< @see CFG-006: Audio Device
-
-    int max_duration;            ///< Maximum recording duration in seconds (5-30)
+   int max_duration;            ///< Maximum recording duration in seconds (5-30)
                                    ///< @see CFG-014: Max Recording Duration
                                    ///< @see FR-007a: Maximum Session Limit
 
@@ -104,17 +99,12 @@ typedef struct _AppConfig {
                                         ///< Default: true (append mode for backward compatibility).
 
     /* VAD (Voice Activity Detection) Settings */
-    int vad_mode;                    ///< VAD aggressiveness mode (0-3)
+    int vad_mode;                    ///< VAD aggressiveness mode (0-3), used by silence scanner
                                         ///< 0 = Least aggressive (most sensitive, catches quiet speech)
                                         ///< 1 = Moderate
                                         ///< 2 = Aggressive
                                         ///< 3 = Most aggressive (most restrictive, only clear speech)
                                         ///< Default: 1 (moderate).
-
-    int vad_silence_ms;              ///< Silence duration in ms before triggering auto-stop
-                                        ///< When VAD detects continuous silence for this duration,
-                                        ///< recording stops and transcription begins automatically.
-                                        ///< Range: 500-5000 ms. Default: 1000 (1 second).
 
     bool continuous_dictation;       ///< Continuous dictation mode (silence-triggered loop)
                                          ///< When true (default), the silence scanner monitors
@@ -401,22 +391,6 @@ bool config_set_audio_device(AppConfig* config, const char* device);
 const char* config_get_audio_device(const AppConfig* config);
 
 /**
- * Set the user-friendly display name for the audio device.
- * @param config  Pointer to AppConfig. Must not be NULL.
- * @param name    Display name (e.g., "Built-in Microphone"). Copied internally.
- *                May be NULL or empty to clear.
- * @return true if valid, false if name is too long.
- */
-bool config_set_audio_device_display_name(AppConfig* config, const char* name);
-
-/**
- * Get the user-friendly display name for the audio device.
- * @param config Pointer to AppConfig. Must not be NULL.
- * @return The display name string (internal, must NOT be freed or modified).
- */
-const char* config_get_audio_device_display_name(const AppConfig* config);
-
-/**
  * Set the maximum recording duration.
  * @param config     Pointer to AppConfig. Must not be NULL.
  * @param duration   Duration in seconds. Must be in range [5, 30].
@@ -503,20 +477,6 @@ void config_set_vad_mode(AppConfig* config, int mode);
  * @return Mode value (0-3), defaults to 1.
  */
 int config_get_vad_mode(const AppConfig* config);
-
-/**
- * Set silence duration in ms before VAD triggers auto-stop.
- * @param config  Pointer to AppConfig. Must not be NULL.
- * @param ms      Silence duration in milliseconds (500-5000).
- */
-void config_set_vad_silence_ms(AppConfig* config, int ms);
-
-/**
- * Get silence duration threshold in ms.
- * @param config Pointer to AppConfig. Must not be NULL.
- * @return Silence duration in ms, defaults to 1000.
- */
-int config_get_vad_silence_ms(const AppConfig* config);
 
 /**
  * Enable or disable continuous dictation mode.

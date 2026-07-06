@@ -55,25 +55,6 @@ static void scrub_memory(void *ptr, size_t len) {
 }
 
 /* ===================================================================
- * VAD Stop Callback Idle Helper
- * =================================================================== */
-
-/* Helper struct for marshaling VAD stop callback to GTK main thread */
-typedef struct {
-    void (*callback)(void *user_data);
-    void *user_data;
-} VadStopIdleData;
-
-static gboolean g_idle_invoke_vad_stop(gpointer data) {
-    VadStopIdleData *vsd = (VadStopIdleData *)data;
-    if (vsd->callback) {
-        vsd->callback(vsd->user_data);
-    }
-    g_free(vsd);
-    return FALSE;
-}
-
-/* ===================================================================
  * Audio sample analysis helper
  * =================================================================== */
 
@@ -229,18 +210,6 @@ struct _AudioRecorder {
     gdouble rms_volume;
     pthread_mutex_t volume_mutex;
 
-    /* VAD (Voice Activity Detection) for silence-based auto-stop */
-    VadDetector *vad_detector;       ///< VAD instance, created on start, destroyed on stop
-    gint64 last_voice_frame_time_ms; ///< Timestamp (ms) of last frame detected as voice
-    bool vad_active;                 ///< true if VAD is enabled for current recording session
-    int vad_silence_ms;              ///< Silence threshold in ms before auto-stop
-    int vad_mode;                    ///< VAD aggressiveness mode (0-3), preserved for reset
-
-    /* VAD stop callback — invoked on GTK main thread when VAD triggers silence stop.
-     * Allows the application to transition from LISTENING to TRANSCRIBING state. */
-    void (*vad_stop_callback)(void *user_data);
-    void *vad_stop_user_data;
-
     /* In-memory ring buffer for continuous transcription (replaces WAV file) */
     AudioRingBuffer *ring_buffer;    ///< Ring buffer, created on start
 };
@@ -374,14 +343,6 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
         return NULL;
     }
 
-    /* VAD initialized to NULL — created on start if enabled in config */
-    recorder->vad_detector = NULL;
-    recorder->last_voice_frame_time_ms = 0;
-    recorder->vad_active = false;
-    recorder->vad_mode = 1;
-    recorder->vad_stop_callback = NULL;
-    recorder->vad_stop_user_data = NULL;
-
     /* Ring buffer initialized to NULL — created on start */
     recorder->ring_buffer = NULL;
 
@@ -415,12 +376,6 @@ void audio_recorder_destroy(AudioRecorder *recorder) {
 
     pthread_mutex_destroy(&recorder->volume_mutex);
     pthread_mutex_destroy(&recorder->mutex);
-
-    /* Destroy VAD detector if it was created */
-    if (recorder->vad_detector) {
-        vad_detector_destroy(recorder->vad_detector);
-        recorder->vad_detector = NULL;
-    }
 
     /* Destroy ring buffer if it was created */
     if (recorder->ring_buffer) {
@@ -518,26 +473,6 @@ static void *capture_thread_func(void *arg) {
      * is_recording is set to TRUE by the main thread under the mutex
      * in audio_recorder_start() after pthread_create() returns successfully. */
 
-    /* Initialize VAD silence timer so the first silence period doesn't
-     * trigger a false auto-stop (last_voice_frame_time_ms defaults to 0,
-     * which would make the first silence check report a huge elapsed time). */
-    /* Initialize VAD silence timer under mutex to prevent data race with
-     * audio_recorder_configure_vad() which may modify vad_active concurrently. */
-    {
-        bool vad_active_snapshot;
-        pthread_mutex_lock(&recorder->mutex);
-        vad_active_snapshot = recorder->vad_active;
-        pthread_mutex_unlock(&recorder->mutex);
-        if (vad_active_snapshot) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            pthread_mutex_lock(&recorder->mutex);
-            recorder->last_voice_frame_time_ms =
-                (gint64)now.tv_sec * 1000 + (gint64)now.tv_nsec / 1000000;
-            pthread_mutex_unlock(&recorder->mutex);
-        }
-    }
-
     /* Enter the ALSA read loop */
     int err;
     int iteration = 0;
@@ -549,7 +484,7 @@ static void *capture_thread_func(void *arg) {
         err = snd_pcm_readi(recorder->alsa_pcm, buffer, recorder->format.buffer_size);
         if (err == -EPIPE) {
             snd_pcm_prepare(recorder->alsa_pcm);
-            continue;
+            continue;  /* Loop will check stop_flag at while() condition */
         } else if (err < 0) {
             read_error_count++;
             const char *err_msg = snd_strerror(err);
@@ -590,96 +525,17 @@ static void *capture_thread_func(void *arg) {
             pthread_mutex_unlock(&recorder->volume_mutex);
         }
 
-        /* VAD-based silence detection — auto-stop after configured silence period.
-         * Buffer size is 320 samples (20ms at 16kHz), matching WebRTC VAD frame requirements.
-         * Snapshot VAD fields under mutex to prevent data races with main thread.
-         *
-         * IMPORTANT: When VAD is active, only voice frames are written to the ring
-         * buffer. Silence frames are excluded to prevent whisper from receiving
-         * trailing silence that causes hallucinated transcriptions. The WAV file
-         * still receives all frames for debugging/fallback purposes. */
-        bool frame_is_voice = true;  /* Default: assume voice when VAD is not active */
-        {
-            bool vad_active_snapshot;
-            VadDetector *vad_detector_snapshot;
-            int vad_silence_ms_snapshot;
-            pthread_mutex_lock(&recorder->mutex);
-            vad_active_snapshot = recorder->vad_active;
-            vad_detector_snapshot = recorder->vad_detector;
-            vad_silence_ms_snapshot = recorder->vad_silence_ms;
-            pthread_mutex_unlock(&recorder->mutex);
-            if (vad_active_snapshot && vad_detector_snapshot) {
-                int num_samples = err * recorder->format.channels;
-                int16_t *samples = (int16_t *)buffer;
-                frame_is_voice = vad_process_frame(vad_detector_snapshot,
-                                                   samples,
-                                                   (size_t)num_samples,
-                                                   recorder->format.sample_rate);
-
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                gint64 current_ms = (gint64)now.tv_sec * 1000 + (gint64)now.tv_nsec / 1000000;
-
-                if (frame_is_voice) {
-                    pthread_mutex_lock(&recorder->mutex);
-                    recorder->last_voice_frame_time_ms = current_ms;
-                    pthread_mutex_unlock(&recorder->mutex);
-                } else {
-                    gint64 last_voice_time;
-                    pthread_mutex_lock(&recorder->mutex);
-                    last_voice_time = recorder->last_voice_frame_time_ms;
-                    pthread_mutex_unlock(&recorder->mutex);
-                    gint64 silence_duration = current_ms - last_voice_time;
-                    if (silence_duration >= (gint64)vad_silence_ms_snapshot) {
-                        g_log("app-audio", G_LOG_LEVEL_MESSAGE,
-                              "[vad] Silence detected for %" G_GINT64_MODIFIER "d ms — stopping recording\n",
-                              silence_duration);
-                        /* Schedule VAD stop callback on GTK main thread before exiting loop.
-                         * This ensures the application transitions to TRANSCRIBING state. */
-                        void (*stop_cb)(void *) = NULL;
-                        void *stop_user_data = NULL;
-                        pthread_mutex_lock(&recorder->mutex);
-                        stop_cb = recorder->vad_stop_callback;
-                        stop_user_data = recorder->vad_stop_user_data;
-                        pthread_mutex_unlock(&recorder->mutex);
-                        if (stop_cb) {
-                            VadStopIdleData *vsd = g_new0(VadStopIdleData, 1);
-                            vsd->callback = stop_cb;
-                            vsd->user_data = stop_user_data;
-                            g_idle_add(g_idle_invoke_vad_stop, vsd);
-                        }
-                        atomic_store(&recorder->stop_flag, true);
-                    }
-                }
-            }
-        }
-
-        /* Write to ring buffer.
-         * In continuous mode (scanner active): write ALL frames so the scanner
-         * can detect silence patterns. The scanner enforces min_segment_ms to
-         * prevent hallucinations on short clips.
-         * In on-demand mode (VAD auto-stop): only write voice frames to prevent
-         * trailing silence from being transcribed.
-         *
+        /* Write all frames to ring buffer unconditionally.
+         * In continuous mode the silence scanner handles segment detection.
          * Thread safety: recorder->ring_buffer is set once during
          * audio_recorder_start() before pthread_create() returns, and is
          * never modified during recording. The pthread_create() call provides
          * a happens-before guarantee, ensuring the capture thread sees the
          * initialized ring_buffer pointer without additional synchronization. */
         if (recorder->ring_buffer) {
-            bool write_to_rb;
-            pthread_mutex_lock(&recorder->mutex);
-            /* In continuous mode (scanner), vad_active is false but we still
-             * need all frames. In on-demand VAD mode, vad_active is true and
-             * we filter silence. The key indicator is continuous_dictation. */
-            write_to_rb = !recorder->vad_active || frame_is_voice;
-            pthread_mutex_unlock(&recorder->mutex);
-
-            if (write_to_rb) {
-                int num_samples = err * recorder->format.channels;
-                int16_t *samples = (int16_t *)buffer;
-                ring_buffer_write(recorder->ring_buffer, samples, (size_t)num_samples);
-            }
+            int num_samples = err * recorder->format.channels;
+            int16_t *samples = (int16_t *)buffer;
+            ring_buffer_write(recorder->ring_buffer, samples, (size_t)num_samples);
         }
 
         iteration++;
@@ -828,20 +684,32 @@ bool audio_recorder_stop(AudioRecorder *recorder) {
 
     /* Guard: if not recording, bail out */
     if (!recorder->is_recording) {
-        g_log("app-audio", G_LOG_LEVEL_WARNING,
-              "[flow] audio_recorder_stop() — NOT recording (already stopped)\n");
         pthread_mutex_unlock(&recorder->mutex);
         return false;
     }
 
     /* Use atomic store for portable thread safety */
-    g_log("app-audio", G_LOG_LEVEL_WARNING,
-          "[flow] audio_recorder_stop() — stopping active recording\n");
     atomic_store(&recorder->stop_flag, true);
+
+    /* Interrupt any blocking ALSA read by dropping the PCM state.
+     * snd_pcm_readi() blocks indefinitely waiting for audio data from
+     * the hardware. Merely setting stop_flag does not interrupt that
+     * system call, causing pthread_join() below to hang forever on the
+     * GTK main thread (freezing the entire UI).
+     *
+     * snd_pcm_drop() forces the pending read to return -EPIPE, which
+     * the capture thread handles by calling snd_pcm_prepare() and then
+     * re-checking stop_flag — causing a clean loop exit.
+     *
+     * Safe under mutex: is_recording=TRUE guarantees alsa_pcm != NULL. */
+    if (recorder->alsa_pcm) {
+        snd_pcm_drop(recorder->alsa_pcm);
+    }
 
     pthread_mutex_unlock(&recorder->mutex);
 
-    /* Use pthread_join() for clean thread termination */
+    /* Use pthread_join() for clean thread termination.
+     * With the PCM dropped above, this should not block indefinitely. */
     void *thread_result = NULL;
     int join_err = pthread_join(recorder->capture_thread, &thread_result);
     if (join_err != 0) {
@@ -1077,65 +945,12 @@ double audio_recorder_get_volume_level(const AudioRecorder *recorder) {
     return vol;
 }
 
-/* ===================================================================
- * VAD Configuration
- * =================================================================== */
-
-void audio_recorder_configure_vad(AudioRecorder *recorder,
-                                  bool enabled,
-                                  int mode,
-                                  int silence_ms)
-{
-    if (!recorder) return;
-
-    pthread_mutex_lock(&recorder->mutex);
-
-    // Destroy existing VAD detector if changing config
-    if (recorder->vad_detector) {
-        vad_detector_destroy(recorder->vad_detector);
-        recorder->vad_detector = NULL;
-    }
-
-    recorder->vad_active = false;
-    recorder->vad_silence_ms = 1000;  // default
-
-    if (enabled && mode >= 0 && mode <= 3 && silence_ms >= 500 && silence_ms <= 5000) {
-        recorder->vad_mode = mode;  /* Store mode for reset */
-        recorder->vad_detector = vad_detector_create((VadMode)mode);
-        if (recorder->vad_detector) {
-            recorder->vad_active = true;
-            recorder->vad_silence_ms = silence_ms;
-            g_log("app-audio", G_LOG_LEVEL_MESSAGE,
-                  "[vad] VAD enabled: mode=%d, silence=%dms\n", mode, silence_ms);
-        } else {
-            g_log("app-audio", G_LOG_LEVEL_WARNING,
-                  "[vad] Failed to create VAD detector — VAD disabled\n");
-        }
-    }
-pthread_mutex_unlock(&recorder->mutex);
-}
-
 AudioRingBuffer *audio_recorder_get_ring_buffer(const AudioRecorder *recorder)
 {
     if (!recorder) return NULL;
     /* Ring buffer is set during start() and never modified during recording.
      * The pthread_create() in start() provides happens-before guarantee. */
     return recorder->ring_buffer;
-}
-
-/**
- * Set the callback to invoke when VAD triggers a silence-based stop.
- * The callback is scheduled on the GTK main thread via g_idle_add().
- */
-void audio_recorder_set_vad_stop_callback(AudioRecorder *recorder,
-                                          void (*callback)(void *user_data),
-                                          void *user_data)
-{
-    if (!recorder) return;
-    pthread_mutex_lock(&recorder->mutex);
-    recorder->vad_stop_callback = callback;
-    recorder->vad_stop_user_data = user_data;
-    pthread_mutex_unlock(&recorder->mutex);
 }
 
 /* ===================================================================

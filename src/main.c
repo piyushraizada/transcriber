@@ -155,7 +155,7 @@ static void transcriber_file_log_handler(const gchar *log_domain,
 static void register_all_log_handlers(void) {
     GLogLevelFlags mask =
         G_LOG_FLAG_RECURSION | G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL |
-        G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE | G_LOG_LEVEL_INFO | G_LOG_LEVEL_DEBUG;
+        G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE | G_LOG_LEVEL_INFO;
 
     /* NULL domain — catches GLib/GTK internal messages (GDBus, etc.) */
     g_log_set_handler(NULL, mask, transcriber_file_log_handler, NULL);
@@ -255,7 +255,6 @@ static void show_auto_close_dialog(TranscriberApp *app, const char *title,
                                    GtkMessageType type, const char *format, ...);
 static void handle_enter_listening(TranscriberApp *app);
 static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path);
-static void on_vad_silence_stop(void *user_data);
 static void on_scanner_segment(int16_t *samples, size_t count, void *user_data);
 static gboolean restart_watchdog_idle(gpointer user_data);
 static void start_watchdog_timer(TranscriberApp *app);
@@ -606,34 +605,6 @@ static void on_config_changed(void *user_data) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* VAD Silence Stop Callback                                           */
-/* ------------------------------------------------------------------ */
-
-/**
- * Callback invoked on the GTK main thread when VAD detects silence
- * and the capture thread has stopped recording.
- * Transitions the application from LISTENING to TRANSCRIBING state.
- */
-static void on_vad_silence_stop(void *user_data) {
-    TranscriberApp *app = (TranscriberApp *)user_data;
-
-    g_log("main", G_LOG_LEVEL_MESSAGE,
-          "[main] VAD silence stop callback — transitioning to TRANSCRIBING\n");
-
-    AppState state = app_get_state(&app->controller);
-    if (state == STATE_LISTENING) {
-        /* Transition to TRANSCRIBING */
-        if (app_transition_to(&app->controller, STATE_TRANSCRIBING)) {
-            /* Stop audio recording (capture thread already exited, but this
-             * finalizes the WAV file and performs cleanup) */
-            if (app->audio_recorder) {
-                audio_recorder_stop(app->audio_recorder);
-            }
-        }
-    }
-}
-
 /**
  * Callback invoked by the silence scanner when a segment is ready for transcription.
  * This runs on the scanner thread, so we marshal to GTK main thread via g_idle_add.
@@ -740,24 +711,6 @@ static void handle_enter_listening(TranscriberApp *app) {
     if (app->tray) {
         tray_set_state(app->tray, STATE_LISTENING);
         tray_start_animation(app->tray);
-    }
-
-    /* Configure VAD before starting recording.
-     * VAD auto-stop is always disabled - recordings stop via timer or manual click.
-     * In continuous mode, the silence scanner handles segment detection. */
-    if (app->audio_recorder && app->controller.config) {
-        bool continuous_dictation = config_get_continuous_dictation(app->controller.config);
-
-        /* Always disable VAD auto-stop. */
-        audio_recorder_configure_vad(app->audio_recorder, false,
-                                     config_get_vad_mode(app->controller.config),
-                                     config_get_vad_silence_ms(app->controller.config));
-
-        if (!continuous_dictation) {
-            /* On-demand mode: use manual stop callback for timer-based stopping */
-            audio_recorder_set_vad_stop_callback(app->audio_recorder,
-                                                 on_vad_silence_stop, app);
-        }
     }
 
     /* Start audio recording */
@@ -980,7 +933,7 @@ static gpointer transcribe_thread_func(gpointer data) {
         }
 
         /* Trim trailing silence to prevent whisper from hallucinating text
-         * on the silence period that triggered VAD auto-stop. */
+         * on trailing quiet periods. */
         if (samples && n_samples > 0) {
             n_samples = audio_trim_trailing_silence(samples, n_samples, 16000);
         }
@@ -1050,21 +1003,21 @@ static gpointer transcribe_thread_func(gpointer data) {
     }
 
     /* If both ring buffer and WAV path are empty, check if this is continuous
-     * mode with VAD-filtered silence. In that case, silently skip transcription
-     * and let the app transition to IDLE without showing an error. */
+     * mode. In that case, silently skip transcription and let the app
+     * transition to IDLE without showing an error. */
     bool continuous = app->controller.config
         ? config_get_continuous_dictation(app->controller.config) : false;
     if (!response) {
         if (continuous) {
-            /* In continuous mode, VAD may have filtered out all remaining audio
-             * as silence. Create a success response with empty text so the app
-             * transitions to IDLE without showing an error. Using an empty string
-             * rather than NULL makes the semantic meaning clear: this is a valid
-             * result with no content, distinct from a failure or NULL pointer. */
+            /* In continuous mode, audio may have been entirely silence or noise.
+             * Create a success response with empty text so the app transitions to
+             * IDLE without showing an error. Using an empty string rather than NULL
+             * makes the semantic meaning clear: this is a valid result with no
+             * content, distinct from a failure or NULL pointer. */
             response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
             if (response) {
                 response->success = true;
-                response->text = g_strdup("");  /* Empty string — VAD-filtered silence */
+                response->text = g_strdup("");  /* Empty string — silence/noise only */
             }
         } else {
             /* Non-continuous mode: show error */
@@ -1089,9 +1042,15 @@ static gpointer transcribe_thread_func(gpointer data) {
             /* Whisper succeeded but returned empty text — treat as silence in
              * continuous mode. Do not show an error to the user. This happens
              * when whisper processes audio containing only silence or very short
-             * speech segments below its detection threshold. */
+             * speech segments below its detection threshold.
+             * IMPORTANT: Still marshal to GTK main thread so on_transcription_result()
+             * can check user_requested_stop and transition state appropriately. */
             g_log("main", G_LOG_LEVEL_MESSAGE,
                   "[flow] Transcription succeeded but empty text — skipping in continuous mode\n");
+            IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
+            icd->app = app;
+            icd->data = NULL;  /* Empty result */
+            g_idle_add(on_transcription_result_idle, icd);
         } else {
             const char *error = whisper_client_get_error(app->whisper_client);
             if (!error || error[0] == '\0') {
@@ -1383,6 +1342,9 @@ static void on_microphone_toggle(void *user_data) {
 
     /* Only check local model when starting recording (IDLE -> LISTENING) */
     AppState current = app_get_state(&app->controller);
+    const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
+    g_log("main", G_LOG_LEVEL_INFO,
+          "[flow] on_microphone_toggle() entered, current=%s\n", state_name[current]);
     if (current == STATE_IDLE) {
         /* STARTUP-LOADING: If model is still loading from startup,
          * reject the click. The "WAIT" overlay on the icon should
@@ -1505,9 +1467,6 @@ static void on_microphone_toggle(void *user_data) {
         }
     }
 
-    g_log("main", G_LOG_LEVEL_WARNING,
-          "[flow] Microphone clicked — toggling state\n");
-
     /* Toggle the state — on_state_change callback will handle the actual work.
       * If we reach here, either:
       * 1. Model was already loaded (normal fast path)
@@ -1618,13 +1577,24 @@ static void on_state_change(TranscriberApp *app, AppState new_state) {
 
     switch (new_state) {
         case STATE_LISTENING:
-            g_log("main", G_LOG_LEVEL_MESSAGE,
+            g_log("main", G_LOG_LEVEL_INFO,
                   "[flow] Entering LISTENING — starting recording + scanner\n");
             handle_enter_listening(app);
             break;
         case STATE_TRANSCRIBING:
-            g_log("main", G_LOG_LEVEL_MESSAGE,
-                  "[flow] Entering TRANSCRIBING — stopping recording\n");
+            /* Stop the silence scanner BEFORE stopping the recorder.
+             * The scanner thread may be blocked inside whisper transcription
+             * (on_scanner_segment holds app->scanner_transcribe_mutex). If we
+             * don't stop it first, the scanner continues running while we try
+             * to shut down recording, causing resource contention and hangs.
+             * This is especially critical in continuous mode where the scanner
+             * fires transcription segments during active recording. */
+            if (app->silence_scanner) {
+                silence_scanner_stop(app->silence_scanner);
+            }
+
+            /* Stop audio recording — pthread_join will wait for capture thread
+             * to finish writing remaining data and close ALSA device. */
             if (app->audio_recorder) {
                 audio_recorder_stop(app->audio_recorder);
             }
@@ -1635,7 +1605,7 @@ static void on_state_change(TranscriberApp *app, AppState new_state) {
                 }
                 bool continuous = app->controller.config
                     ? config_get_continuous_dictation(app->controller.config) : false;
-                g_log("main", G_LOG_LEVEL_MESSAGE,
+                g_log("main", G_LOG_LEVEL_INFO,
                       "[flow] TRANSCRIBING: wav_path='%s' continuous=%s\n",
                       path ? path : "(null)", continuous ? "true" : "false");
                 /* In continuous mode, always transcribe even if WAV path is empty,
@@ -1646,7 +1616,7 @@ static void on_state_change(TranscriberApp *app, AppState new_state) {
                 if ((path && path[0] != '\0') || continuous) {
                     handle_enter_transcribing(app, path);
                 } else {
-                    g_log("main", G_LOG_LEVEL_WARNING,
+                    g_log("main", G_LOG_LEVEL_INFO,
                           "[flow] No WAV path and not continuous — transitioning to IDLE\n");
                     app_transition_to(&app->controller, STATE_IDLE);
                     if (app->main_window) {
@@ -1656,7 +1626,7 @@ static void on_state_change(TranscriberApp *app, AppState new_state) {
             }
             break;
         case STATE_IDLE:
-            g_log("main", G_LOG_LEVEL_MESSAGE,
+            g_log("main", G_LOG_LEVEL_INFO,
                   "[flow] Entering IDLE\n");
             if (app->main_window) {
                 app_window_set_state(app->main_window, STATE_IDLE);

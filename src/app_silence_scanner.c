@@ -388,17 +388,17 @@ void silence_scanner_stop(SilenceScanner *scanner)
     was_running = scanner->running;
     pthread_mutex_unlock(&scanner->mutex);
 
-    if (!was_running) return;
+    if (!was_running) {
+        return;
+    }
 
     atomic_store(&scanner->stop_flag, true);
+
     pthread_join(scanner->thread, NULL);
 
     pthread_mutex_lock(&scanner->mutex);
     scanner->running = false;
     pthread_mutex_unlock(&scanner->mutex);
-
-    g_log("app-scanner", G_LOG_LEVEL_MESSAGE,
-          "[scanner] Stopped\n");
 }
 
 void silence_scanner_reset(SilenceScanner *scanner)

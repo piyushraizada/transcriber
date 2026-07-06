@@ -313,6 +313,7 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         gchar *display_name = NULL;
         gchar *device_name = NULL;
         gtk_tree_model_get(device_model, &device_iter, 0, &display_name, 1, &device_name, -1);
+        g_free(display_name);  /* Display name no longer stored — it was write-only */
         if (device_name) {
             if (g_strcmp0(device_name, "default") == 0) {
                 config_set_audio_device(dlg->config, "");
@@ -320,10 +321,6 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
                 config_set_audio_device(dlg->config, device_name);
             }
             g_free(device_name);
-        }
-        if (display_name) {
-            config_set_audio_device_display_name(dlg->config, display_name);
-            g_free(display_name);
         }
     }
 
@@ -1045,7 +1042,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
     }
 
-    /* ---- VAD (Voice Activity Detection) ---- */
+    /* ---- Silence Scanner Settings (VAD-based segment detection) ---- */
     {
             GtkWidget *vad_title = gtk_label_new("Voice Activity Detection (VAD):");
             gtk_label_set_xalign(GTK_LABEL(vad_title), 0);
@@ -1068,10 +1065,10 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_combo_box_set_active(dlg->vad_mode_combo, config_get_vad_mode(config));
         gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->vad_mode_combo), FALSE, FALSE, 0);
 
-        // VAD Silence Duration
-        GtkWidget *vad_silence_label = gtk_label_new("  Silence threshold:");
-        gtk_label_set_xalign(GTK_LABEL(vad_silence_label), 0);
-        gtk_box_pack_start(GTK_BOX(vbox), vad_silence_label, FALSE, FALSE, 0);
+        // Scanner silence duration — controls when silence scanner triggers transcription
+        GtkWidget *scanner_silence_label = gtk_label_new("  Auto-stop after silence:");
+        gtk_label_set_xalign(GTK_LABEL(scanner_silence_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), scanner_silence_label, FALSE, FALSE, 0);
 
         GtkWidget *silence_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         dlg->vad_silence_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1.0, 10.0, 0.1));

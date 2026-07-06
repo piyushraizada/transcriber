@@ -225,8 +225,6 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->audio_device, "default", sizeof(config->audio_device) - 1);
     config->audio_device[sizeof(config->audio_device) - 1] = '\0';
 
-    config->audio_device_display_name[0] = '\0';  /* No display name by default */
-
     config->max_duration = 30;  /* 30 seconds — aligns with Whisper's optimal sample length */
 
     config->window_x = 100;  /* Default position */
@@ -240,8 +238,7 @@ void config_set_defaults(AppConfig* config)
     config->append_transcription_text = true;
 
     /* VAD (Voice Activity Detection) settings */
-    config->vad_mode = 1;              // Moderate aggressiveness
-    config->vad_silence_ms = 2500;     // 2.5 seconds of silence triggers auto-stop (allows natural pauses)
+    config->vad_mode = 1;              // Moderate aggressiveness, used by silence scanner
     config->continuous_dictation = true; // Continuous dictation mode by default
 
     /* Silence Scanner — only active in continuous dictation mode */
@@ -365,11 +362,7 @@ bool config_load_from_path(AppConfig* config, const char* path)
         config->audio_device[sizeof(config->audio_device) - 1] = '\0';
     }
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "audio_device_display_name");
-    if (item && cJSON_IsString(item) && item->valuestring) {
-        strncpy(config->audio_device_display_name, item->valuestring, sizeof(config->audio_device_display_name) - 1);
-        config->audio_device_display_name[sizeof(config->audio_device_display_name) - 1] = '\0';
-    }
+    /* Note: audio_device_display_name removed — it was write-only (stored but never read). */
 
     item = cJSON_GetObjectItemCaseSensitive(root, "max_duration");
     if (item && cJSON_IsNumber(item)) {
@@ -425,16 +418,8 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "vad_silence_ms");
-    if (item && cJSON_IsNumber(item)) {
-        int ms = (int)item->valueint;
-        if (ms >= 500 && ms <= 5000) {
-            config->vad_silence_ms = ms;
-        } else {
-            g_log("app-config", G_LOG_LEVEL_MESSAGE, "[config] Invalid vad_silence_ms %d, clamping to 1000\n", ms);
-            config->vad_silence_ms = 1000;
-        }
-    }
+    /* Note: vad_silence_ms removed — VAD auto-stop was disabled.
+     * Scanner silence threshold is controlled by scanner_silence_ms instead. */
 
     item = cJSON_GetObjectItemCaseSensitive(root, "continuous_dictation");
     if (item && cJSON_IsBool(item)) {
@@ -523,7 +508,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
 
     cJSON_AddStringToObject(root, "model_path", config->model_path);
     cJSON_AddStringToObject(root, "audio_device", config->audio_device);
-    cJSON_AddStringToObject(root, "audio_device_display_name", config->audio_device_display_name);
+    /* Note: audio_device_display_name removed — it was write-only (stored but never read). */
     cJSON_AddNumberToObject(root, "max_duration", config->max_duration);
 
     cJSON *window_pos = cJSON_CreateObject();
@@ -536,8 +521,8 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddBoolToObject(root, "append_transcription_text", config->append_transcription_text);
 
     /* VAD settings */
+    /* VAD settings — vad_silence_ms removed (VAD auto-stop disabled) */
     cJSON_AddNumberToObject(root, "vad_mode", config->vad_mode);
-    cJSON_AddNumberToObject(root, "vad_silence_ms", config->vad_silence_ms);
     cJSON_AddBoolToObject(root, "continuous_dictation", config->continuous_dictation);
 
     /* Scanner settings */
@@ -687,31 +672,6 @@ const char* config_get_audio_device(const AppConfig* config)
     return config->audio_device;
 }
 
-bool config_set_audio_device_display_name(AppConfig* config, const char* name)
-{
-    if (!config) {
-        set_error("NULL config");
-        return false;
-    }
-    if (name) {
-        if (strlen(name) >= sizeof(config->audio_device_display_name)) {
-            set_error("display name too long");
-            return false;
-        }
-        strncpy(config->audio_device_display_name, name, sizeof(config->audio_device_display_name) - 1);
-        config->audio_device_display_name[sizeof(config->audio_device_display_name) - 1] = '\0';
-    } else {
-        config->audio_device_display_name[0] = '\0';
-    }
-    return true;
-}
-
-const char* config_get_audio_device_display_name(const AppConfig* config)
-{
-    if (!config) return "";
-    return config->audio_device_display_name;
-}
-
 bool config_set_max_duration(AppConfig* config, int duration)
 {
     if (!config) {
@@ -799,20 +759,6 @@ int config_get_vad_mode(const AppConfig* config)
 {
     if (!config) return 1;
     return config->vad_mode;
-}
-
-void config_set_vad_silence_ms(AppConfig* config, int ms)
-{
-    if (!config) return;
-    if (ms >= 500 && ms <= 5000) {
-        config->vad_silence_ms = ms;
-    }
-}
-
-int config_get_vad_silence_ms(const AppConfig* config)
-{
-    if (!config) return 1000;
-    return config->vad_silence_ms;
 }
 
 void config_set_continuous_dictation(AppConfig* config, bool enabled)

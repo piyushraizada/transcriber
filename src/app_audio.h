@@ -112,9 +112,8 @@ const char *audio_recorder_get_device(const AudioRecorder *recorder);
  * @return true if recording started successfully, false on failure.
  *
  * @note Duration enforcement is handled externally by the application's
- *       watchdog timer. Additionally, VAD-based auto-stop (when enabled via
- *       audio_recorder_configure_vad()) can trigger internal recording stop
- *       after a configured period of silence.
+ *       watchdog timer. In continuous mode, the silence scanner handles
+ *       automatic segment detection and transcription.
  */
 bool audio_recorder_start(AudioRecorder *recorder);
 
@@ -230,43 +229,7 @@ void audio_device_list_free(AudioDeviceList *list);
 bool audio_recorder_delete_wav(AudioRecorder *recorder);
 
 /*---------------------------------------------------------------------------
- * Section 11: VAD (Voice Activity Detection) Configuration
- *---------------------------------------------------------------------------
- * Functions for enabling VAD-based silence detection.
- * Call these before audio_recorder_start() to configure VAD behavior.
- */
-
-/**
- * Configure VAD settings on the audio recorder.
- *
- * When VAD is enabled, the capture thread monitors audio for silence periods.
- * After the configured silence duration elapses with no voice detected,
- * recording stops automatically and transcription begins.
- *
- * @param recorder      AudioRecorder handle
- * @param enabled       true to enable VAD, false to disable
- * @param mode          Aggressiveness mode (0-3, higher = more restrictive)
- * @param silence_ms    Silence duration in ms before auto-stop (500-5000)
- */
-void audio_recorder_configure_vad(AudioRecorder *recorder,
-                                   bool enabled,
-                                   int mode,
-                                   int silence_ms);
-
-/**
- * Set the callback to invoke when VAD triggers a silence-based stop.
- * The callback is scheduled on the GTK main thread via g_idle_add().
- *
- * @param recorder  AudioRecorder handle
- * @param callback  Function to call when VAD silence triggers stop
- * @param user_data User data passed to callback
- */
-void audio_recorder_set_vad_stop_callback(AudioRecorder *recorder,
-                                          void (*callback)(void *user_data),
-                                          void *user_data);
-
-/*---------------------------------------------------------------------------
- * Section 12: Ring Buffer Access
+ * Section 11: Ring Buffer Access
  *---------------------------------------------------------------------------
  * Extract captured audio from the in-memory ring buffer for transcription.
  */
