@@ -165,12 +165,14 @@ The application will appear as a microphone icon in your system tray. Click the 
 
 Configuration is stored in `~/.config/transcriber/config.json`. You can adjust settings such as:
 
-- **Model path** — path to a GGML Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`)
+- **Model path** — path to a GGML/GGUF Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`)
 - **Audio device** — ALSA capture device (default: system default)
-- **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 60, range: 5–120)
-- **VAD enabled** — enable or disable Voice Activity Detection (default: `true`)
-- **VAD mode** — sensitivity mode: `high`, `medium`, `low`, or `very_low` (default: `high`)
-- **VAD silence timeout** — silence duration in seconds that triggers segment segmentation (default: 1.5, range: 0.5–5.0)
+- **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 30, range: 5–30)
+- **Continuous dictation** — enable or disable the silence-triggered recording/transcription loop (default: `true`)
+- **VAD mode** — aggressiveness level as an integer from 0 to 3, where 0 is least aggressive (most sensitive) and 3 is most aggressive (most restrictive; default: 1, moderate)
+- **Scanner silence timeout** — silence duration in milliseconds before the scanner checks if a segment should be transcribed (default: 2000 ms, range: 1000–10000 ms)
+- **Scanner min segment** — minimum audio segment length in milliseconds before sending to Whisper (default: 5000 ms, range: 1000–30000 ms)
+- **Append transcription text** — when `true`, new transcriptions are appended to existing text; when `false`, the text window is cleared at the start of each session (default: `true`)
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 
 A configuration dialog is available from the system tray context menu or the gear icon in the main window's status bar.
