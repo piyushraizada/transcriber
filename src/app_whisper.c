@@ -67,6 +67,7 @@ struct _WhisperClient {
     char language[16];                 // Language code: "auto", "en", "fr", etc.
     int n_threads;
     int gpu_index;                     // -3 = auto by free mem, -2 = CPU-only, >=0 = specific GPU
+    bool flash_attention;              // Enable flash attention for reduced VRAM usage
     char error_message[256];
     int error_code;
     pthread_mutex_t mutex;
@@ -273,6 +274,7 @@ static bool load_model_internal(WhisperClient *client) {
 
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = try_gpu;
+    cparams.flash_attn = client->flash_attention;
 
     // Set GPU device if we have a specific index
 #ifdef HAVE_CUDA
@@ -325,11 +327,14 @@ static bool load_model_internal(WhisperClient *client) {
     }
 
     /* Verify language IDs are accessible — a quick sanity check that the
-     * model's internal data structures are properly mapped in memory. */
-    int lang_auto_id = whisper_lang_id(ctx, "auto");
-    if (lang_auto_id < 0) {
+     * model's internal data structures are properly mapped in memory.
+     * Note: "auto" is NOT a valid whisper.cpp language code (it's only used as
+     * a user-facing config value for auto-detection). Use "en" instead which
+     * exists in every Whisper model's language table. */
+    int lang_en_id = whisper_lang_id("en");
+    if (lang_en_id < 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
-              "[whisper] Post-load validation failed: cannot resolve 'auto' language ID\n");
+              "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
         whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
@@ -378,8 +383,9 @@ static bool load_model(WhisperClient *client) {
  * @param client      WhisperClient instance
  * @param gpu_mode    GPU mode string: "auto", "cpu", or "gpu:N"
  *                    If NULL, defaults to "auto" (GPU_INDEX_AUTO_MEMORY)
+ * @param flash_attention  Enable flash attention for reduced VRAM usage
  * =================================================================== */
-bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
+bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool flash_attention) {
     if (!client) return false;
 
     pthread_mutex_lock(&client->mutex);
@@ -390,13 +396,14 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
         gpu_mode_parse(gpu_mode, &gpu_index);
     }
 
-    // If already loaded with same GPU config, skip
-    if (atomic_load(&client->model_loaded) && client->gpu_index == gpu_index) {
+    // If already loaded with same GPU config and flash attention setting, skip
+    if (atomic_load(&client->model_loaded) && client->gpu_index == gpu_index
+            && client->flash_attention == flash_attention) {
         pthread_mutex_unlock(&client->mutex);
         return true;
     }
 
-    // If already loaded but GPU config differs, unload first
+    // If already loaded but GPU config or flash attention differs, unload first
     if (atomic_load(&client->model_loaded)) {
         if (client->ctx) {
             whisper_free(client->ctx);
@@ -405,8 +412,9 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode) {
         atomic_store(&client->model_loaded, false);
     }
 
-    // Set the GPU index preference
+    // Set the GPU index and flash attention preference
     client->gpu_index = gpu_index;
+    client->flash_attention = flash_attention;
 
     // Load the model (atomic for cross-thread visibility)
     atomic_store(&client->model_loading, true);

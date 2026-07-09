@@ -238,6 +238,9 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->gpu_mode, gpu_mode_get_default(), sizeof(config->gpu_mode) - 1);
     config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
 
+    /* Flash attention — disabled by default. Users can enable it to reduce VRAM usage. */
+    config->flash_attention = false;
+
     /* Transcription text mode — default to append (true) for backward compatibility */
     config->append_transcription_text = true;
 
@@ -405,6 +408,12 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
+    /* Flash attention — optional GPU memory optimization */
+    item = cJSON_GetObjectItemCaseSensitive(root, "flash_attention");
+    if (item && cJSON_IsBool(item)) {
+        config->flash_attention = cJSON_IsTrue(item);
+    }
+
     /* Transcription text mode */
     item = cJSON_GetObjectItemCaseSensitive(root, "append_transcription_text");
     if (item && cJSON_IsBool(item)) {
@@ -564,6 +573,8 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddItemToObject(root, "window_position", window_pos);
 
     cJSON_AddStringToObject(root, "gpu_mode", config->gpu_mode);
+
+    cJSON_AddBoolToObject(root, "flash_attention", config->flash_attention);
 
     cJSON_AddBoolToObject(root, "append_transcription_text", config->append_transcription_text);
 
@@ -834,6 +845,18 @@ const char* config_get_gpu_mode(const AppConfig* config)
 {
     if (!config) return "";
     return config->gpu_mode;
+}
+
+void config_set_flash_attention(AppConfig* config, bool enabled)
+{
+    if (!config) return;
+    config->flash_attention = enabled;
+}
+
+bool config_get_flash_attention(const AppConfig* config)
+{
+    if (!config) return false;
+    return config->flash_attention;
 }
 
 void config_set_append_transcription_text(AppConfig* config, bool append)

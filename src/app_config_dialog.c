@@ -45,6 +45,7 @@ struct _ConfigDialog {
     GtkComboBox *device_combo;
     GtkComboBox *language_combo;
     GtkComboBox *gpu_mode_combo;
+    GtkCheckButton *flash_attention_checkbox;
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
@@ -343,6 +344,10 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         }
     }
 
+    /* Set flash attention from checkbox */
+    config_set_flash_attention(dlg->config,
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox)));
+
     /* Set append transcription text mode from checkbox */
     config_set_append_transcription_text(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->append_text_checkbox)));
@@ -543,6 +548,40 @@ static void on_browse_model_clicked(GtkButton *button, ConfigDialog *dlg) {
         }
     }
     gtk_widget_destroy(chooser);
+}
+
+/**
+ * Update flash attention checkbox sensitivity based on GPU mode.
+ * Flash attention only works with NVIDIA CUDA GPUs — disable it when CPU mode is selected.
+ */
+static void update_flash_attention_sensitivity(ConfigDialog *dlg) {
+    if (!dlg || !dlg->flash_attention_checkbox || !dlg->gpu_mode_combo) return;
+
+    GtkTreeIter iter;
+    GtkTreeModel *model = GTK_TREE_MODEL(gtk_combo_box_get_model(dlg->gpu_mode_combo));
+    bool is_cpu = false;
+
+    if (gtk_combo_box_get_active_iter(dlg->gpu_mode_combo, &iter)) {
+        gchar *mode_val = NULL;
+        gtk_tree_model_get(model, &iter, 1, &mode_val, -1);
+        if (mode_val) {
+            is_cpu = (g_strcmp0(mode_val, "cpu") == 0);
+            g_free(mode_val);
+        }
+    }
+
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->flash_attention_checkbox), !is_cpu);
+    if (!is_cpu && dlg->flash_attention_checkbox) {
+        /* Re-enable the checkbox so user can toggle it */
+    } else if (is_cpu) {
+        /* Force off when CPU mode is active to avoid confusion on save */
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox), FALSE);
+    }
+}
+
+static void on_gpu_mode_changed(GtkComboBox *combo, ConfigDialog *dlg) {
+    UNUSED(combo);
+    update_flash_attention_sensitivity(dlg);
 }
 
 static void on_duration_changed(GtkSpinButton *spin, ConfigDialog *dlg) {
@@ -1016,12 +1055,33 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
             } while (gtk_tree_model_iter_next(gpu_model, &iter));
         }
 
+
         gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->gpu_mode_combo), FALSE, TRUE, 0);
+
+        /* Connect signal to update flash attention sensitivity when GPU mode changes */
+        g_signal_connect(dlg->gpu_mode_combo, "changed",
+                         G_CALLBACK(on_gpu_mode_changed), dlg);
 
         GtkWidget *gpu_restart_label = gtk_label_new("Restart the application for GPU changes to take effect.");
         gtk_label_set_xalign(GTK_LABEL(gpu_restart_label), 0);
         gtk_widget_set_opacity(gpu_restart_label, 0.6);
         gtk_box_pack_start(GTK_BOX(vbox), gpu_restart_label, FALSE, FALSE, 0);
+
+        dlg->flash_attention_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
+            "Flash Attention (reduces GPU memory usage)"));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox),
+                                      config_get_flash_attention(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->flash_attention_checkbox), FALSE, FALSE, 0);
+
+        GtkWidget *flash_help = gtk_label_new(
+            "Only works with NVIDIA CUDA GPU. Reduces VRAM usage\n"
+            "while maintaining transcription accuracy. Requires restart.");
+        gtk_label_set_xalign(GTK_LABEL(flash_help), 0);
+        gtk_widget_set_opacity(flash_help, 0.6);
+        gtk_box_pack_start(GTK_BOX(vbox), flash_help, FALSE, FALSE, 0);
+
+        /* Set initial sensitivity based on current GPU mode */
+        update_flash_attention_sensitivity(dlg);
 
         gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
     }

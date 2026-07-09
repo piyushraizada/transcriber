@@ -350,14 +350,17 @@ bool whisper_client_is_loading(const WhisperClient *client);
  * Safe to call from a background thread. Do NOT call from the GTK
  * main thread as this may block for several seconds.
  *
- * @param client   Pointer to a valid WhisperClient. Must not be NULL.
- * @param gpu_mode GPU mode string: "auto", "cpu", or "gpu:N" (may be NULL for auto)
+ * @param client          Pointer to a valid WhisperClient. Must not be NULL.
+ * @param gpu_mode        GPU mode string: "auto", "cpu", or "gpu:N" (may be NULL for auto)
+ * @param flash_attention Enable flash attention for reduced VRAM usage. When true,
+ *                        whisper.cpp uses flash attention which can significantly reduce
+ *                        GPU memory consumption during inference while maintaining accuracy.
  * @return true if the model was loaded successfully, false on error.
  *         Check whisper_client_get_error() for details on failure.
  *
  * @thread_safe This function is safe to call from any thread.
  */
-bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode);
+bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool flash_attention);
 
 /*---------------------------------------------------------------------------
  * Section 10: GPU Support

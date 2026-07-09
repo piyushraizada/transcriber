@@ -87,10 +87,16 @@ typedef struct _AppConfig {
 
     /* GPU Settings */
     char gpu_mode[32];           ///< GPU acceleration mode
-                                   ///< "auto" = select GPU with most free memory
-                                   ///< "cpu" = force CPU-only processing
-                                   ///< "gpu:N" = use specific GPU device N
-                                   ///< @see CFG-GPU-001: GPU Mode
+                                    ///< "auto" = select GPU with most free memory
+                                    ///< "cpu" = force CPU-only processing
+                                    ///< "gpu:N" = use specific GPU device N
+                                    ///< @see CFG-GPU-001: GPU Mode
+
+    bool flash_attention;        ///< Enable flash attention for reduced VRAM usage
+                                    ///< When true, whisper.cpp uses flash attention which can
+                                    ///< significantly reduce GPU memory consumption during inference
+                                    ///< while maintaining transcription accuracy. Default: false.
+                                    ///< @see CFG-GPU-002: Flash Attention
 
     /* Transcription Text Mode */
     bool append_transcription_text;  ///< true = append new text to existing, false = clear before new transcription
@@ -443,6 +449,20 @@ bool config_set_gpu_mode(AppConfig* config, const char* mode);
  * @return The gpu_mode string (internal, must NOT be freed or modified).
  */
 const char* config_get_gpu_mode(const AppConfig* config);
+
+/**
+ * Set flash attention mode for reduced GPU VRAM usage.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param enabled true = enable flash attention, false = disable.
+ */
+void config_set_flash_attention(AppConfig* config, bool enabled);
+
+/**
+ * Get flash attention mode.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if flash attention is enabled, false otherwise.
+ */
+bool config_get_flash_attention(const AppConfig* config);
 
 /**
  * Set the transcription text mode (append vs. overwrite).

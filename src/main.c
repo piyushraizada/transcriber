@@ -1241,7 +1241,8 @@ static gpointer model_loading_thread_func(gpointer data) {
      * gpu_mode can be "auto", "cpu", or "gpu:N".
      * This blocks until the model is loaded (or fails). */
     const char *gpu_mode = config_get_gpu_mode(app->controller.config);
-    bool loaded = whisper_client_load_model(app->whisper_client, gpu_mode);
+    bool flash_attention = config_get_flash_attention(app->controller.config);
+    bool loaded = whisper_client_load_model(app->whisper_client, gpu_mode, flash_attention);
 
     /* Marshal result back to GTK main thread */
     if (loaded) {
