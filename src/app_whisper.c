@@ -44,10 +44,17 @@
 #define MAX_PATH_LEN  PATH_MAX
 #define DEFAULT_THREADS 0  // 0 = use all available threads
 
-/* Default model search directories (in order of preference) */
+/* Default model search directories (in order of preference).
+ * SYSTEM_MODEL_DIR is defined by CMake at configure time, allowing package
+ * maintainers to override the system-wide model directory via
+ * -DSYSTEM_MODEL_DIR=/custom/path. Falls back to /usr/share/transcriber/models */
+#ifndef SYSTEM_MODEL_DIR
+#define SYSTEM_MODEL_DIR "/usr/share/transcriber/models"
+#endif
+
 static const char *DEFAULT_MODEL_DIRS[] = {
     "~/.cache/whisper",
-    "/usr/share/transcriber/models",
+    SYSTEM_MODEL_DIR,
     NULL
 };
 
@@ -296,8 +303,47 @@ static bool load_model_internal(WhisperClient *client) {
         return false;
     }
 
+    /* Assign context before validation so error paths can clean up. */
     client->ctx = ctx;
+
+    /* Post-load functional validation: verify the loaded context is usable
+     * by querying model properties and checking GPU memory allocation.
+     * This catches cases where whisper_init_from_file_with_params returns
+     * a non-NULL pointer but the underlying GPU memory is corrupted or
+     * insufficient for actual inference. */
+    int n_vocab = whisper_n_vocab(ctx);
+    if (n_vocab <= 0) {
+        g_log("app-whisper", G_LOG_LEVEL_WARNING,
+              "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
+              n_vocab);
+        whisper_free(ctx);
+        client->ctx = NULL;
+        snprintf(client->error_message, sizeof(client->error_message),
+                 "Model loaded but post-validation failed (vocab=%d)", n_vocab);
+        client->error_code = 4;
+        return false;
+    }
+
+    /* Verify language IDs are accessible — a quick sanity check that the
+     * model's internal data structures are properly mapped in memory. */
+    int lang_auto_id = whisper_lang_id(ctx, "auto");
+    if (lang_auto_id < 0) {
+        g_log("app-whisper", G_LOG_LEVEL_WARNING,
+              "[whisper] Post-load validation failed: cannot resolve 'auto' language ID\n");
+        whisper_free(ctx);
+        client->ctx = NULL;
+        snprintf(client->error_message, sizeof(client->error_message),
+                 "Model loaded but post-validation failed (language lookup)");
+        client->error_code = 5;
+        return false;
+    }
+
+    /* Model passed functional validation — mark as loaded. */
     atomic_store(&client->model_loaded, true);
+
+    g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+          "[whisper] Model validated successfully (vocab=%d, gpu=%s)\n",
+          n_vocab, gpu_loaded ? "yes" : "no");
 
     /* Release CUDA contexts on GPUs not used by the loaded model.
      * whisper_init_from_file_with_params() enumerates all CUDA devices

@@ -26,6 +26,8 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdatomic.h>
 
 /******************************************************************************
  * AppStateController Implementation (from app.h)
@@ -41,21 +43,38 @@ int app_state_controller_init(AppStateController *controller,
         return -1;
     }
 
-    /* Initialize the mutex */
+    /* Zero-initialize the entire struct first.
+     * This ensures that even if another thread reads the controller between
+     * mutex init and field assignment below, it sees all-zero values rather
+     * than stale garbage from stack/heap memory. The atomic sequence counter
+     * is set to 0 here (via memset) and will be properly initialized by
+     * atomic_init() after the mutex is ready. */
+    memset(controller, 0, sizeof(AppStateController));
+
+    /* Initialize the mutex before any field assignments.
+     * All subsequent writes are performed under the lock so that a reader
+     * acquiring the mutex sees either all-zero (pre-init) or fully-populated
+     * fields — never a partially-initialized intermediate state. */
     int ret = pthread_mutex_init(&controller->state_mutex, NULL);
     if (ret != 0) {
         return -1;
     }
 
-    /* Set initial state */
+    /* Initialize atomic sequence counter properly. */
+    atomic_store((atomic_int *)&controller->sequence_counter, 0);
+
+    /* Set all fields under the mutex lock for thread safety.
+     * Any concurrent reader (e.g., app_get_state) will either see
+     * the zero-initialized state or the fully-populated state. */
+    pthread_mutex_lock(&controller->state_mutex);
     controller->state = STATE_IDLE;
     controller->model_status = MODEL_UNAVAILABLE;
-    controller->sequence_counter = 0;
     controller->config = config;
     controller->on_transcription_result = on_transcription_result;
     controller->on_model_status = on_model_status;
     controller->on_state_change = on_state_change;
     controller->callback_user_data = user_data;
+    pthread_mutex_unlock(&controller->state_mutex);
 
     return 0;
 }

@@ -162,10 +162,18 @@ target_link_libraries(transcriber PRIVATE
 )
 
 # 3. DEFINITIONS
+
+# System-wide model directory — configurable by package maintainers via
+# -DSYSTEM_MODEL_DIR=/custom/path. Defaults to <prefix>/share/transcriber/models.
+if(NOT SYSTEM_MODEL_DIR)
+    set(SYSTEM_MODEL_DIR "${CMAKE_INSTALL_PREFIX}/share/transcriber/models")
+endif()
+
 target_compile_definitions(transcriber PRIVATE
     XPM_STATICALLY_EMBEDDED
     APP_VERSION="${PROJECT_VERSION}"
     ASSET_DIR_PATH="${CMAKE_INSTALL_PREFIX}/share/transcriber/assets"
+    SYSTEM_MODEL_DIR="${SYSTEM_MODEL_DIR}"
 )
 
 # 3a. ADD CFLAGS_OTHER (e.g., -isystem flags from pkg-config)

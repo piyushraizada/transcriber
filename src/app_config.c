@@ -38,6 +38,10 @@
 static char g_config_error[256] = {0};
 static pthread_mutex_t g_config_error_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Mutex to serialize config save operations, preventing concurrent writers
+ * from corrupting the temporary file during atomic write (write .tmp + rename). */
+static pthread_mutex_t g_config_save_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void set_error(const char* msg)
 {
     pthread_mutex_lock(&g_config_error_mutex);
@@ -463,11 +467,32 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
-    /* Language */
+    /* Language — validate format before accepting.
+     * Accept "auto" or a 2-letter lowercase ISO 639-1 language code (e.g., "en", "fr").
+     * Rejects empty strings, overly long values, and codes with invalid characters. */
     item = cJSON_GetObjectItemCaseSensitive(root, "language");
     if (item && cJSON_IsString(item) && item->valuestring) {
-        strncpy(config->language, item->valuestring, sizeof(config->language) - 1);
-        config->language[sizeof(config->language) - 1] = '\0';
+        const char *lang = item->valuestring;
+        size_t lang_len = strlen(lang);
+        bool valid = false;
+        if (lang_len == 4 && strncmp(lang, "auto", 5) == 0) {
+            valid = true;
+        } else if (lang_len == 2) {
+            valid = true;
+            for (size_t i = 0; i < lang_len; i++) {
+                if (!(lang[i] >= 'a' && lang[i] <= 'z')) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (valid) {
+            strncpy(config->language, lang, sizeof(config->language) - 1);
+            config->language[sizeof(config->language) - 1] = '\0';
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE,
+                  "[config] Invalid language \"%s\", using default (auto)\n", lang);
+        }
     }
 
     cJSON_Delete(root);
@@ -494,8 +519,13 @@ bool config_save(const AppConfig* config)
 
 bool config_save_to_path(const AppConfig* config, const char* path)
 {
+    /* Serialize save operations to prevent concurrent writers from corrupting
+     * the temporary file during atomic write (write .tmp + rename). */
+    pthread_mutex_lock(&g_config_save_mutex);
+
     if (!config || !path) {
         set_error("NULL parameter");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
@@ -503,12 +533,14 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     char* dir = g_path_get_dirname(path);
     if (!dir) {
         set_error("Memory allocation failed");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
     if (!mkdirs(dir, 0700)) {
         g_free(dir);
         set_error("Failed to create config directory");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
     g_free(dir);
@@ -517,6 +549,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON* root = cJSON_CreateObject();
     if (!root) {
         set_error("Failed to create JSON object");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
@@ -550,8 +583,10 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     char* json_str = cJSON_Print(root);
     cJSON_Delete(root);
 
+
     if (!json_str) {
         set_error("Failed to serialize JSON");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
@@ -563,6 +598,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     if (!fp) {
         free(json_str);
         set_error("Failed to create temporary config file");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
@@ -571,6 +607,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
         fclose(fp);
         unlink(tmp_path);
         set_error("Failed to write config file");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
     free(json_str);
@@ -587,6 +624,7 @@ bool config_save_to_path(const AppConfig* config, const char* path)
         fclose(fp);
         unlink(tmp_path);
         set_error("Failed to set config file permissions");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
@@ -596,16 +634,19 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     if (rename(tmp_path, path) != 0) {
         unlink(tmp_path);
         set_error("Failed to rename config file");
+        pthread_mutex_unlock(&g_config_save_mutex);
         return false;
     }
 
     set_error(NULL);
+    pthread_mutex_unlock(&g_config_save_mutex);
     return true;
 }
 
 /*---------------------------------------------------------------------------
  * Section 5: Configuration Validation
  *---------------------------------------------------------------------------*/
+
 
 bool config_validate(const AppConfig* config)
 {
@@ -629,6 +670,53 @@ bool config_validate(const AppConfig* config)
     /* Validate window position — must be >= -1 */
     if (config->window_x < -1 || config->window_y < -1) {
         set_error("window position must be >= -1");
+        return false;
+    }
+
+    /* Validate vad_mode — must be in [0, 3] */
+    if (config->vad_mode < 0 || config->vad_mode > 3) {
+        set_error("vad_mode must be between 0 and 3");
+        return false;
+    }
+
+    /* Validate scanner_silence_sec — must be in [1.0, 10.0] */
+    if (config->scanner_silence_sec < 1.0f || config->scanner_silence_sec > 10.0f) {
+        set_error("scanner_silence_sec must be between 1.0 and 10.0");
+        return false;
+    }
+
+    /* Validate scanner_min_segment_sec — must be in [1.0, 30.0] */
+    if (config->scanner_min_segment_sec < 1.0f || config->scanner_min_segment_sec > 30.0f) {
+        set_error("scanner_min_segment_sec must be between 1.0 and 30.0");
+        return false;
+    }
+
+    /* Validate language — must be "auto" or valid 2-letter ISO 639-1 code */
+    if (config->language[0] != '\0') {
+        size_t lang_len = strlen(config->language);
+        bool valid_lang = false;
+        if (lang_len == 4 && strncmp(config->language, "auto", 5) == 0) {
+            valid_lang = true;
+        } else if (lang_len == 2) {
+            valid_lang = true;
+            for (size_t i = 0; i < lang_len; i++) {
+                if (!(config->language[i] >= 'a' && config->language[i] <= 'z')) {
+                    valid_lang = false;
+                    break;
+                }
+            }
+        }
+        if (!valid_lang) {
+            char msg[128];
+            g_snprintf(msg, sizeof(msg), "Invalid language code \"%s\"", config->language);
+            set_error(msg);
+            return false;
+        }
+    }
+
+    /* Validate gpu_mode */
+    if (!gpu_mode_validate(config->gpu_mode)) {
+        set_error("Invalid GPU mode");
         return false;
     }
 
