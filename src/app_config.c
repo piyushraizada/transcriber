@@ -238,8 +238,9 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->gpu_mode, gpu_mode_get_default(), sizeof(config->gpu_mode) - 1);
     config->gpu_mode[sizeof(config->gpu_mode) - 1] = '\0';
 
-    /* Flash attention — disabled by default. Users can enable it to reduce VRAM usage. */
-    config->flash_attention = false;
+    /* Flash attention — enabled by default to reduce VRAM usage on GPU.
+     * Has no effect in CPU-only mode. Users can disable it in the config dialog. */
+    config->flash_attention = true;
 
     /* Transcription text mode — default to append (true) for backward compatibility */
     config->append_transcription_text = true;

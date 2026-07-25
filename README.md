@@ -23,7 +23,7 @@ The following packages are required to build Transcriber from source. Install th
 
 ```bash
 sudo apt-get install build-essential cmake pkg-config \
-    libgtk-3-dev libasound2-dev libdbus-1-dev \
+    libgtk-3-dev libasound2-dev \
     libcjson-dev libayatana-appindicator3-dev \
     git
 ```
@@ -32,7 +32,7 @@ sudo apt-get install build-essential cmake pkg-config \
 
 ```bash
 sudo dnf install gcc gcc-c++ cmake pkgconf-pkg-config \
-    gtk3-devel alsa-lib-devel dbus-devel \
+    gtk3-devel alsa-lib-devel \
     cjson-devel libayatana-appindicator3-devel \
     git
 ```
@@ -41,7 +41,7 @@ sudo dnf install gcc gcc-c++ cmake pkgconf-pkg-config \
 
 ```bash
 sudo pacman -S base-devel cmake pkgconf \
-    gtk3 alsa-lib dbus cjson libayatana-appindicator \
+    gtk3 alsa-lib cjson libayatana-appindicator \
     git
 ```
 
@@ -81,30 +81,32 @@ make -j$(nproc)
 
 The build process will:
 
-- Download and compile [whisper.cpp](https://github.com/ggml-org/whisper.cpp) via CMake FetchContent
+- Download and compile [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (pinned to tag `v1.8.1`) via CMake FetchContent
 - Detect CUDA (if available) and enable GPU acceleration automatically
 
 #### Download the Whisper model
 
-The default Whisper model (`large-v3-turbo-q8_0`, ~1.1 GiB) is **not** downloaded automatically during build. Obtain it with:
+The default Whisper model (`large-v3-turbo-q8_0`, ~1.1 GiB) is **not** downloaded automatically during build. The simplest way to obtain it is the helper script, which downloads to `models/` by default:
 
 ```bash
+./packaging/download-model.sh
+```
+
+Alternatively, you can enable the CMake download target (which places the model in `~/.cache/whisper/`) by configuring with `-DDOWNLOAD_DEFAULT_MODEL=ON`:
+
+```bash
+cmake -DDOWNLOAD_DEFAULT_MODEL=ON ..
 make download-default-model
 ```
 
-This places the model in `~/.cache/whisper/`. You can also download any GGML/GGUF Whisper model manually and configure its path in the application settings.
-
-To disable the download target entirely:
-
-```bash
-cmake -DDOWNLOAD_DEFAULT_MODEL=OFF ..
-```
+You can also download any GGML/GGUF Whisper model manually and configure its path in the application settings.
 
 #### CMake Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `DOWNLOAD_DEFAULT_MODEL` | `ON` | Create the `download-default-model` target |
+| `DOWNLOAD_DEFAULT_MODEL` | `OFF` | Create the `download-default-model` target (downloads model to `~/.cache/whisper/`) |
+| `ENABLE_BLAS` | `ON` | Enable BLAS/OpenBLAS acceleration for whisper.cpp CPU inference |
 | `ENABLE_ASAN` | `OFF` | Enable AddressSanitizer for memory error detection |
 | `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer for data race detection |
 | `ENABLE_LTO` | `OFF` | Enable Link Time Optimization for release builds |
@@ -170,10 +172,12 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 30, range: 5–30)
 - **Continuous dictation** — enable or disable the silence-triggered recording/transcription loop (default: `true`)
 - **VAD mode** — aggressiveness level as an integer from 0 to 3, where 0 is least aggressive (most sensitive) and 3 is most aggressive (most restrictive; default: 1, moderate)
-- **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription (allowed values: 0.5, 1.0, 1.5, 2.0; default: 1.0 sec)
+- **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription. The config dialog offers 0.5, 1.0, 1.5, and 2.0 sec (default: 1.0 sec); the raw `config.json` value is clamped to the range 1.0–10.0 sec, so hand-edited values outside the dialog choices are accepted but snapped to the nearest option when the dialog is opened.
 - **Scanner min segment** — minimum audio segment length in seconds before sending to Whisper (default: 5 sec, range: 1–30 sec)
 - **Append transcription text** — when `true`, new transcriptions are appended to existing text; when `false`, the text window is cleared at the start of each session (default: `true`)
+- **Language** — transcription language as `"auto"` (auto-detect) or a 2-letter ISO 639-1 code (e.g., `"en"`, `"fr"`); default: `auto`
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
+- **Flash attention** — when `true`, enables whisper.cpp flash attention to reduce GPU VRAM usage (no effect in CPU-only mode; default: `true`)
 
 A configuration dialog is available from the system tray context menu or the gear icon in the main window's status bar.
 
