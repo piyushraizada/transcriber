@@ -966,8 +966,8 @@ size_t audio_recorder_extract_samples(AudioRecorder *recorder, int16_t **out_sam
     return ring_buffer_extract_all(recorder->ring_buffer, out_samples);
 }
 
-/* Trim trailing silence from PCM samples.
- * Scans backwards in 20ms frames and removes frames below RMS threshold.
+/* Trim trailing silence from PCM samples using VAD.
+ * Scans backwards in 20ms frames and removes frames classified as non-voice.
  * Returns the trimmed sample count. */
 size_t audio_trim_trailing_silence(int16_t *samples, size_t n_samples, uint32_t sample_rate)
 {
@@ -977,35 +977,38 @@ size_t audio_trim_trailing_silence(int16_t *samples, size_t n_samples, uint32_t 
     size_t frame_size = sample_rate / 50;  /* 16000/50 = 320 samples */
     if (frame_size == 0) frame_size = 1;
 
-    /* Silence threshold: RMS amplitude below this is considered silence.
-     * 100 out of 32768 full scale ≈ -90 dB, well below speech levels. */
-    const double silence_threshold = 100.0;
+    VadDetector *vad = vad_detector_create(VAD_MODE_MODERATE);
+    if (!vad) {
+        g_log("app-audio", G_LOG_LEVEL_WARNING,
+              "[audio] VAD creation failed — skipping trailing silence trim\n");
+        return n_samples;
+    }
 
     size_t remaining = n_samples;
+    int trimmed_frames = 0;
 
     while (remaining >= frame_size) {
-        /* Calculate RMS of the last frame */
+        /* Run VAD on the last frame */
         size_t frame_start = remaining - frame_size;
-        double sum_squares = 0.0;
-        for (size_t i = frame_start; i < remaining; i++) {
-            double val = (double)samples[i];
-            sum_squares += val * val;
-        }
-        double rms = sqrt(sum_squares / frame_size);
+        bool is_voice = vad_process_frame(vad, samples + frame_start,
+                                          (int)frame_size, (int)sample_rate);
 
-        if (rms < silence_threshold) {
+        if (!is_voice) {
             /* This frame is silence — trim it */
             remaining -= frame_size;
+            trimmed_frames++;
         } else {
-            /* Found a non-silent frame — stop trimming */
+            /* Found a voice frame — stop trimming */
             break;
         }
     }
 
+    vad_detector_destroy(vad);
+
     if (remaining < n_samples) {
         g_log("app-audio", G_LOG_LEVEL_MESSAGE,
-              "[audio] Trimmed trailing silence: %zu -> %zu samples (%.1f seconds removed)\n",
-              n_samples, remaining,
+              "[audio] Trimmed trailing silence: %zu -> %zu samples (%d frames, %.1f seconds removed)\n",
+              n_samples, remaining, trimmed_frames,
               (double)(n_samples - remaining) / (double)sample_rate);
     }
 

@@ -214,15 +214,17 @@ typedef void (*model_status_callback)(ModelStatus status,
  * callback invocation on transition, eliminating latency and CPU overhead.
  *
  * Parameters:
- *   new_state  — The AppState value after the transition.
- *   user_data  — Opaque pointer passed through from controller init.
+ *   previous_state — The AppState value before the transition.
+ *   new_state      — The AppState value after the transition.
+ *   user_data      — Opaque pointer passed through from controller init.
  *
  * IMPORTANT: This callback is invoked from whichever thread called
  * app_transition_to() or app_toggle_state(). For GTK-main-thread safety,
  * callers on non-GTK threads should marshal via g_idle_add().
  *
  * SRS: Section 2.1 (Threading Model), Section 2.3 (State Machine) */
-typedef void (*state_change_callback)(AppState new_state,
+typedef void (*state_change_callback)(AppState previous_state,
+                                       AppState new_state,
                                        void *user_data);
 
 /******************************************************************************

@@ -267,10 +267,10 @@ static gpointer model_loading_thread_func(gpointer data);
 static gboolean on_model_loaded_idle(gpointer data);
 static gboolean on_model_load_failed_idle(gpointer data);
 static void on_microphone_toggle(void *user_data);
-static void on_state_change(TranscriberApp *app, AppState new_state);
+static void on_state_change(TranscriberApp *app, AppState previous_state, AppState new_state);
 static void show_auto_close_dialog(TranscriberApp *app, const char *title,
                                    GtkMessageType type, const char *format, ...);
-static void handle_enter_listening(TranscriberApp *app);
+static void handle_enter_listening(TranscriberApp *app, AppState previous_state);
 static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path);
 static void on_scanner_segment(int16_t *samples, size_t count, void *user_data);
 static gboolean restart_watchdog_idle(gpointer user_data);
@@ -608,16 +608,32 @@ static void stop_volume_poll(TranscriberApp *app) {
 
 /**
  * Handle config changes saved from the configuration dialog.
- * Applies runtime updates to the audio recorder (device, etc.).
+ * Applies runtime updates to the audio recorder (device, etc.) and
+ * immediately reacts to transcription text mode changes.
  */
 static void on_config_changed(void *user_data) {
     TranscriberApp *app = (TranscriberApp *)user_data;
+
+    /* Apply audio device change */
     if (app->audio_recorder && app->controller.config) {
         const char *device = config_get_audio_device(app->controller.config);
         if (device && device[0] != '\0') {
             audio_recorder_set_device(app->audio_recorder, device);
         } else {
             audio_recorder_set_device(app->audio_recorder, NULL);
+        }
+    }
+
+    /* React to append_transcription_text setting change immediately.
+     * When the user switches from append mode (true) to overwrite mode
+     * (false), clear the text window so the next transcription starts fresh.
+     * Only do this when not in continuous dictation mode, since continuous
+     * mode manages its own text accumulation. */
+    if (app->controller.config && app->text_window) {
+        bool append_mode = config_get_append_transcription_text(app->controller.config);
+        bool continuous = config_get_continuous_dictation(app->controller.config);
+        if (!append_mode && !continuous) {
+            app_text_window_clear_text(app->text_window);
         }
     }
 }
@@ -636,9 +652,11 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
         return;
     }
 
+    size_t scanner_offset = app->silence_scanner
+        ? silence_scanner_get_transcribed_offset(app->silence_scanner) : 0;
     g_log("main", G_LOG_LEVEL_MESSAGE,
-          "[main] Scanner segment: %zu samples (%.1fs) — transcribing\n",
-          count, (double)count / 16000.0);
+          "[DEBUG-scanner-segment] %zu samples (%.1fs), transcribed_offset=%zu — transcribing\n",
+          count, (double)count / 16000.0, scanner_offset);
 
     /* Acquire mutex before calling whisper_transcribe_samples to prevent
      * concurrent access to the whisper.cpp context (not thread-safe).
@@ -701,18 +719,22 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
  * Handle transition to LISTENING state.
  * Starts audio recording and the watchdog timer.
  */
-static void handle_enter_listening(TranscriberApp *app) {
+static void handle_enter_listening(TranscriberApp *app, AppState previous_state) {
     g_log("main", G_LOG_LEVEL_MESSAGE, "[flow] === handle_enter_listening() entered ===\n");
 
     /* Clear the TextWindow buffer at the start of a new transcription session
      * if the user has disabled append mode (overwrite mode). This prevents
      * unbounded memory growth over many transcription sessions.
-     * However, skip clearing during continuous mode restarts (TRANSCRIBING→LISTENING)
-     * to avoid erasing the text that was just appended. */
+     *
+     * For continuous dictation mode, only clear when entering from IDLE
+     * (a fresh session started by the user). Do NOT clear during mid-session
+     * restarts (TRANSCRIBING→LISTENING) to preserve accumulated text. */
     bool append_mode = app->controller.config ? config_get_append_transcription_text(app->controller.config) : true;
     bool continuous_dictation = app->controller.config ? config_get_continuous_dictation(app->controller.config) : false;
-    if (app->text_window && !append_mode && !continuous_dictation) {
-        app_text_window_clear_text(app->text_window);
+    if (app->text_window && !append_mode) {
+        if (!continuous_dictation || previous_state == STATE_IDLE) {
+            app_text_window_clear_text(app->text_window);
+        }
     }
 
     /* Update the UI */
@@ -912,11 +934,23 @@ static gpointer transcribe_thread_func(gpointer data) {
     const char *language = config_get_language(app->controller.config);
     whisper_client_set_language(app->whisper_client, language);
 
+    /* DEBUG: Log entry state */
+    bool is_continuous_debug = app->controller.config
+        ? config_get_continuous_dictation(app->controller.config) : false;
+    g_log("main", G_LOG_LEVEL_MESSAGE,
+          "[DEBUG-transcribe-thread] ENTRY continuous=%s user_requested_stop=%d\n",
+          is_continuous_debug ? "true" : "false",
+          atomic_load(&app->user_requested_stop));
+
     /* Stop the silence scanner first to prevent it from reading the ring buffer
      * while we extract samples. The scanner thread and this transcription thread
      * both access the ring buffer, so we must stop the scanner before extracting. */
     if (app->silence_scanner) {
+        size_t offset_before_stop = silence_scanner_get_transcribed_offset(app->silence_scanner);
         silence_scanner_stop(app->silence_scanner);
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[DEBUG-transcribe-thread] Scanner stopped — transcribed_offset=%zu\n",
+              offset_before_stop);
     }
 
     /* Stop audio recording first (capture thread must stop before ring buffer extract) */
@@ -930,29 +964,53 @@ static gpointer transcribe_thread_func(gpointer data) {
     if (app->audio_recorder) {
         n_samples = audio_recorder_extract_samples(app->audio_recorder, &samples);
 
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[DEBUG-transcribe-thread] Extracted %zu samples (%.2fs) from ring buffer\n",
+              n_samples, (double)n_samples / 16000.0);
+
         /* In continuous mode, skip already-transcribed samples.
          * The silence scanner tracks how many samples have been sent
          * for transcription. We only want the remaining untranscribed
          * portion from the ring buffer. */
         if (samples && n_samples > 0 && app->silence_scanner) {
             size_t already_transcribed = silence_scanner_get_transcribed_offset(app->silence_scanner);
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[DEBUG-transcribe-thread] Scanner transcribed_offset=%zu, ring_buffer_total=%zu\n",
+                  already_transcribed, n_samples);
             if (already_transcribed >= n_samples) {
                 /* All samples were already transcribed by the scanner */
+                g_log("main", G_LOG_LEVEL_MESSAGE,
+                      "[DEBUG-transcribe-thread] SKIP — all %zu samples already transcribed (offset=%zu)\n",
+                      n_samples, already_transcribed);
                 g_free(samples);
                 samples = NULL;
                 n_samples = 0;
             } else if (already_transcribed > 0) {
+                size_t remaining_after_skip = n_samples - already_transcribed;
+                g_log("main", G_LOG_LEVEL_MESSAGE,
+                      "[DEBUG-transcribe-thread] Skipping %zu already-transcribed samples, keeping %zu (%.2fs)\n",
+                      already_transcribed, remaining_after_skip,
+                      (double)remaining_after_skip / 16000.0);
                 /* Skip the already-transcribed prefix */
                 memmove(samples, samples + already_transcribed,
                         (n_samples - already_transcribed) * sizeof(int16_t));
                 n_samples -= already_transcribed;
+            } else {
+                g_log("main", G_LOG_LEVEL_MESSAGE,
+                      "[DEBUG-transcribe-thread] No offset to skip — using all %zu samples\n",
+                      n_samples);
             }
         }
 
         /* Trim trailing silence to prevent whisper from hallucinating text
          * on trailing quiet periods. */
         if (samples && n_samples > 0) {
+            size_t before_trim = n_samples;
             n_samples = audio_trim_trailing_silence(samples, n_samples, 16000);
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[DEBUG-transcribe-thread] After trim: %zu -> %zu samples (%.2fs removed)\n",
+                  before_trim, n_samples,
+                  (double)(before_trim - n_samples) / 16000.0);
         }
 
         /* Skip transcription if remaining audio is too short.
@@ -961,7 +1019,13 @@ static gpointer transcribe_thread_func(gpointer data) {
          * to avoid spurious transcriptions. */
         if (samples && n_samples > 0) {
             int remaining_ms = (int)((double)n_samples / 16000.0 * 1000.0);
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[DEBUG-transcribe-thread] Duration check: %d ms (threshold=500ms)\n",
+                  remaining_ms);
             if (remaining_ms < 500) {
+                g_log("main", G_LOG_LEVEL_MESSAGE,
+                      "[DEBUG-transcribe-thread] SKIP — too short (%d ms < 500ms)\n",
+                      remaining_ms);
                 g_free(samples);
                 samples = NULL;
                 n_samples = 0;
@@ -989,17 +1053,31 @@ static gpointer transcribe_thread_func(gpointer data) {
                 /* Require at least 30% of frames to be voice */
                 bool has_voice = (voice_frames > (int)(n_frames * 0.3));
                 vad_detector_destroy(vad);
+                g_log("main", G_LOG_LEVEL_MESSAGE,
+                      "[DEBUG-transcribe-thread] VAD: %d/%d frames voice (%.0f%%, threshold=30%%) has_voice=%s\n",
+                      voice_frames, (int)n_frames,
+                      n_frames > 0 ? ((double)voice_frames / n_frames * 100.0) : 0.0,
+                      has_voice ? "true" : "false");
                 if (!has_voice) {
                     g_log("main", G_LOG_LEVEL_MESSAGE,
-                          "[main] Remaining audio has no voice (%d/%d frames) — skipping transcription\n",
+                          "[DEBUG-transcribe-thread] SKIP — VAD rejected (%d/%d frames)\n",
                           voice_frames, (int)n_frames);
                     g_free(samples);
                     samples = NULL;
                     n_samples = 0;
                 }
             }
+        } else if (samples && n_samples > 0) {
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[DEBUG-transcribe-thread] VAD check skipped (no scanner), proceeding with %zu samples\n",
+                  n_samples);
         }
     }
+
+    g_log("main", G_LOG_LEVEL_MESSAGE,
+          "[DEBUG-transcribe-thread] Final: samples=%p n_samples=%zu (%.2fs)\n",
+          (void*)samples, n_samples,
+          n_samples > 0 ? (double)n_samples / 16000.0 : 0.0);
 
     WhisperResponse *response = NULL;
 
@@ -1117,8 +1195,13 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
         g_log("main", G_LOG_LEVEL_WARNING,
               "[flow] Transcription SUCCESS — appending '%.80s...'\n", text_or_error);
 
-        /* Append transcribed text to the TextWindow */
+        /* Append or replace transcribed text in the TextWindow based on setting. */
         if (app->text_window) {
+            bool append_mode = app->controller.config
+                ? config_get_append_transcription_text(app->controller.config) : true;
+            if (!append_mode) {
+                app_text_window_clear_text(app->text_window);
+            }
             app_text_window_append_text(app->text_window, text_or_error);
         }
 
@@ -1167,11 +1250,14 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
 
     AppState current_state = app_get_state(&app->controller);
 
+    size_t final_offset = app->silence_scanner
+        ? silence_scanner_get_transcribed_offset(app->silence_scanner) : 0;
     g_log("main", G_LOG_LEVEL_WARNING,
-          "[transcription_result] success=%d continuous=%s user_stopped=%d "
-          "current_state=%d\n",
+          "[DEBUG-transcription_result] success=%d continuous=%s user_stopped=%d "
+          "current_state=%d transcribed_offset=%zu text_len=%zu\n",
           success, continuous ? "true" : "false",
-          user_stopped, current_state);
+          user_stopped, current_state, final_offset,
+          (success && text_or_error) ? strlen(text_or_error) : 0);
 
     if (continuous && success && !user_stopped) {
         /* Continuous mode: restart recording after transcription completes.
@@ -1585,19 +1671,19 @@ static void perform_initial_model_load(TranscriberApp *app) {
  * This callback is invoked from the GTK main thread, as all
  * callers of app_transition_to/app_toggle_state run on that thread.
  */
-static void on_state_change(TranscriberApp *app, AppState new_state) {
+static void on_state_change(TranscriberApp *app, AppState previous_state, AppState new_state) {
     const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
 
     g_log("main", G_LOG_LEVEL_WARNING,
           "[flow] STATE CHANGE: %s -> %s\n",
-          state_name[app_get_state(&app->controller)],
+          state_name[previous_state],
           state_name[new_state]);
 
     switch (new_state) {
         case STATE_LISTENING:
             g_log("main", G_LOG_LEVEL_INFO,
                   "[flow] Entering LISTENING — starting recording + scanner\n");
-            handle_enter_listening(app);
+            handle_enter_listening(app, previous_state);
             break;
         case STATE_TRANSCRIBING:
             /* Stop the silence scanner BEFORE stopping the recorder.
@@ -1677,9 +1763,9 @@ static void on_model_status_change_wrapper(ModelStatus status, void *user_data) 
 /**
  * Wrapper to adapt on_state_change to the controller callback signature.
  */
-static void on_state_change_wrapper(AppState new_state, void *user_data) {
+static void on_state_change_wrapper(AppState previous_state, AppState new_state, void *user_data) {
     TranscriberApp *app = (TranscriberApp *)user_data;
-    on_state_change(app, new_state);
+    on_state_change(app, previous_state, new_state);
 }
 
 /* ------------------------------------------------------------------ */

@@ -145,7 +145,7 @@ bool app_transition_to(AppStateController *controller, AppState target) {
       * modified, so there is no race. If future code modifies it, a ref
       * count or copy would be needed here. */
     if (allowed && controller->on_state_change) {
-        controller->on_state_change(target, controller->callback_user_data);
+        controller->on_state_change(current, target, controller->callback_user_data);
     }
 
     return allowed;
@@ -167,10 +167,11 @@ bool app_toggle_state(AppStateController *controller) {
      * of sequence_counter and non-atomic state determination. */
     pthread_mutex_lock(&controller->state_mutex);
 
+    AppState previous = controller->state;
     AppState target;
     bool should_transition = false;
 
-    switch (controller->state) {
+    switch (previous) {
         case STATE_IDLE:
             target = STATE_LISTENING;
             should_transition = true;
@@ -197,7 +198,7 @@ bool app_toggle_state(AppStateController *controller) {
      * Callback is invoked outside the mutex to prevent deadlocks.
      * Note: Called from whichever thread invoked this function. */
     if (should_transition && controller->on_state_change) {
-        controller->on_state_change(target, controller->callback_user_data);
+        controller->on_state_change(previous, target, controller->callback_user_data);
     }
 
     return should_transition;
