@@ -708,7 +708,7 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     /* Create the main window */
     win->window = GTK_WINDOW(gtk_window_new(GTK_WINDOW_TOPLEVEL));
     if (!win->window) {
-        free(win);
+        g_free(win);
         return NULL;
     }
 
@@ -1025,19 +1025,16 @@ void app_window_set_config_changed_callback(MainWindow *win,
 /* ------------------------------------------------------------------ */
 
 TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
-    TextWindow *tw = (TextWindow *)calloc(1, sizeof(TextWindow));
+    TextWindow *tw = g_new0(TextWindow, 1);
     if (!tw) {
         return NULL;
     }
     tw->auto_position = TRUE;  /* Auto-position on first show; skip after user moves it */
-    if (!tw) {
-        return NULL;
-    }
 
     /* Create the text window */
     tw->window = GTK_WINDOW(gtk_window_new(GTK_WINDOW_TOPLEVEL));
     if (!tw->window) {
-        free(tw);
+        g_free(tw);
         return NULL;
     }
 
@@ -1127,7 +1124,7 @@ void app_text_window_destroy(TextWindow *tw) {
         gtk_widget_destroy(GTK_WIDGET(tw->window));
     }
 
-    free(tw);
+    g_free(tw);
 }
 
 void app_text_window_append_text(TextWindow *tw, const char *text) {

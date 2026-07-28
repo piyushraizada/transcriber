@@ -429,6 +429,13 @@ SystemTray *tray_create(void) {
                                            tray->icon_dir);
     if (!tray->indicator) {
         g_log("app-tray", G_LOG_LEVEL_MESSAGE, "[tray] Failed to create AppIndicator\n");
+        /* Clean up icon PNG files before removing the directory. */
+        if (tray->icon_idle_created) {
+            unlink(tray->icon_idle_path);
+        }
+        if (tray->icon_listening_created) {
+            unlink(tray->icon_listening_path);
+        }
         rmdir(tray->icon_dir);
         g_free(tray);
         return NULL;

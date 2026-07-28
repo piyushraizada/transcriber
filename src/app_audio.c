@@ -656,6 +656,10 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         set_audio_error(msg);
         fclose(recorder->wav_file);
         recorder->wav_file = NULL;
+        if (recorder->ring_buffer) {
+            ring_buffer_destroy(recorder->ring_buffer);
+            recorder->ring_buffer = NULL;
+        }
         unlink(recorder->wav_path);
         recorder->wav_path[0] = '\0';
         pthread_mutex_unlock(&recorder->mutex);
