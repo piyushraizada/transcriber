@@ -35,6 +35,10 @@
 
 #include "app_gpu.h"
 
+#ifdef HAVE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 /* ===================================================================
  * Constants and defaults
  * =================================================================== */
@@ -67,6 +71,7 @@ struct _WhisperClient {
     char language[16];                 // Language code: "auto", "en", "fr", etc.
     int n_threads;
     int gpu_index;                     // -3 = auto by free mem, -2 = CPU-only, >=0 = specific GPU
+    int active_gpu_device;             // Actual CUDA device index after model load (-1 = CPU)
     bool flash_attention;              // Enable flash attention for reduced VRAM usage
     char error_message[256];
     int error_code;
@@ -280,6 +285,10 @@ static bool load_model_internal(WhisperClient *client) {
 #ifdef HAVE_CUDA
     if (try_gpu && gpu_idx >= 0) {
         cparams.gpu_device = gpu_idx;
+        /* Ensure the CUDA current device matches before model init.
+         * whisper_init_from_file_with_params() uses cudaSetDevice internally,
+         * but intermediate GPU queries may have left us on a different device. */
+        cudaSetDevice(gpu_idx);
     }
 #endif
 
@@ -318,6 +327,9 @@ static bool load_model_internal(WhisperClient *client) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
               "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
               n_vocab);
+#ifdef HAVE_CUDA
+        if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
+#endif
         whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
@@ -335,6 +347,9 @@ static bool load_model_internal(WhisperClient *client) {
     if (lang_en_id < 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
               "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
+#ifdef HAVE_CUDA
+        if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
+#endif
         whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
@@ -342,6 +357,11 @@ static bool load_model_internal(WhisperClient *client) {
         client->error_code = 5;
         return false;
     }
+
+    /* Store the actual active GPU device so transcription can restore
+     * the CUDA context before each call. The current device can drift
+     * after gpu_release_unused_devices() and multi-threaded operations. */
+    client->active_gpu_device = gpu_loaded && gpu_idx >= 0 ? gpu_idx : -1;
 
     /* Model passed functional validation — mark as loaded. */
     atomic_store(&client->model_loaded, true);
@@ -406,6 +426,14 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool
     // If already loaded but GPU config or flash attention differs, unload first
     if (atomic_load(&client->model_loaded)) {
         if (client->ctx) {
+            /* Restore correct CUDA device before freeing the old model. */
+#ifdef HAVE_CUDA
+            if (client->active_gpu_device >= 0) {
+                pthread_mutex_unlock(&client->mutex);
+                cudaSetDevice(client->active_gpu_device);
+                pthread_mutex_lock(&client->mutex);
+            }
+#endif
             whisper_free(client->ctx);
             client->ctx = NULL;
         }
@@ -605,6 +633,7 @@ WhisperClient* whisper_client_create(void) {
     atomic_store(&client->model_loading, false);
     client->n_threads = DEFAULT_THREADS;
     client->gpu_index = GPU_INDEX_AUTO_MEMORY;  // Auto-select by free memory
+    client->active_gpu_device = -1;             // -1 means CPU until model is loaded
     client->model_path[0] = '\0';
     strncpy(client->language, "auto", sizeof(client->language) - 1);
     client->language[sizeof(client->language) - 1] = '\0';
@@ -632,8 +661,21 @@ void whisper_client_destroy(WhisperClient* client) {
      * transcriptions from starting. */
     atomic_store(&client->model_loading, false);
 
+    /* Save active GPU device before mutex lock — needed for cleanup below. */
+    int saved_gpu_device = client->active_gpu_device;
+
     pthread_mutex_lock(&client->mutex);
     if (client->ctx) {
+        /* Restore correct CUDA device before freeing the model.
+         * The memory was allocated on active_gpu_device, and cudaFree()
+         * inside whisper_free() will fail on the wrong device. */
+#ifdef HAVE_CUDA
+        if (saved_gpu_device >= 0) {
+            pthread_mutex_unlock(&client->mutex);
+            cudaSetDevice(saved_gpu_device);
+            pthread_mutex_lock(&client->mutex);
+        }
+#endif
         whisper_free(client->ctx);
         client->ctx = NULL;
     }
@@ -665,6 +707,14 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
     if (client->ctx && ret == 0) {
         // Check if path changed
         if (strcmp(client->model_path, resolved) != 0) {
+            /* Restore correct CUDA device before freeing the old model. */
+#ifdef HAVE_CUDA
+            if (client->active_gpu_device >= 0) {
+                pthread_mutex_unlock(&client->mutex);
+                cudaSetDevice(client->active_gpu_device);
+                pthread_mutex_lock(&client->mutex);
+            }
+#endif
             whisper_free(client->ctx);
             client->ctx = NULL;
             atomic_store(&client->model_loaded, false);
@@ -777,7 +827,14 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
         params.language = lang;
     }
 
-    // Run transcription WITHOUT holding the mutex
+    // Ensure CUDA context is set to the correct GPU device before inference.
+    // The current device can drift after gpu_release_unused_devices() and
+    // multi-threaded operations, causing OOM on the wrong GPU.
+#ifdef HAVE_CUDA
+    if (client->active_gpu_device >= 0) {
+        cudaSetDevice(client->active_gpu_device);
+    }
+#endif
     int result = whisper_full(ctx, params, samples, n_samples);
 
     free(samples);
@@ -931,7 +988,12 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
         params.language = lang;
     }
 
-    // Run transcription
+    // Ensure CUDA context is set to the correct GPU device before inference.
+#ifdef HAVE_CUDA
+    if (client->active_gpu_device >= 0) {
+        cudaSetDevice(client->active_gpu_device);
+    }
+#endif
     int result = whisper_full(ctx, params, float_samples, n_samples);
     free(float_samples);
 
