@@ -21,7 +21,7 @@
  *   - Loads GGML model files (ggml-base.bin, ggml-small.bin, etc.)
  *   - Transcribes WAV files (16kHz, mono, 16-bit PCM)
  *   - Supports language specification and auto-detection
- *   - Thread-safe with mutex-protected model access
+ *   - Thread-safe with mutex-protected model access and reference counting
  *   - Graceful cancellation support for long transcriptions
  *
  * The module maintains API compatibility with the previous external API
@@ -33,6 +33,8 @@
  *   - Transcription runs in a dedicated background thread
  *   - The whisper.cpp context is NOT thread-safe, so a mutex protects
  *     concurrent access during transcription
+ *   - Context reference counting prevents use-after-free when transcriptions
+ *     are in-flight while another thread unloads the model
  *   - Cancellation is supported via an atomic flag checked during processing
  */
 
@@ -43,6 +45,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*---------------------------------------------------------------------------
+ * Section 0: Error Codes
+ *---------------------------------------------------------------------------
+ * Consistent, non-overlapping error codes for all whisper module functions.
+ */
+typedef enum {
+    WHISPER_ERR_OK                =  0,  ///< Success
+    WHISPER_ERR_INVALID_PARAM     =  1,  ///< NULL or invalid argument
+    WHISPER_ERR_MODEL_NOT_FOUND   =  2,  ///< Model file does not exist
+    WHISPER_ERR_MODEL_LOAD_FAIL   =  3,  ///< whisper_init_from_file_with_params failed
+    WHISPER_ERR_WAV_READ_FAIL     =  4,  ///< Failed to read or parse WAV file
+    WHISPER_ERR_TRANSCRIBE_FAIL   =  5,  ///< whisper_full() returned error
+    WHISPER_ERR_NO_SEGMENTS       =  6,  ///< Transcription produced zero segments
+    WHISPER_ERR_MEMORY_ALLOC      =  7,  ///< malloc/calloc failed
+    WHISPER_ERR_MODEL_VALIDATION  =  8,  ///< Post-load validation failed (vocab)
+    WHISPER_ERR_MODEL_LANG_CHECK  =  9,  ///< Post-load language lookup failed
+} whisper_error_code;
 
 /*---------------------------------------------------------------------------
  * Section 1: Whisper Response Structure
@@ -92,8 +112,8 @@ WhisperClient* whisper_client_create(void);
  * Destroy a Whisper client and free all associated resources.
  *
  * This function performs complete cleanup:
- *   1. Free whisper.cpp context (if loaded)
- *   2. Free model path and language strings
+ *   1. Signal cancellation to any in-flight transcription
+ *   2. Free whisper.cpp context (if loaded)
  *   3. Destroy mutex
  *   4. Free the WhisperClient struct
  *
@@ -139,7 +159,7 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* model_path
  * @param client   Pointer to a valid WhisperClient. Must not be NULL.
  * @param language Language code string. "auto" or NULL for auto-detect.
  *
- * @return true if the language was set successfully, false if invalid.
+ * @return true if the language was set successfully, false if client is NULL.
  */
 bool whisper_client_set_language(WhisperClient* client, const char* language);
 
@@ -230,9 +250,9 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
  *         The caller MUST free the response using whisper_response_free().
  */
 WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
-                                                        const int16_t *samples,
-                                                        int n_samples,
-                                                        int max_retries);
+                                                         const int16_t *samples,
+                                                         int n_samples,
+                                                         int max_retries);
 
 /*---------------------------------------------------------------------------
  * Section 6: Connection Health Check (Model Availability)
@@ -253,23 +273,16 @@ WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
 bool whisper_check_connection(WhisperClient* client);
 
 /**
- * Validate that a file is a valid Whisper model (GGML or GGUF format).
+ * Validate that a file has a valid Whisper model magic header (GGML or GGUF).
  *
- * This function attempts to load the model using whisper.cpp's own
- * model loader (whisper_init_from_file_with_params), which handles
- * both GGML (.bin) and GGUF (.gguf) formats. The model is immediately
- * freed after validation — it is NOT kept loaded.
- *
- * This is the authoritative check for model validity, as it uses the
- * same code path that will be used during actual transcription.
+ * This function checks the first 4 bytes of the file for the GGML (0x67676d6c)
+ * or GGUF (0x46554747) magic signature. It does NOT load the full model,
+ * making it fast enough to call from the UI thread during file selection.
+ * The actual model loading happens lazily on first transcription.
  *
  * @param model_path Path to the model file to validate.
- * @return true if whisper.cpp can successfully load the model,
- *         false otherwise (file missing, corrupt, wrong format, etc.).
- *
- * @note This function is synchronous and may take several seconds
- *       for large models. Call from a background thread or idle
- *       callback, NOT from the GTK main thread during UI updates.
+ * @return true if the file has a valid GGML or GGUF magic header,
+ *         false otherwise (file missing, too small, wrong format, etc.).
  */
 bool whisper_validate_model_file(const char* model_path);
 

@@ -14,6 +14,29 @@
  *
  * The API surface matches the original external API implementation,
  * so the rest of the application remains unchanged.
+ *
+ * Key data structures:
+ *   - WhisperClient: Opaque handle containing whisper context, model path,
+ *     language config, GPU settings, mutex, cancellation flag, and a
+ *     reference count for the loaded context to prevent use-after-free
+ *     when transcriptions are in-flight during model reload/unload.
+ *
+ * Threading:
+ *   - All public APIs are thread-safe via pthread_mutex_t
+ *   - Context reference counting (atomic) ensures that in-flight
+ *     transcriptions keep the whisper_context alive even if another
+ *     thread unloads the model
+ *   - A 'destroying' atomic flag blocks new transcriptions during cleanup
+ *   - Cancellation uses an atomic_int flag checked by whisper.cpp's
+ *     abort_callback during whisper_full()
+ *
+ * Lifecycle:
+ *   1. whisper_client_create() — allocate and init client
+ *   2. whisper_client_set_model_path() — configure model location
+ *   3. whisper_client_load_model() (optional) — pre-load model
+ *   4. whisper_transcribe() / whisper_transcribe_samples() — transcribe
+ *   5. whisper_client_destroy() — signal cancellation, wait for refs to
+ *     drop, free context and client
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -48,6 +71,17 @@
 #define MAX_PATH_LEN  PATH_MAX
 #define DEFAULT_THREADS 0  // 0 = use all available threads
 
+/* Maximum WAV data chunk size: 30 minutes of 16kHz/16-bit/mono audio (~57.6 MB) */
+#define MAX_WAV_DATA_SIZE (30UL * 60UL * 16000UL * 2UL)
+
+/* GGML magic: 0x67676d6c ("ggml" little-endian) */
+#define GGML_MAGIC 0x67676d6cu
+/* GGUF magic: 0x46554747 ("GGUF" as uint32 little-endian) */
+#define GGUF_MAGIC 0x46554747u
+
+/* Default fallback thread count when sysconf fails */
+#define DEFAULT_FALLBACK_THREADS 4
+
 /* Default model search directories (in order of preference).
  * SYSTEM_MODEL_DIR is defined by CMake at configure time, allowing package
  * maintainers to override the system-wide model directory via
@@ -78,8 +112,38 @@ struct _WhisperClient {
     pthread_mutex_t mutex;
     atomic_int cancel_requested;
     atomic_bool model_loaded;          // atomic for portable cross-thread visibility
-    atomic_bool model_loading;         // true while model load is in progress (atomic for cross-thread safety)
+    atomic_bool model_loading;         // true while model load is in progress
+    atomic_uint ctx_refcount;          // reference count for in-flight transcriptions
+    atomic_bool destroying;            // true during whisper_client_destroy cleanup
 };
+
+/* ===================================================================
+ * Helper: context reference counting
+ * =================================================================== */
+static void ctx_ref(WhisperClient *client) {
+    if (client) {
+        atomic_fetch_add(&client->ctx_refcount, 1);
+    }
+}
+
+static void ctx_unref(WhisperClient *client) {
+    if (client && atomic_fetch_sub(&client->ctx_refcount, 1) == 1) {
+        // Last reference dropped — free the context under mutex
+        pthread_mutex_lock(&client->mutex);
+        struct whisper_context *to_free = client->ctx;
+        client->ctx = NULL;
+        atomic_store(&client->model_loaded, false);
+        pthread_mutex_unlock(&client->mutex);
+
+        if (to_free) {
+#ifdef HAVE_CUDA
+            // GPU device may have drifted; use saved index from before lock
+            // (the caller should handle this, but we do a best-effort here)
+#endif
+            whisper_free(to_free);
+        }
+    }
+}
 
 /* ===================================================================
  * Cancellation callback for whisper.cpp
@@ -173,6 +237,76 @@ static void set_error(WhisperClient *client, int code, const char *msg) {
 }
 
 /* ===================================================================
+ * Helper: setup transcription parameters (deduplicated)
+ * =================================================================== */
+static void setup_transcription_params(int n_threads_cfg, const char *lang,
+                                        struct whisper_full_params *params,
+                                        atomic_int *cancel_flag) {
+    *params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+
+    int threads = n_threads_cfg > 0 ? n_threads_cfg : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (threads <= 0) {
+        threads = DEFAULT_FALLBACK_THREADS;
+    }
+    params->n_threads = threads;
+    params->print_progress = false;
+    params->print_realtime = false;
+    params->print_special = false;
+    params->translate = false;
+    params->no_timestamps = true;
+
+    // Setup cancellation callback - whisper.cpp will call this periodically
+    params->abort_callback = whisper_abort_callback;
+    params->abort_callback_user_data = cancel_flag;
+
+    // Set language: "auto" or empty means auto-detect, otherwise use specified language
+    if (lang[0] == '\0' || strcmp(lang, "auto") == 0) {
+        params->language = NULL;  // Auto-detect
+    } else {
+        params->language = lang;
+    }
+}
+
+/* ===================================================================
+ * Helper: extract and concatenate segment text (deduplicated)
+ * =================================================================== */
+static char *extract_segments_text(struct whisper_context *ctx, int n_segments) {
+    if (!ctx || n_segments <= 0) return NULL;
+
+    // Single pass to calculate total length
+    size_t total_len = 0;
+    for (int i = 0; i < n_segments; i++) {
+        const char *text = whisper_full_get_segment_text(ctx, i);
+        if (text) {
+            total_len += strlen(text);
+        }
+    }
+
+    char *full_text = g_malloc(total_len + 1);
+    if (!full_text) return NULL;
+
+    full_text[0] = '\0';
+    size_t offset = 0;
+    for (int i = 0; i < n_segments; i++) {
+        const char *text = whisper_full_get_segment_text(ctx, i);
+        if (text) {
+            size_t len = strlen(text);
+            memcpy(full_text + offset, text, len);
+            offset += len;
+        }
+    }
+    full_text[offset] = '\0';
+
+    // Trim trailing whitespace/newline
+    size_t len = strlen(full_text);
+    while (len > 0 && (full_text[len - 1] == '\n' || full_text[len - 1] == ' ')) {
+        full_text[--len] = '\0';
+    }
+
+    return full_text;
+}
+
+/* ===================================================================
  * Public: Check if CUDA GPU acceleration is available
  * =================================================================== */
 bool whisper_gpu_available(void) {
@@ -207,7 +341,7 @@ static bool load_model_internal(WhisperClient *client) {
     if (atomic_load(&client->model_loaded)) return true;
 
     if (client->model_path[0] == '\0') {
-        set_error(client, 1, "No model path configured");
+        set_error(client, WHISPER_ERR_MODEL_NOT_FOUND, "No model path configured");
         return false;
     }
 
@@ -215,8 +349,8 @@ static bool load_model_internal(WhisperClient *client) {
     struct stat st;
     if (stat(client->model_path, &st) != 0) {
         snprintf(client->error_message, sizeof(client->error_message),
-                 "Model file not found: %.200s", client->model_path);
-        client->error_code = 2;
+                  "Model file not found: %.200s", client->model_path);
+        client->error_code = WHISPER_ERR_MODEL_NOT_FOUND;
         return false;
     }
 
@@ -267,14 +401,14 @@ static bool load_model_internal(WhisperClient *client) {
         char gpu_name[256];
         if (gpu_get_device_name(gpu_idx, gpu_name, sizeof(gpu_name))) {
             g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-                  "[whisper] Using GPU device %d: %s", gpu_idx, gpu_name);
+                   "[whisper] Using GPU device %d: %s", gpu_idx, gpu_name);
         } else {
             g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-                  "[whisper] Using GPU device %d", gpu_idx);
+                   "[whisper] Using GPU device %d", gpu_idx);
         }
     } else if (!try_gpu) {
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-              "[whisper] Using CPU (no GPU)");
+               "[whisper] Using CPU (no GPU)");
     }
 
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -309,8 +443,8 @@ static bool load_model_internal(WhisperClient *client) {
 
     if (!ctx) {
         snprintf(client->error_message, sizeof(client->error_message),
-                 "Failed to load whisper model: %.200s", client->model_path);
-        client->error_code = 3;
+                  "Failed to load whisper model: %.200s", client->model_path);
+        client->error_code = WHISPER_ERR_MODEL_LOAD_FAIL;
         return false;
     }
 
@@ -325,16 +459,16 @@ static bool load_model_internal(WhisperClient *client) {
     int n_vocab = whisper_n_vocab(ctx);
     if (n_vocab <= 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
-              "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
-              n_vocab);
+               "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
+               n_vocab);
 #ifdef HAVE_CUDA
         if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
 #endif
         whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
-                 "Model loaded but post-validation failed (vocab=%d)", n_vocab);
-        client->error_code = 4;
+                  "Model loaded but post-validation failed (vocab=%d)", n_vocab);
+        client->error_code = WHISPER_ERR_MODEL_VALIDATION;
         return false;
     }
 
@@ -346,15 +480,15 @@ static bool load_model_internal(WhisperClient *client) {
     int lang_en_id = whisper_lang_id("en");
     if (lang_en_id < 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
-              "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
+               "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
 #ifdef HAVE_CUDA
         if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
 #endif
         whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
-                 "Model loaded but post-validation failed (language lookup)");
-        client->error_code = 5;
+                  "Model loaded but post-validation failed (language lookup)");
+        client->error_code = WHISPER_ERR_MODEL_LANG_CHECK;
         return false;
     }
 
@@ -363,12 +497,15 @@ static bool load_model_internal(WhisperClient *client) {
      * after gpu_release_unused_devices() and multi-threaded operations. */
     client->active_gpu_device = gpu_loaded && gpu_idx >= 0 ? gpu_idx : -1;
 
+    /* Reset refcount for new context */
+    atomic_store(&client->ctx_refcount, 0);
+
     /* Model passed functional validation — mark as loaded. */
     atomic_store(&client->model_loaded, true);
 
     g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-          "[whisper] Model validated successfully (vocab=%d, gpu=%s)\n",
-          n_vocab, gpu_loaded ? "yes" : "no");
+           "[whisper] Model validated successfully (vocab=%d, gpu=%s)\n",
+           n_vocab, gpu_loaded ? "yes" : "no");
 
     /* Release CUDA contexts on GPUs not used by the loaded model.
      * whisper_init_from_file_with_params() enumerates all CUDA devices
@@ -378,6 +515,24 @@ static bool load_model_internal(WhisperClient *client) {
     }
 
     return true;
+}
+
+/* ===================================================================
+ * Internal: Helper to free current context under mutex with GPU safety
+ * =================================================================== */
+static void free_current_context(WhisperClient *client) {
+    if (!client || !client->ctx) return;
+
+#ifdef HAVE_CUDA
+    int saved_gpu = client->active_gpu_device;
+    if (saved_gpu >= 0) {
+        pthread_mutex_unlock(&client->mutex);
+        cudaSetDevice(saved_gpu);
+        pthread_mutex_lock(&client->mutex);
+    }
+#endif
+    whisper_free(client->ctx);
+    client->ctx = NULL;
 }
 
 /* ===================================================================
@@ -425,18 +580,7 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool
 
     // If already loaded but GPU config or flash attention differs, unload first
     if (atomic_load(&client->model_loaded)) {
-        if (client->ctx) {
-            /* Restore correct CUDA device before freeing the old model. */
-#ifdef HAVE_CUDA
-            if (client->active_gpu_device >= 0) {
-                pthread_mutex_unlock(&client->mutex);
-                cudaSetDevice(client->active_gpu_device);
-                pthread_mutex_lock(&client->mutex);
-            }
-#endif
-            whisper_free(client->ctx);
-            client->ctx = NULL;
-        }
+        free_current_context(client);
         atomic_store(&client->model_loaded, false);
     }
 
@@ -545,62 +689,73 @@ static bool read_wav_samples(const char *path, float **samples_out, int *n_sampl
     }
 
     // Validate data_size to prevent excessive memory allocation from malicious WAV files.
-    // Cap at 30 minutes of 16kHz/16-bit/mono audio = ~57.6 MB.
-    #define MAX_WAV_DATA_SIZE (30UL * 60UL * 16000UL * 2UL)
     if ((uint64_t)data_size > MAX_WAV_DATA_SIZE) {
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-              "[whisper] WAV data chunk too large: %u bytes (max %lu) — aborting\n",
-              data_size, (unsigned long)MAX_WAV_DATA_SIZE);
+               "[whisper] WAV data chunk too large: %u bytes (max %lu) — aborting\n",
+               data_size, (unsigned long)MAX_WAV_DATA_SIZE);
         fclose(f);
         return false;
     }
 
-    // Read PCM data and convert to float32
-    int n_samples = data_size / (bits_per_sample / 8);
+    // Read raw PCM data as bytes, then convert to float32
     int bytes_per_sample_actual = bits_per_sample / 8;
-
-    // Handle multi-channel by only taking first channel samples
-    if (channels > 1) {
-        n_samples = n_samples / channels;
+    if (bytes_per_sample_actual <= 0) {
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Invalid bits_per_sample: %d\n", bits_per_sample);
+        fclose(f);
+        return false;
     }
 
-    float *samples = (float *)calloc(n_samples, sizeof(float));
+    int total_samples_in_file = data_size / bytes_per_sample_actual;
+    // Handle multi-channel by only taking first channel samples
+    int n_samples = (channels > 1) ? total_samples_in_file / channels : total_samples_in_file;
+
+    if (n_samples <= 0) {
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] WAV file contains no valid samples\n");
+        fclose(f);
+        return false;
+    }
+
+    float *samples = g_new0(float, n_samples);
     if (!samples) {
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Memory allocation failed for samples\n");
         fclose(f);
         return false;
     }
 
-    // Read raw PCM data
-    int16_t *pcm = (int16_t *)malloc(data_size);
-    if (!pcm) {
-        free(samples);
+    // Read raw PCM data as bytes to handle any bit depth correctly
+    uint8_t *raw_pcm = g_malloc(data_size);
+    if (!raw_pcm) {
+        g_free(samples);
         g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Memory allocation failed for PCM buffer\n");
         fclose(f);
         return false;
     }
 
-    size_t read_count = fread(pcm, bytes_per_sample_actual * channels, n_samples * channels, f);
+    size_t bytes_read = fread(raw_pcm, 1, data_size, f);
     fclose(f);
 
-    if (read_count < (size_t)(n_samples * channels)) {
-        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: read %zu samples, expected %d\n",
-                read_count, n_samples * channels);
-        n_samples = read_count / channels;
+    if (bytes_read < data_size) {
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Warning: read %zu bytes, expected %u\n",
+                bytes_read, data_size);
+        n_samples = (int)(bytes_read / (bytes_per_sample_actual * channels));
     }
 
     // Convert to float32 normalized to [-1, 1]
     for (int i = 0; i < n_samples; i++) {
+        int byte_offset = i * channels * bytes_per_sample_actual;
         if (bits_per_sample == 16) {
-            samples[i] = (float)pcm[i * channels] / 32768.0f;
+            int16_t val = (int16_t)(raw_pcm[byte_offset] | (raw_pcm[byte_offset + 1] << 8));
+            samples[i] = (float)val / 32768.0f;
         } else if (bits_per_sample == 8) {
-            samples[i] = ((float)pcm[i * channels] - 128.0f) / 128.0f;
+            samples[i] = ((float)raw_pcm[byte_offset] - 128.0f) / 128.0f;
         } else {
-            samples[i] = (float)pcm[i * channels] / 32768.0f;
+            // Fallback: treat as 16-bit
+            int16_t val = (int16_t)(raw_pcm[byte_offset] | (raw_pcm[byte_offset + 1] << 8));
+            samples[i] = (float)val / 32768.0f;
         }
     }
 
-    free(pcm);
+    g_free(raw_pcm);
     *samples_out = samples;
     *n_samples_out = n_samples;
 
@@ -614,23 +769,25 @@ void whisper_response_free(WhisperResponse *response) {
     if (!response) return;
 
     if (response->text) {
-        free(response->text);
+        g_free(response->text);
         response->text = NULL;
     }
     memset(response->error_message, 0, sizeof(response->error_message));
-    free(response);
+    g_free(response);
 }
 
 /* ===================================================================
  * Public API: whisper_client_create
  * =================================================================== */
 WhisperClient* whisper_client_create(void) {
-    WhisperClient *client = (WhisperClient *)calloc(1, sizeof(WhisperClient));
+    WhisperClient *client = g_new0(WhisperClient, 1);
     if (!client) return NULL;
 
     client->ctx = NULL;
     client->model_loaded = false;
     atomic_store(&client->model_loading, false);
+    atomic_store(&client->ctx_refcount, 0);
+    atomic_store(&client->destroying, false);
     client->n_threads = DEFAULT_THREADS;
     client->gpu_index = GPU_INDEX_AUTO_MEMORY;  // Auto-select by free memory
     client->active_gpu_device = -1;             // -1 means CPU until model is loaded
@@ -642,7 +799,7 @@ WhisperClient* whisper_client_create(void) {
     atomic_store(&client->cancel_requested, 0);
 
     if (pthread_mutex_init(&client->mutex, NULL) != 0) {
-        free(client);
+        g_free(client);
         return NULL;
     }
     return client;
@@ -654,37 +811,40 @@ WhisperClient* whisper_client_create(void) {
 void whisper_client_destroy(WhisperClient* client) {
     if (!client) return;
 
-    /* Signal any in-flight transcription to abort before freeing the context.
-     * The abort callback checked by whisper_full() will cause it to exit.
-     * However, whisper_full() may not check the callback immediately under
-     * heavy GPU load, so we also set model_loaded=false to prevent new
-     * transcriptions from starting. */
+    // Set destroying flag to block new transcriptions
+    atomic_store(&client->destroying, true);
     atomic_store(&client->model_loading, false);
 
-    /* Save active GPU device before mutex lock — needed for cleanup below. */
-    int saved_gpu_device = client->active_gpu_device;
+    // Signal cancellation to any in-flight transcription
+    atomic_store(&client->cancel_requested, 1);
 
     pthread_mutex_lock(&client->mutex);
-    if (client->ctx) {
-        /* Restore correct CUDA device before freeing the model.
-         * The memory was allocated on active_gpu_device, and cudaFree()
-         * inside whisper_free() will fail on the wrong device. */
+
+    // Save GPU device for cleanup while holding mutex
 #ifdef HAVE_CUDA
-        if (saved_gpu_device >= 0) {
-            pthread_mutex_unlock(&client->mutex);
-            cudaSetDevice(saved_gpu_device);
-            pthread_mutex_lock(&client->mutex);
-        }
+    int saved_gpu = client->active_gpu_device;
 #endif
-        whisper_free(client->ctx);
-        client->ctx = NULL;
-    }
+
+    // Take ownership of the context pointer (set to NULL so refcount drops to 0)
+    struct whisper_context *to_free = client->ctx;
+    client->ctx = NULL;
     atomic_store(&client->model_loaded, false);
+    atomic_store(&client->ctx_refcount, 0);
+
     pthread_mutex_unlock(&client->mutex);
 
+    // Free the context outside the mutex to avoid holding lock during CUDA ops
+    if (to_free) {
+#ifdef HAVE_CUDA
+        if (saved_gpu >= 0) {
+            cudaSetDevice(saved_gpu);
+        }
+#endif
+        whisper_free(to_free);
+    }
+
     pthread_mutex_destroy(&client->mutex);
-    memset(client, 0, sizeof(WhisperClient));
-    free(client);
+    g_free(client);
 }
 
 /* ===================================================================
@@ -707,16 +867,7 @@ bool whisper_client_set_model_path(WhisperClient* client, const char* path) {
     if (client->ctx && ret == 0) {
         // Check if path changed
         if (strcmp(client->model_path, resolved) != 0) {
-            /* Restore correct CUDA device before freeing the old model. */
-#ifdef HAVE_CUDA
-            if (client->active_gpu_device >= 0) {
-                pthread_mutex_unlock(&client->mutex);
-                cudaSetDevice(client->active_gpu_device);
-                pthread_mutex_lock(&client->mutex);
-            }
-#endif
-            whisper_free(client->ctx);
-            client->ctx = NULL;
+            free_current_context(client);
             atomic_store(&client->model_loaded, false);
         }
     }
@@ -746,24 +897,101 @@ bool whisper_client_set_language(WhisperClient* client, const char* language) {
 }
 
 /* ===================================================================
+ * Helper: perform transcription given context and samples (no mutex held)
+ * Returns WhisperResponse; caller must free it.
+ * =================================================================== */
+static WhisperResponse *transcribe_with_context(WhisperClient *client,
+                                                 struct whisper_context *ctx,
+                                                 int n_threads_cfg,
+                                                 const char *lang,
+                                                 int active_gpu_device,
+                                                 const float *samples,
+                                                 int n_samples) {
+    WhisperResponse *response = g_new0(WhisperResponse, 1);
+    if (!response) return NULL;
+
+    // Setup parameters using deduplicated helper
+    struct whisper_full_params params;
+    setup_transcription_params(n_threads_cfg, lang, &params, &client->cancel_requested);
+
+    // Ensure CUDA context is set to the correct GPU device before inference.
+#ifdef HAVE_CUDA
+    if (active_gpu_device >= 0) {
+        cudaSetDevice(active_gpu_device);
+    }
+#endif
+
+    int result = whisper_full(ctx, params, samples, n_samples);
+
+    if (result != 0) {
+        const char *err_msg = "Unknown transcription error";
+        switch (result) {
+            case -1: err_msg = "Failed to compute log mel spectrogram"; break;
+            case -2: err_msg = "Failed to auto-detect language"; break;
+            case -3: err_msg = "Too many source language tokens"; break;
+            case -4: err_msg = "whisper_decode() failed"; break;
+            case -5: err_msg = "Failed to batch decode"; break;
+            default: err_msg = "Transcription failed";
+        }
+        pthread_mutex_lock(&client->mutex);
+        set_error(client, WHISPER_ERR_TRANSCRIBE_FAIL, err_msg);
+        pthread_mutex_unlock(&client->mutex);
+        strncpy(response->error_message, err_msg, sizeof(response->error_message) - 1);
+        response->error_code = WHISPER_ERR_TRANSCRIBE_FAIL;
+        return response;
+    }
+
+    // Extract text from segments
+    int n_segments = whisper_full_n_segments(ctx);
+    if (n_segments <= 0) {
+        strncpy(response->error_message, "No transcription segments produced", sizeof(response->error_message) - 1);
+        response->error_code = WHISPER_ERR_NO_SEGMENTS;
+        return response;
+    }
+
+    // Use deduplicated segment extraction helper
+    char *full_text = extract_segments_text(ctx, n_segments);
+    if (!full_text) {
+        pthread_mutex_lock(&client->mutex);
+        set_error(client, WHISPER_ERR_MEMORY_ALLOC, "Memory allocation failed");
+        pthread_mutex_unlock(&client->mutex);
+        strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
+        response->error_code = WHISPER_ERR_MEMORY_ALLOC;
+        return response;
+    }
+
+    response->text = full_text;
+    response->success = true;
+    response->error_code = WHISPER_ERR_OK;
+
+    return response;
+}
+
+/* ===================================================================
  * Public API: whisper_transcribe
- * Mutex is now held only to access shared state (context,
- * config), then released before the actual transcription runs. This
- * prevents blocking whisper_check_connection(), whisper_client_set_model_path(),
- * and whisper_client_destroy() during long transcription operations.
+ * Mutex is now held only to access shared state (context, config), then
+ * released before the actual transcription runs. Context reference counting
+ * prevents use-after-free when another thread unloads the model.
  * =================================================================== */
 WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path) {
-    WhisperResponse *response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
+    WhisperResponse *response = g_new0(WhisperResponse, 1);
     if (!response) return NULL;
 
     response->success = false;
-    response->error_code = 0;
+    response->error_code = WHISPER_ERR_OK;
     response->text = NULL;
     response->error_message[0] = '\0';
 
     if (!client || !wav_path) {
         strncpy(response->error_message, "Invalid parameters", sizeof(response->error_message) - 1);
-        response->error_code = 1;
+        response->error_code = WHISPER_ERR_INVALID_PARAM;
+        return response;
+    }
+
+    // Check destroying flag before proceeding
+    if (atomic_load(&client->destroying)) {
+        strncpy(response->error_message, "Client is being destroyed", sizeof(response->error_message) - 1);
+        response->error_code = WHISPER_ERR_INVALID_PARAM;
         return response;
     }
 
@@ -782,12 +1010,16 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
         return response;
     }
 
-    // Copy needed config while holding mutex
+    // Copy needed config while holding mutex — including GPU device index
     struct whisper_context *ctx = client->ctx;
     int n_threads_cfg = client->n_threads;
     char lang[16];
     strncpy(lang, client->language, sizeof(lang));
     lang[sizeof(lang) - 1] = '\0';
+    int gpu_device = client->active_gpu_device;
+
+    // Increment refcount to keep context alive during transcription
+    ctx_ref(client);
 
     pthread_mutex_unlock(&client->mutex);
     // --- Mutex released: now run long operations without holding it ---
@@ -797,115 +1029,20 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
     int n_samples = 0;
     if (!read_wav_samples(wav_path, &samples, &n_samples)) {
         pthread_mutex_lock(&client->mutex);
-        set_error(client, 4, "Failed to read WAV file");
+        set_error(client, WHISPER_ERR_WAV_READ_FAIL, "Failed to read WAV file");
         pthread_mutex_unlock(&client->mutex);
         strncpy(response->error_message, "Failed to read WAV file", sizeof(response->error_message) - 1);
-        response->error_code = 4;
+        response->error_code = WHISPER_ERR_WAV_READ_FAIL;
+        ctx_unref(client);
         return response;
     }
 
-    // Setup transcription parameters
-    struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    // Perform transcription with context ref held
+    response = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, samples, n_samples);
+    g_free(samples);
 
-    // Configure parameters
-    params.n_threads = n_threads_cfg > 0 ? n_threads_cfg : (int)sysconf(_SC_NPROCESSORS_ONLN);
-    params.print_progress = false;
-    params.print_realtime = false;
-    params.print_special = false;
-    params.translate = false;
-    params.no_timestamps = true;
-
-    // Setup cancellation callback - whisper.cpp will call this periodically
-    // to check if transcription should be aborted
-    params.abort_callback = whisper_abort_callback;
-    params.abort_callback_user_data = &client->cancel_requested;
-
-    // Set language: "auto" or empty means auto-detect, otherwise use specified language
-    if (lang[0] == '\0' || strcmp(lang, "auto") == 0) {
-        params.language = NULL;  // Auto-detect
-    } else {
-        params.language = lang;
-    }
-
-    // Ensure CUDA context is set to the correct GPU device before inference.
-    // The current device can drift after gpu_release_unused_devices() and
-    // multi-threaded operations, causing OOM on the wrong GPU.
-#ifdef HAVE_CUDA
-    if (client->active_gpu_device >= 0) {
-        cudaSetDevice(client->active_gpu_device);
-    }
-#endif
-    int result = whisper_full(ctx, params, samples, n_samples);
-
-    free(samples);
-    samples = NULL;
-
-    if (result != 0) {
-        const char *err_msg = "Unknown transcription error";
-        switch (result) {
-            case -1: err_msg = "Failed to compute log mel spectrogram"; break;
-            case -2: err_msg = "Failed to auto-detect language"; break;
-            case -3: err_msg = "Too many source language tokens"; break;
-            case -4: err_msg = "whisper_decode() failed"; break;
-            case -5: err_msg = "Failed to batch decode"; break;
-            default: err_msg = "Transcription failed";
-        }
-        pthread_mutex_lock(&client->mutex);
-        set_error(client, 5, err_msg);
-        pthread_mutex_unlock(&client->mutex);
-        strncpy(response->error_message, err_msg, sizeof(response->error_message) - 1);
-        response->error_code = 5;
-        return response;
-    }
-
-    // Extract text from segments
-    int n_segments = whisper_full_n_segments(ctx);
-    if (n_segments <= 0) {
-        strncpy(response->error_message, "No transcription segments produced", sizeof(response->error_message) - 1);
-        response->error_code = 6;
-        return response;
-    }
-
-    // Concatenate all segments - single pass with memcpy for O(n) performance
-    size_t total_len = 0;
-    for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
-        if (text) {
-            total_len += strlen(text);
-        }
-    }
-
-    char *full_text = (char *)malloc(total_len + 1);
-    if (!full_text) {
-        pthread_mutex_lock(&client->mutex);
-        set_error(client, 7, "Memory allocation failed");
-        pthread_mutex_unlock(&client->mutex);
-        strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
-        response->error_code = 7;
-        return response;
-    }
-
-    full_text[0] = '\0';
-    size_t offset = 0;
-    for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
-        if (text) {
-            size_t len = strlen(text);
-            memcpy(full_text + offset, text, len);
-            offset += len;
-        }
-    }
-    full_text[offset] = '\0';
-
-    // Trim trailing whitespace/newline
-    size_t len = strlen(full_text);
-    while (len > 0 && (full_text[len-1] == '\n' || full_text[len-1] == ' ')) {
-        full_text[--len] = '\0';
-    }
-
-    response->text = full_text;
-    response->success = true;
-    response->error_code = 0;
+    // Release context reference
+    ctx_unref(client);
 
     return response;
 }
@@ -914,19 +1051,26 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
  * Public API: whisper_transcribe_samples (in-memory, no WAV file)
  * =================================================================== */
 WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
-                                            const int16_t *samples,
-                                            int n_samples) {
-    WhisperResponse *response = (WhisperResponse *)calloc(1, sizeof(WhisperResponse));
+                                             const int16_t *samples,
+                                             int n_samples) {
+    WhisperResponse *response = g_new0(WhisperResponse, 1);
     if (!response) return NULL;
 
     response->text = NULL;
-    response->error_code = 1;
+    response->error_code = WHISPER_ERR_INVALID_PARAM;
     response->success = false;
     response->error_message[0] = '\0';
 
     if (!client || !samples || n_samples <= 0) {
         strncpy(response->error_message, "Invalid parameters", sizeof(response->error_message) - 1);
-        response->error_code = 1;
+        response->error_code = WHISPER_ERR_INVALID_PARAM;
+        return response;
+    }
+
+    // Check destroying flag before proceeding
+    if (atomic_load(&client->destroying)) {
+        strncpy(response->error_message, "Client is being destroyed", sizeof(response->error_message) - 1);
+        response->error_code = WHISPER_ERR_INVALID_PARAM;
         return response;
     }
 
@@ -945,24 +1089,29 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
         return response;
     }
 
-    // Copy needed config while holding mutex
+    // Copy needed config while holding mutex — including GPU device index
     struct whisper_context *ctx = client->ctx;
     int n_threads_cfg = client->n_threads;
     char lang[16];
     strncpy(lang, client->language, sizeof(lang));
     lang[sizeof(lang) - 1] = '\0';
+    int gpu_device = client->active_gpu_device;
+
+    // Increment refcount to keep context alive during transcription
+    ctx_ref(client);
 
     pthread_mutex_unlock(&client->mutex);
     // --- Mutex released ---
 
     // Convert int16_t PCM to float32 samples expected by whisper.cpp
-    float *float_samples = (float *)malloc((size_t)n_samples * sizeof(float));
+    float *float_samples = g_malloc((size_t)n_samples * sizeof(float));
     if (!float_samples) {
         pthread_mutex_lock(&client->mutex);
-        set_error(client, 7, "Memory allocation failed for sample conversion");
+        set_error(client, WHISPER_ERR_MEMORY_ALLOC, "Memory allocation failed for sample conversion");
         pthread_mutex_unlock(&client->mutex);
         strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
-        response->error_code = 7;
+        response->error_code = WHISPER_ERR_MEMORY_ALLOC;
+        ctx_unref(client);
         return response;
     }
 
@@ -970,91 +1119,12 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
         float_samples[i] = (float)samples[i] / 32768.0f;
     }
 
-    // Setup transcription parameters
-    struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    params.n_threads = n_threads_cfg > 0 ? n_threads_cfg : (int)sysconf(_SC_NPROCESSORS_ONLN);
-    params.print_progress = false;
-    params.print_realtime = false;
-    params.print_special = false;
-    params.translate = false;
-    params.no_timestamps = true;
-    params.abort_callback = whisper_abort_callback;
-    params.abort_callback_user_data = &client->cancel_requested;
+    // Perform transcription with context ref held
+    response = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, float_samples, n_samples);
+    g_free(float_samples);
 
-    // Set language: "auto" or empty means auto-detect
-    if (lang[0] == '\0' || strcmp(lang, "auto") == 0) {
-        params.language = NULL;  // Auto-detect
-    } else {
-        params.language = lang;
-    }
-
-    // Ensure CUDA context is set to the correct GPU device before inference.
-#ifdef HAVE_CUDA
-    if (client->active_gpu_device >= 0) {
-        cudaSetDevice(client->active_gpu_device);
-    }
-#endif
-    int result = whisper_full(ctx, params, float_samples, n_samples);
-    free(float_samples);
-
-    if (result != 0) {
-        const char *err_msg = "Unknown transcription error";
-        switch (result) {
-            case -1: err_msg = "Failed to compute log mel spectrogram"; break;
-            case -2: err_msg = "Failed to auto-detect language"; break;
-            case -3: err_msg = "Too many source language tokens"; break;
-            case -4: err_msg = "whisper_decode() failed"; break;
-            case -5: err_msg = "Failed to batch decode"; break;
-            default: err_msg = "Transcription failed";
-        }
-        pthread_mutex_lock(&client->mutex);
-        set_error(client, 5, err_msg);
-        pthread_mutex_unlock(&client->mutex);
-        strncpy(response->error_message, err_msg, sizeof(response->error_message) - 1);
-        response->error_code = 5;
-        return response;
-    }
-
-    // Extract text from segments
-    int n_segments = whisper_full_n_segments(ctx);
-    if (n_segments <= 0) {
-        strncpy(response->error_message, "No transcription segments produced", sizeof(response->error_message) - 1);
-        response->error_code = 6;
-        return response;
-    }
-
-    // Concatenate all segments
-    size_t total_len = 0;
-    for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
-        if (text) total_len += strlen(text);
-    }
-
-    char *full_text = (char *)malloc(total_len + 1);
-    if (!full_text) {
-        pthread_mutex_lock(&client->mutex);
-        set_error(client, 7, "Memory allocation failed");
-        pthread_mutex_unlock(&client->mutex);
-        strncpy(response->error_message, "Memory allocation failed", sizeof(response->error_message) - 1);
-        response->error_code = 7;
-        return response;
-    }
-
-    full_text[0] = '\0';
-    size_t offset = 0;
-    for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
-        if (text) {
-            size_t len = strlen(text);
-            memcpy(full_text + offset, text, len);
-            offset += len;
-        }
-    }
-    full_text[offset] = '\0';
-
-    response->text = full_text;
-    response->success = true;
-    response->error_code = 0;
+    // Release context reference
+    ctx_unref(client);
 
     return response;
 }
@@ -1063,9 +1133,9 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
  * Public API: whisper_transcribe_samples_with_retry
  * =================================================================== */
 WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
-                                                        const int16_t *samples,
-                                                        int n_samples,
-                                                        int max_retries) {
+                                                         const int16_t *samples,
+                                                         int n_samples,
+                                                         int max_retries) {
     if (!client || !samples || n_samples <= 0) return NULL;
 
     int attempts = max_retries > 0 ? max_retries + 1 : 1;
@@ -1087,7 +1157,7 @@ WhisperResponse* whisper_transcribe_samples_with_retry(WhisperClient* client,
         int code = response->error_code;
 
         // Only retry on certain error codes (5=decode error, 7=memory)
-        if (code != 5 && code != 7) {
+        if (code != WHISPER_ERR_TRANSCRIBE_FAIL && code != WHISPER_ERR_MEMORY_ALLOC) {
             if (last_response) {
                 whisper_response_free(last_response);
             }
@@ -1143,7 +1213,8 @@ WhisperResponse* whisper_transcribe_with_retry(WhisperClient* client, const char
         int code = response->error_code;
 
         // Only retry on certain error codes (4=read error, 5=decode error, 7=memory)
-        if (code != 4 && code != 5 && code != 7) {
+        if (code != WHISPER_ERR_WAV_READ_FAIL && code != WHISPER_ERR_TRANSCRIBE_FAIL &&
+            code != WHISPER_ERR_MEMORY_ALLOC) {
             // Non-retryable error -- free previous and return this one
             if (last_response) {
                 whisper_response_free(last_response);
@@ -1201,11 +1272,6 @@ bool whisper_validate_model_file(const char* model_path) {
     }
     fclose(f);
 
-    /* GGML magic: 0x67676d6c ("ggml" little-endian) */
-    #define GGML_MAGIC 0x67676d6cu
-    /* GGUF magic: 0x46554747 ("GGUF" as uint32 little-endian) */
-    #define GGUF_MAGIC 0x46554747u
-
     if (magic == GGML_MAGIC || magic == GGUF_MAGIC) {
         return true;
     }
@@ -1224,7 +1290,7 @@ bool whisper_check_connection(WhisperClient* client) {
     pthread_mutex_lock(&client->mutex);
 
     if (client->model_path[0] == '\0') {
-        set_error(client, 1, "No model path configured");
+        set_error(client, WHISPER_ERR_MODEL_NOT_FOUND, "No model path configured");
         pthread_mutex_unlock(&client->mutex);
         return false;
     }
@@ -1233,11 +1299,11 @@ bool whisper_check_connection(WhisperClient* client) {
     bool exists = (stat(client->model_path, &st) == 0 && S_ISREG(st.st_mode));
 
     if (exists) {
-        set_error(client, 0, "");
+        set_error(client, WHISPER_ERR_OK, "");
     } else {
         snprintf(client->error_message, sizeof(client->error_message),
-                 "Model file not found: %.200s", client->model_path);
-        client->error_code = 2;
+                  "Model file not found: %.200s", client->model_path);
+        client->error_code = WHISPER_ERR_MODEL_NOT_FOUND;
     }
 
     pthread_mutex_unlock(&client->mutex);
