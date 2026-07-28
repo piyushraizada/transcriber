@@ -126,22 +126,11 @@ static void ctx_ref(WhisperClient *client) {
     }
 }
 
+/* Decrement in-flight transcription count. Does NOT free the context —
+ * that is handled by free_current_context() and whisper_client_destroy(). */
 static void ctx_unref(WhisperClient *client) {
-    if (client && atomic_fetch_sub(&client->ctx_refcount, 1) == 1) {
-        // Last reference dropped — free the context under mutex
-        pthread_mutex_lock(&client->mutex);
-        struct whisper_context *to_free = client->ctx;
-        client->ctx = NULL;
-        atomic_store(&client->model_loaded, false);
-        pthread_mutex_unlock(&client->mutex);
-
-        if (to_free) {
-#ifdef HAVE_CUDA
-            // GPU device may have drifted; use saved index from before lock
-            // (the caller should handle this, but we do a best-effort here)
-#endif
-            whisper_free(to_free);
-        }
+    if (client) {
+        atomic_fetch_sub(&client->ctx_refcount, 1);
     }
 }
 
