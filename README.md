@@ -7,7 +7,7 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
 *   **Clear Transcription:** Right-click the microphone icon (when idle) to clear all transcribed text from the text window, clipboard, and internal buffer. Also available as "Clear Transcription" in the system tray context menu.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
-*   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard.
+*   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard. Text is automatically cleared from the clipboard on application exit to prevent stale data persisting after shutdown.
 *   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
 
 ### Technical Highlights
@@ -162,7 +162,16 @@ Or after installation:
 transcriber
 ```
 
-The application will appear as a microphone icon in your system tray and as a small floating window with a red/green mic drawing. Use the following interactions:
+The application will appear as a microphone icon in your system tray and as a small floating window with a red/green mic drawing.
+
+### Visual Indicators
+
+- **Red mic** — Idle (ready to record)
+- **Green mic + sine wave animation** — Actively recording
+- **Green mic (static)** — Transcribing audio to text
+- **"WAIT" overlay on red mic** — Model loading in background on first use. Clicks are ignored until the model finishes loading.
+
+### Interactions
 
 - **Left-click** the mic icon (main window or system tray) — start/stop recording
 - **Right-click** the mic icon (main window, when idle / red) — clear all transcribed text from the text window and clipboard
@@ -186,7 +195,7 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 - **Flash attention** — when `true`, enables whisper.cpp flash attention to reduce GPU VRAM usage (no effect in CPU-only mode; default: `true`)
 
-A configuration dialog is available from the system tray context menu or the gear icon in the main window's status bar.
+A configuration dialog is available from the system tray context menu ("Show Window" → gear icon) or directly via the gear button in the main window's status bar (bottom-left corner).
 
 ## Global Hotkey
 
@@ -197,6 +206,26 @@ dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/
 ```
 
 Configure this command as a custom shortcut in your desktop environment's keyboard settings (e.g., GNOME Settings → Keyboard → Custom Shortcuts). The D-Bus activation service file (`org.xvoice.Controller.service`) also enables the application to autolaunch from the dock when no instance is running.
+
+## Troubleshooting
+
+### Log File
+
+All application logs are written to `/tmp/transcriber.log` on each startup (truncated at launch). Use this file to diagnose crashes, transcription failures, GPU initialization errors, or audio device issues. The log includes timestamps, severity levels, and module-specific tags for easy filtering:
+
+```bash
+# View the full log
+cat /tmp/transcriber.log
+
+# Filter errors only
+grep ERROR /tmp/transcriber.log
+```
+
+### Common Issues
+
+- **Model not found** — Ensure a valid GGML/GGUF model file exists at the configured path. Download one using `./packaging/download-model.sh`.
+- **GPU out of memory** — Enable flash attention in settings (reduces VRAM usage), or switch GPU mode to `cpu` for CPU-only inference.
+- **No audio captured** — Verify the configured ALSA device is available with `arecord -L`. Select a valid device in the settings dialog.
 
 ## Third-Party Software
 
