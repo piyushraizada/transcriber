@@ -5,6 +5,7 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 ### Core Functionality
 *   **Continuous VAD-Driven Transcription:** Records audio continuously and automatically segments speech at natural silence boundaries using Voice Activity Detection (VAD). Each speech segment is transcribed asynchronously while recording continues, enabling seamless, hands-free transcription.
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
+*   **Clear Transcription:** Right-click the microphone icon (when idle) to clear all transcribed text from the text window, clipboard, and internal buffer. Also available as "Clear Transcription" in the system tray context menu.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
 *   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard.
 *   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
@@ -81,7 +82,7 @@ make -j$(nproc)
 
 The build process will:
 
-- Download and compile [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (pinned to tag `v1.8.1`) via CMake FetchContent
+- Download and compile [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (pinned to tag `v1.9.1`) via CMake FetchContent
 - Detect CUDA (if available) and enable GPU acceleration automatically
 
 #### Download the Whisper model
@@ -161,7 +162,13 @@ Or after installation:
 transcriber
 ```
 
-The application will appear as a microphone icon in your system tray. Click the icon to start continuous recording. A Voice Activity Detector (VAD) monitors the audio stream in real-time and automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues. Click the icon again or use the global hotkey to stop recording and trigger the final transcription of any remaining audio.
+The application will appear as a microphone icon in your system tray and as a small floating window with a red/green mic drawing. Use the following interactions:
+
+- **Left-click** the mic icon (main window or system tray) — start/stop recording
+- **Right-click** the mic icon (main window, when idle / red) — clear all transcribed text from the text window and clipboard
+- **System tray context menu** — right-click for "Toggle Recording", "Clear Transcription" (idle only), "Show Window", and "Quit"
+
+A Voice Activity Detector (VAD) monitors the audio stream in real-time and automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues. Click the icon again or use the global hotkey to stop recording and trigger the final transcription of any remaining audio.
 
 ## Configuration
 
