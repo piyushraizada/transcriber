@@ -282,6 +282,7 @@ static void start_volume_poll(TranscriberApp *app);
 static void stop_volume_poll(TranscriberApp *app);
 static void perform_initial_model_load(TranscriberApp *app);
 static int get_transcription_timeout_seconds(TranscriberApp *app);
+static void on_tray_clear(TranscriberApp *app);
 static TranscriberApp *app_create(void);
 static void app_destroy(TranscriberApp *app);
 
@@ -1671,6 +1672,26 @@ static void perform_initial_model_load(TranscriberApp *app) {
  * This callback is invoked from the GTK main thread, as all
  * callers of app_transition_to/app_toggle_state run on that thread.
  */
+/**
+ * Callback invoked when the user selects "Clear Transcription" from the tray context menu.
+ * Only available in IDLE state. Clears the TextWindow buffer and empties the clipboard.
+ */
+static void on_tray_clear(TranscriberApp *app) {
+    /* Clear the transcription text window */
+    if (app->text_window) {
+        app_text_window_clear_text(app->text_window);
+    }
+
+    /* Clear the system clipboard */
+    clipboard_clear(NULL);
+
+    /* Reset continuous clipboard accumulator */
+    pthread_mutex_lock(&app->continuous_clipboard_mutex);
+    g_free(app->continuous_clipboard_text);
+    app->continuous_clipboard_text = NULL;
+    pthread_mutex_unlock(&app->continuous_clipboard_mutex);
+}
+
 static void on_state_change(TranscriberApp *app, AppState previous_state, AppState new_state) {
     const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
 
@@ -1833,6 +1854,7 @@ static TranscriberApp *app_create(void) {
 
     /* Register callbacks on MainWindow */
     app_window_set_toggle_callback(app->main_window, on_microphone_toggle, app);
+    app_window_set_clear_callback(app->main_window, (void (*)(void *))on_tray_clear, app);
     app_window_set_config_changed_callback(app->main_window, on_config_changed, app);
 
     /* Create TextWindow */
@@ -1844,6 +1866,7 @@ static TranscriberApp *app_create(void) {
     if (app->tray) {
         tray_set_main_window(app->tray, gtk_win);
         tray_set_toggle_callback(app->tray, on_microphone_toggle, app);
+        tray_set_clear_callback(app->tray, (void (*)(void *))on_tray_clear, app);
     }
 
     /* Start D-Bus service */

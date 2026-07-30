@@ -26,16 +26,16 @@ include(FetchContent)
 FetchContent_Declare(
     whisper
     GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-    GIT_TAG        v1.8.1
+    GIT_TAG        v1.9.1
     # Pin to specific commit for reproducible builds.
-    # Tag v1.8.1 points to this commit as of 2026-05-31.
+    # Tag v1.9.1 points to this commit as of 2026-07-30.
     # Update this SHA when upgrading whisper.cpp.
     GIT_SHALLOW    ON
 )
 # Attempt to enable CUDA GPU acceleration if CUDA toolkit is available
 # Falls back gracefully to CPU-only if CUDA is not installed
 # Use CUDAToolkit (modern CMake 3.9+) instead of deprecated FindCUDA
-# CMP0146: CMake 3.27+ changed CUDA language handling. whisper.cpp v1.8.1
+# CMP0146: CMake 3.27+ changed CUDA language handling. whisper.cpp v1.9.1
 # expects the old behavior. Set to OLD to suppress warnings. Review and
 # remove this override when upgrading whisper.cpp to a version compatible
 # with the new CMP0146 policy.

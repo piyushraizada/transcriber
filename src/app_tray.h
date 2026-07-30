@@ -182,6 +182,21 @@ void tray_set_toggle_callback(SystemTray *tray,
                               void (*callback)(void *user_data),
                               void *user_data);
 
+/**
+ * Set the clear callback for the "Clear Transcription" menu action.
+ *
+ * When the user selects "Clear Transcription" from the context menu
+ * (only visible in IDLE state), the provided callback is invoked
+ * with the user_data argument.
+ *
+ * @param tray       Pointer to a valid SystemTray. Must not be NULL.
+ * @param callback   Function to call when "Clear Transcription" is activated.
+ * @param user_data  Opaque pointer passed to the callback.
+ */
+void tray_set_clear_callback(SystemTray *tray,
+                             void (*callback)(void *user_data),
+                             void *user_data);
+
 #ifdef __cplusplus
 }
 #endif

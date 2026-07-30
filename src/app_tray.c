@@ -85,12 +85,16 @@
 struct _SystemTray {
     AppIndicator *indicator;      /* The AppIndicator handle */
     GtkMenu *menu;                /* Right-click context menu */
+    GtkWidget *clear_menu_item;   /* "Clear Transcription" menu item (IDLE only) */
     GtkWindow *main_window;       /* Reference to main window for "Show" */
     AppState current_state;       /* Current application state */
     ModelStatus model_status; /* Current connection status */
     /* Toggle callback — invoked when "Toggle Recording" is selected */
     void (*on_toggle)(void *user_data);
     void *toggle_user_data;
+    /* Clear callback — invoked when "Clear Transcription" is selected (IDLE only) */
+    void (*on_clear)(void *user_data);
+    void *clear_user_data;
     /* Dynamic temp icon directory and file paths */
     char icon_dir[PATH_MAX];
     char icon_idle_path[PATH_MAX];
@@ -124,6 +128,7 @@ static void build_context_menu(SystemTray *tray);
 
 /* Menu item callbacks */
 static void on_menu_toggle(GtkMenuItem *item, gpointer user_data);
+static void on_menu_clear(GtkMenuItem *item, gpointer user_data);
 static void on_menu_show(GtkMenuItem *item, gpointer user_data);
 static void on_menu_quit(GtkMenuItem *item, gpointer user_data);
 
@@ -237,6 +242,12 @@ static void build_context_menu(SystemTray *tray) {
                              G_CALLBACK(on_menu_toggle), tray);
     gtk_menu_shell_append(GTK_MENU_SHELL(tray->menu), toggle_item);
 
+    /* "Clear Transcription" menu item (only visible in IDLE state) */
+    tray->clear_menu_item = gtk_menu_item_new_with_label("Clear Transcription");
+    g_signal_connect_swapped(tray->clear_menu_item, "activate",
+                             G_CALLBACK(on_menu_clear), tray);
+    gtk_menu_shell_append(GTK_MENU_SHELL(tray->menu), tray->clear_menu_item);
+
     /* "Show Window" menu item */
     GtkWidget *show_item = gtk_menu_item_new_with_label("Show Window");
     g_signal_connect_swapped(show_item, "activate",
@@ -253,8 +264,10 @@ static void build_context_menu(SystemTray *tray) {
                              G_CALLBACK(on_menu_quit), tray);
     gtk_menu_shell_append(GTK_MENU_SHELL(tray->menu), quit_item);
 
-    /* Show all menu items */
+    /* Show all menu items, then hide "Clear Transcription" initially.
+     * It will be shown by tray_set_state() when entering IDLE state. */
     gtk_widget_show_all(GTK_WIDGET(tray->menu));
+    gtk_widget_hide(tray->clear_menu_item);
 
     /* Attach menu to the indicator */
     app_indicator_set_menu(tray->indicator, GTK_MENU(tray->menu));
@@ -269,6 +282,14 @@ static void on_menu_toggle(GtkMenuItem *item, gpointer user_data) {
     SystemTray *tray = (SystemTray *)user_data;
     if (tray->on_toggle) {
         tray->on_toggle(tray->toggle_user_data);
+    }
+}
+
+static void on_menu_clear(GtkMenuItem *item, gpointer user_data) {
+    UNUSED(item);
+    SystemTray *tray = (SystemTray *)user_data;
+    if (tray->on_clear) {
+        tray->on_clear(tray->clear_user_data);
     }
 }
 
@@ -376,6 +397,8 @@ SystemTray *tray_create(void) {
     tray->main_window = NULL;
     tray->on_toggle = NULL;
     tray->toggle_user_data = NULL;
+    tray->on_clear = NULL;
+    tray->clear_user_data = NULL;
     tray->icon_idle_created = false;
     tray->icon_listening_created = false;
     tray->animation_source_id = 0;
@@ -506,6 +529,15 @@ void tray_set_state(SystemTray *tray, AppState state) {
     tray->current_state = state;
     update_tray_icon(tray);
     update_tray_tooltip(tray);
+
+    /* Show "Clear Transcription" only when IDLE */
+    if (tray->clear_menu_item) {
+        if (state == STATE_IDLE) {
+            gtk_widget_show(tray->clear_menu_item);
+        } else {
+            gtk_widget_hide(tray->clear_menu_item);
+        }
+    }
 }
 
 void tray_set_model_status(SystemTray *tray, ModelStatus status) {
@@ -529,6 +561,14 @@ void tray_set_toggle_callback(SystemTray *tray,
     if (!tray) return;
     tray->on_toggle = callback;
     tray->toggle_user_data = user_data;
+}
+
+void tray_set_clear_callback(SystemTray *tray,
+                             void (*callback)(void *user_data),
+                             void *user_data) {
+    if (!tray) return;
+    tray->on_clear = callback;
+    tray->clear_user_data = user_data;
 }
 
 /* ------------------------------------------------------------------ */

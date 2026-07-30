@@ -153,9 +153,12 @@ struct _MainWindow {
     int countdown_seconds;
     /* Volume level tracking moved from global to struct for encapsulation. */
     double last_volume_level;
-    /* Toggle callback — invoked when the mic icon is clicked */
+    /* Toggle callback — invoked when the mic icon is left-clicked */
     void (*on_toggle)(void *user_data);
     void *toggle_user_data;
+    /* Clear callback — invoked when the mic icon is right-clicked in IDLE state */
+    void (*on_clear)(void *user_data);
+    void *clear_user_data;
     /* Config changed callback — invoked when config dialog saves */
     void (*on_config_changed)(void *user_data);
     void *config_changed_user_data;
@@ -546,9 +549,17 @@ static void on_indicator_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data
 static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
     UNUSED(widget);
-    UNUSED(event);
-    if (win->on_toggle) {
-        win->on_toggle(win->toggle_user_data);
+
+    if (event->button == 1) {
+        /* Left-click — toggle recording */
+        if (win->on_toggle) {
+            win->on_toggle(win->toggle_user_data);
+        }
+    } else if (event->button == 3 && win->controller && app_get_state(win->controller) == STATE_IDLE) {
+        /* Right-click in IDLE state — clear transcription */
+        if (win->on_clear) {
+            win->on_clear(win->clear_user_data);
+        }
     }
     return TRUE;
 }
@@ -1010,6 +1021,14 @@ void app_window_set_toggle_callback(MainWindow *win,
     if (!win) return;
     win->on_toggle = callback;
     win->toggle_user_data = user_data;
+}
+
+void app_window_set_clear_callback(MainWindow *win,
+                                   void (*callback)(void *user_data),
+                                   void *user_data) {
+    if (!win) return;
+    win->on_clear = callback;
+    win->clear_user_data = user_data;
 }
 
 void app_window_set_config_changed_callback(MainWindow *win,

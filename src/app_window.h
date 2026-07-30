@@ -353,6 +353,21 @@ void app_window_set_toggle_callback(MainWindow *win,
                                     void (*callback)(void *user_data),
                                     void *user_data);
 
+/* app_window_set_clear_callback — Register a callback for mic icon right-clicks.
+ *
+ * When the user right-clicks the microphone icon in IDLE state, the provided
+ * callback is invoked with the user_data argument. This allows the main
+ * application to handle clearing transcription text and clipboard.
+ *
+ * Parameters:
+ *   win       — The MainWindow handle.
+ *   callback  — Function to call on mic icon right-click (IDLE only).
+ *   user_data — Opaque pointer passed to the callback.
+ */
+void app_window_set_clear_callback(MainWindow *win,
+                                   void (*callback)(void *user_data),
+                                   void *user_data);
+
 /* app_window_set_config_changed_callback — Register a callback for config saves.
  *
  * When the user saves the configuration dialog, the provided callback is invoked
