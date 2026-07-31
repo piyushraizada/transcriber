@@ -56,6 +56,9 @@
 // whisper.cpp header
 #include "whisper.h"
 
+// Exception-safe C wrappers around whisper.cpp (implemented in app_whisper_safe.cpp)
+#include "app_whisper_safe.h"
+
 #include "app_gpu.h"
 
 #ifdef HAVE_CUDA
@@ -265,7 +268,7 @@ static char *extract_segments_text(struct whisper_context *ctx, int n_segments) 
     // Single pass to calculate total length
     size_t total_len = 0;
     for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
+        const char *text = safe_whisper_full_get_segment_text(ctx, i);
         if (text) {
             total_len += strlen(text);
         }
@@ -277,7 +280,7 @@ static char *extract_segments_text(struct whisper_context *ctx, int n_segments) 
     full_text[0] = '\0';
     size_t offset = 0;
     for (int i = 0; i < n_segments; i++) {
-        const char *text = whisper_full_get_segment_text(ctx, i);
+        const char *text = safe_whisper_full_get_segment_text(ctx, i);
         if (text) {
             size_t len = strlen(text);
             memcpy(full_text + offset, text, len);
@@ -418,16 +421,16 @@ static bool load_model_internal(WhisperClient *client) {
     struct whisper_context *ctx = NULL;
 
     if (try_gpu) {
-        ctx = whisper_init_from_file_with_params(client->model_path, cparams);
+        ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
 
         if (ctx) {
             gpu_loaded = true;
         } else {
             cparams.use_gpu = false;
-            ctx = whisper_init_from_file_with_params(client->model_path, cparams);
+            ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
         }
     } else {
-        ctx = whisper_init_from_file_with_params(client->model_path, cparams);
+        ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
     }
 
     if (!ctx) {
@@ -445,7 +448,7 @@ static bool load_model_internal(WhisperClient *client) {
      * This catches cases where whisper_init_from_file_with_params returns
      * a non-NULL pointer but the underlying GPU memory is corrupted or
      * insufficient for actual inference. */
-    int n_vocab = whisper_n_vocab(ctx);
+    int n_vocab = safe_whisper_n_vocab(ctx);
     if (n_vocab <= 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
                "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
@@ -453,7 +456,7 @@ static bool load_model_internal(WhisperClient *client) {
 #ifdef HAVE_CUDA
         if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
 #endif
-        whisper_free(ctx);
+        safe_whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
                   "Model loaded but post-validation failed (vocab=%d)", n_vocab);
@@ -466,14 +469,14 @@ static bool load_model_internal(WhisperClient *client) {
      * Note: "auto" is NOT a valid whisper.cpp language code (it's only used as
      * a user-facing config value for auto-detection). Use "en" instead which
      * exists in every Whisper model's language table. */
-    int lang_en_id = whisper_lang_id("en");
+    int lang_en_id = safe_whisper_lang_id("en");
     if (lang_en_id < 0) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
                "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
 #ifdef HAVE_CUDA
         if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
 #endif
-        whisper_free(ctx);
+        safe_whisper_free(ctx);
         client->ctx = NULL;
         snprintf(client->error_message, sizeof(client->error_message),
                   "Model loaded but post-validation failed (language lookup)");
@@ -520,7 +523,7 @@ static void free_current_context(WhisperClient *client) {
         pthread_mutex_lock(&client->mutex);
     }
 #endif
-    whisper_free(client->ctx);
+    safe_whisper_free(client->ctx);
     client->ctx = NULL;
 }
 
@@ -829,7 +832,7 @@ void whisper_client_destroy(WhisperClient* client) {
             cudaSetDevice(saved_gpu);
         }
 #endif
-        whisper_free(to_free);
+        safe_whisper_free(to_free);
     }
 
     pthread_mutex_destroy(&client->mutex);
@@ -910,7 +913,7 @@ static WhisperResponse *transcribe_with_context(WhisperClient *client,
     }
 #endif
 
-    int result = whisper_full(ctx, params, samples, n_samples);
+    int result = safe_whisper_full(ctx, params, samples, n_samples);
 
     if (result != 0) {
         const char *err_msg = "Unknown transcription error";
@@ -920,6 +923,7 @@ static WhisperResponse *transcribe_with_context(WhisperClient *client,
             case -3: err_msg = "Too many source language tokens"; break;
             case -4: err_msg = "whisper_decode() failed"; break;
             case -5: err_msg = "Failed to batch decode"; break;
+            case -100: err_msg = "GPU out-of-memory (C++ exception during transcription)"; break;
             default: err_msg = "Transcription failed";
         }
         pthread_mutex_lock(&client->mutex);
@@ -931,7 +935,8 @@ static WhisperResponse *transcribe_with_context(WhisperClient *client,
     }
 
     // Extract text from segments
-    int n_segments = whisper_full_n_segments(ctx);
+    int n_segments = safe_whisper_full_n_segments(ctx);
+
     if (n_segments <= 0) {
         strncpy(response->error_message, "No transcription segments produced", sizeof(response->error_message) - 1);
         response->error_code = WHISPER_ERR_NO_SEGMENTS;

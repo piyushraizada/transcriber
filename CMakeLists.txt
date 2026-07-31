@@ -100,6 +100,7 @@ set(SOURCES
     src/main.c
     src/app_audio.c
     src/app_whisper.c
+    src/app_whisper_safe.cpp
     src/app_model_info.c
     src/app_gpu.c
     src/app_config.c
