@@ -214,7 +214,7 @@ typedef struct {
  * @return A newly allocated AudioDeviceList*, or NULL on error.
  *         The caller must free the result using audio_device_list_free().
  */
-AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder);
+AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder, bool log_enumeration);
 
 /**
  * Free a device list returned by audio_recorder_get_device_list().

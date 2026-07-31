@@ -103,8 +103,15 @@
 /* ------------------------------------------------------------------ */
 
 /**
- * GLib log callback that writes all g_log() messages to /tmp/transcriber.log.
- *
+ * Global flag controlling whether DEBUG/MESSAGE levels are logged.
+ * Set to false by default; updated when the user toggles "Debug logs" in settings.
+ * Both file and stderr log handlers check this flag to filter output consistently.
+ */
+static bool g_debug_logs_enabled = false;
+
+/**
+ * GLib log callback that writes g_log() messages to /tmp/transcriber.log.
+ * When debug logging is disabled, only ERROR, CRITICAL, WARNING, and INFO are written.
  * Registered for every domain used by our application (see register_all_log_handlers()).
  * Format: [timestamp] [level] domain: message
  */
@@ -113,6 +120,12 @@ static void transcriber_file_log_handler(const gchar *log_domain,
                                          const gchar *message,
                                          gpointer user_data) {
     (void)user_data;
+
+    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
+    if (!g_debug_logs_enabled &&
+        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
+        return;
+    }
 
     static FILE *log_file = NULL;
 
@@ -148,6 +161,45 @@ static void transcriber_file_log_handler(const gchar *log_domain,
 }
 
 /**
+ * Stderr log handler — conditionally filters output based on debug_logs setting.
+ * When debug_logs is false, only ERROR, CRITICAL, WARNING, and INFO are printed.
+ * When debug_logs is true, all levels including DEBUG and MESSAGE pass through.
+ */
+static void transcriber_stderr_log_handler(const gchar *log_domain,
+                                            GLogLevelFlags log_level,
+                                            const gchar *message,
+                                            gpointer user_data) {
+    (void)user_data;
+
+    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
+    if (!g_debug_logs_enabled &&
+        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
+        return;
+    }
+
+    const char *level;
+    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
+    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
+    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
+    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
+    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
+    else                                        level = "DEBUG";
+
+    fprintf(stderr, "[%s] %s: %s\n",
+            log_domain ? log_domain : "(null)",
+            level, message ? message : "(null)");
+}
+
+/**
+ * List of all application-specific log domains for iterating.
+ */
+static const char *LOG_DOMAINS[] = {
+    NULL, "main", "app-audio", "app-scanner", "app-whisper",
+    "app-config", "app-gpu", "app-tray", "app_window", "app-ringbuffer"
+};
+#define LOG_DOMAINS_COUNT (sizeof(LOG_DOMAINS) / sizeof(LOG_DOMAINS[0]))
+
+/**
  * Flush and close the static log file handle opened by transcriber_file_log_handler().
  * Call this during application shutdown to release the file descriptor and ensure
  * all pending buffered data is written. Safe to call multiple times or before the
@@ -165,28 +217,29 @@ static void close_log_file(void) {
 }
 
 /**
- * Register the file log handler for every domain used by our application.
- * g_log_set_handler() only intercepts one domain at a time, so we must call it
- * once per domain name plus NULL (for GLib/GTK defaults).
+ * Register log handlers for every domain used by our application.
+ * Both file and stderr handlers filter based on the shared g_debug_logs_enabled flag.
  */
-static void register_all_log_handlers(void) {
+static void register_all_log_handlers(AppConfig *config) {
     GLogLevelFlags mask =
         G_LOG_FLAG_RECURSION | G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL |
-        G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE | G_LOG_LEVEL_INFO;
+        G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE | G_LOG_LEVEL_INFO | G_LOG_LEVEL_DEBUG;
 
-    /* NULL domain — catches GLib/GTK internal messages (GDBus, etc.) */
-    g_log_set_handler(NULL, mask, transcriber_file_log_handler, NULL);
+    g_debug_logs_enabled = config ? config_get_debug_logs(config) : false;
 
-    /* Application-specific domains used across all modules */
-    g_log_set_handler("main", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-audio", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-scanner", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-whisper", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-config", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-gpu", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-tray", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app_window", mask, transcriber_file_log_handler, NULL);
-    g_log_set_handler("app-ringbuffer", mask, transcriber_file_log_handler, NULL);
+    for (size_t i = 0; i < LOG_DOMAINS_COUNT; i++) {
+        g_log_set_handler(LOG_DOMAINS[i], mask, transcriber_file_log_handler, NULL);
+        g_log_set_handler(LOG_DOMAINS[i], mask, transcriber_stderr_log_handler, NULL);
+    }
+}
+
+/**
+ * Update the global debug logs flag when the user toggles "Debug logs" in settings.
+ * Both file and stderr handlers check this flag on every call, so no handler
+ * re-registration is needed — just flip the flag for immediate effect.
+ */
+static void reinstall_stderr_handlers(AppConfig *config) {
+    g_debug_logs_enabled = config ? config_get_debug_logs(config) : false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -403,6 +456,7 @@ static void show_auto_close_dialog(TranscriberApp *app, const char *title,
         GTK_BUTTONS_OK,
         "%s", message));
     gtk_window_set_title(GTK_WINDOW(dialog), title);
+    g_signal_connect(dialog, "response", G_CALLBACK(gtk_widget_destroy), NULL);
     g_timeout_add_seconds(DIALOG_AUTO_CLOSE_SECONDS, auto_close_dialog, dialog);
     /* Show without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
@@ -620,8 +674,12 @@ static void on_config_changed(void *user_data) {
         const char *device = config_get_audio_device(app->controller.config);
         if (device && device[0] != '\0') {
             audio_recorder_set_device(app->audio_recorder, device);
+            g_log("main", G_LOG_LEVEL_INFO,
+                  "[audio] Microphone reconfigured to: %s", device);
         } else {
             audio_recorder_set_device(app->audio_recorder, NULL);
+            g_log("main", G_LOG_LEVEL_INFO,
+                  "[audio] Microphone reconfigured to: default");
         }
     }
 
@@ -636,6 +694,11 @@ static void on_config_changed(void *user_data) {
         if (!append_mode && !continuous) {
             app_text_window_clear_text(app->text_window);
         }
+    }
+
+    /* Apply debug logging setting change immediately */
+    if (app->controller.config) {
+        reinstall_stderr_handlers(app->controller.config);
     }
 }
 
@@ -688,7 +751,7 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
          * continuous mode. Do not show an error to the user. This happens
          * when whisper processes audio containing only silence or very short
          * speech segments below its detection threshold. */
-        g_log("main", G_LOG_LEVEL_MESSAGE,
+        g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Scanner transcription succeeded but empty text — skipping in continuous mode\n");
         whisper_response_free(response);
     } else {
@@ -721,7 +784,7 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
  * Starts audio recording and the watchdog timer.
  */
 static void handle_enter_listening(TranscriberApp *app, AppState previous_state) {
-    g_log("main", G_LOG_LEVEL_MESSAGE, "[flow] === handle_enter_listening() entered ===\n");
+    g_log("main", G_LOG_LEVEL_DEBUG, "[flow] === handle_enter_listening() entered ===\n");
 
     /* Clear the TextWindow buffer at the start of a new transcription session
      * if the user has disabled append mode (overwrite mode). This prevents
@@ -757,10 +820,10 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
     if (app->audio_recorder) {
         int max_duration = app->controller.config->max_duration;
         if (max_duration <= 0) max_duration = DEFAULT_MAX_DURATION_SECONDS;
-        g_log("main", G_LOG_LEVEL_MESSAGE,
+        g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Starting audio recorder (max_duration=%ds)\n", max_duration);
         if (audio_recorder_start(app->audio_recorder)) {
-            g_log("main", G_LOG_LEVEL_MESSAGE,
+            g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Audio recording started successfully\n");
             /* Start the watchdog timer */
             start_watchdog_timer(app);
@@ -777,7 +840,7 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
                 /* Stop and destroy old scanner before creating a new one.
                  * This is safe even on first entry where app->silence_scanner==NULL. */
                 if (app->silence_scanner) {
-                    g_log("main", G_LOG_LEVEL_MESSAGE,
+                    g_log("main", G_LOG_LEVEL_DEBUG,
                           "[flow] Destroying old silence scanner before restart\n");
                     silence_scanner_stop(app->silence_scanner);
                     silence_scanner_destroy(app->silence_scanner);
@@ -828,7 +891,7 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
  * Stops audio recording and initiates transcription.
  */
 static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path) {
-    g_log("main", G_LOG_LEVEL_MESSAGE,
+    g_log("main", G_LOG_LEVEL_DEBUG,
           "[flow] === handle_enter_transcribing() entered wav='%s' ===\n",
           wav_path ? wav_path : "(null)");
 
@@ -1141,7 +1204,7 @@ static gpointer transcribe_thread_func(gpointer data) {
              * speech segments below its detection threshold.
              * IMPORTANT: Still marshal to GTK main thread so on_transcription_result()
              * can check user_requested_stop and transition state appropriately. */
-            g_log("main", G_LOG_LEVEL_MESSAGE,
+            g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Transcription succeeded but empty text — skipping in continuous mode\n");
             IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
             icd->app = app;
@@ -1193,7 +1256,7 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
 
     if (success && text_or_error) {
         /* Log the raw transcription output for debugging */
-        g_log("main", G_LOG_LEVEL_WARNING,
+        g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Transcription SUCCESS — appending '%.80s...'\n", text_or_error);
 
         /* Append or replace transcribed text in the TextWindow based on setting. */
@@ -1253,8 +1316,8 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
 
     size_t final_offset = app->silence_scanner
         ? silence_scanner_get_transcribed_offset(app->silence_scanner) : 0;
-    g_log("main", G_LOG_LEVEL_WARNING,
-          "[DEBUG-transcription_result] success=%d continuous=%s user_stopped=%d "
+    g_log("main", G_LOG_LEVEL_DEBUG,
+          "[flow] transcription_result: success=%d continuous=%s user_stopped=%d "
           "current_state=%d transcribed_offset=%zu text_len=%zu\n",
           success, continuous ? "true" : "false",
           user_stopped, current_state, final_offset,
@@ -1273,14 +1336,14 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
          *
          * In both cases, transitioning to LISTENING is the correct action to
          * restore the continuous recording + scanning loop. */
-        g_log("main", G_LOG_LEVEL_MESSAGE,
+        g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Continuous mode — restarting LISTENING after transcription\n");
 
         /* Transition back to LISTENING — this triggers handle_enter_listening()
          * which restarts audio recording and recreates the silence scanner. */
         app_transition_to(&app->controller, STATE_LISTENING);
     } else if (continuous && !success) {
-        g_log("main", G_LOG_LEVEL_WARNING,
+        g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Continuous mode but transcription FAILED — transitioning to IDLE\n");
     } else {
         /* Normal mode: transition back to IDLE */
@@ -1448,7 +1511,7 @@ static void on_microphone_toggle(void *user_data) {
     /* Only check local model when starting recording (IDLE -> LISTENING) */
     AppState current = app_get_state(&app->controller);
     const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
-    g_log("main", G_LOG_LEVEL_INFO,
+    g_log("main", G_LOG_LEVEL_DEBUG,
           "[flow] on_microphone_toggle() entered, current=%s\n", state_name[current]);
     if (current == STATE_IDLE) {
         /* STARTUP-LOADING: If model is still loading from startup,
@@ -1467,7 +1530,7 @@ static void on_microphone_toggle(void *user_data) {
                 device_valid = true;
             } else if (configured_device && configured_device[0] != '\0') {
                 /* Check if the configured device exists in the available device list */
-                AudioDeviceList *devices = audio_recorder_get_device_list(app->audio_recorder);
+                AudioDeviceList *devices = audio_recorder_get_device_list(app->audio_recorder, false);
                 if (devices) {
                     for (gint i = 0; i < devices->count; i++) {
                         if (g_strcmp0(devices->device_names[i], configured_device) == 0) {
@@ -1695,14 +1758,14 @@ static void on_tray_clear(TranscriberApp *app) {
 static void on_state_change(TranscriberApp *app, AppState previous_state, AppState new_state) {
     const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
 
-    g_log("main", G_LOG_LEVEL_WARNING,
+    g_log("main", G_LOG_LEVEL_DEBUG,
           "[flow] STATE CHANGE: %s -> %s\n",
           state_name[previous_state],
           state_name[new_state]);
 
     switch (new_state) {
         case STATE_LISTENING:
-            g_log("main", G_LOG_LEVEL_INFO,
+            g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Entering LISTENING — starting recording + scanner\n");
             handle_enter_listening(app, previous_state);
             break;
@@ -1730,7 +1793,7 @@ static void on_state_change(TranscriberApp *app, AppState previous_state, AppSta
                 }
                 bool continuous = app->controller.config
                     ? config_get_continuous_dictation(app->controller.config) : false;
-                g_log("main", G_LOG_LEVEL_INFO,
+                g_log("main", G_LOG_LEVEL_DEBUG,
                       "[flow] TRANSCRIBING: wav_path='%s' continuous=%s\n",
                       path ? path : "(null)", continuous ? "true" : "false");
                 /* In continuous mode, always transcribe even if WAV path is empty,
@@ -1741,7 +1804,7 @@ static void on_state_change(TranscriberApp *app, AppState previous_state, AppSta
                 if ((path && path[0] != '\0') || continuous) {
                     handle_enter_transcribing(app, path);
                 } else {
-                    g_log("main", G_LOG_LEVEL_INFO,
+                    g_log("main", G_LOG_LEVEL_DEBUG,
                           "[flow] No WAV path and not continuous — transitioning to IDLE\n");
                     app_transition_to(&app->controller, STATE_IDLE);
                     if (app->main_window) {
@@ -1751,7 +1814,7 @@ static void on_state_change(TranscriberApp *app, AppState previous_state, AppSta
             }
             break;
         case STATE_IDLE:
-            g_log("main", G_LOG_LEVEL_INFO,
+            g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Entering IDLE\n");
             if (app->main_window) {
                 app_window_set_state(app->main_window, STATE_IDLE);
@@ -1805,6 +1868,10 @@ static TranscriberApp *app_create(void) {
     config_set_defaults(&app->config);
     config_load(&app->config);
 
+    /* Reinstall stderr handlers now that debug_logs setting is loaded from config.
+     * The initial register_all_log_handlers(NULL) used the default (no debug). */
+    reinstall_stderr_handlers(&app->config);
+
     /* Initialize controller */
     if (app_state_controller_init(&app->controller,
                                   &app->config,
@@ -1827,6 +1894,38 @@ static TranscriberApp *app_create(void) {
     }
     if (device && device[0] != '\0') {
         audio_recorder_set_device(app->audio_recorder, device);
+        g_log("main", G_LOG_LEVEL_INFO,
+              "[audio] Using configured microphone: %s", device);
+    } else {
+        g_log("main", G_LOG_LEVEL_INFO,
+              "[audio] Using default microphone");
+    }
+
+    /* Enumerate available microphones at startup for logging and validation.
+     * If the configured device is not present in the enumerated list, emit a
+     * WARNING to the log file so stale configurations are traceable. */
+    {
+        AudioDeviceList *startup_devices = audio_recorder_get_device_list(app->audio_recorder, true);
+        if (startup_devices) {
+            const char *configured = config_get_audio_device(&app->config);
+            if (configured && configured[0] != '\0' &&
+                g_strcmp0(configured, "default") != 0) {
+                bool found = false;
+                for (gint i = 0; i < startup_devices->count; i++) {
+                    if (g_strcmp0(startup_devices->device_names[i], configured) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    g_log("main", G_LOG_LEVEL_WARNING,
+                          "[audio] Configured microphone '%s' not found in available devices — "
+                          "recording may fail until a valid device is selected in Settings",
+                          configured);
+                }
+            }
+            audio_device_list_free(startup_devices);
+        }
     }
 
     /* Create Whisper client */
@@ -2038,10 +2137,18 @@ int main(int argc, char *argv[]) {
      * receives every message level including DEBUG and MESSAGE. */
     setenv("G_MESSAGES_DEBUG", "all", 1);
 
+    /* Truncate/create log file BEFORE installing any handlers so that no stale
+     * data from a previous run exists when the first log message is written. */
+    {
+        FILE *_truncate_log = fopen("/tmp/transcriber.log", "w");
+        if (_truncate_log) fclose(_truncate_log);
+    }
+
     /* Install file-based log handlers BEFORE any subsystem initialization.
      * Registers transcriber_file_log_handler for every domain used by the app
-     * so all g_log() messages are captured to /tmp/transcriber.log. */
-    register_all_log_handlers();
+     * so all g_log() messages are captured to /tmp/transcriber.log.
+     * Config is NULL here — stderr handler defaults to INFO+ only (no debug). */
+    register_all_log_handlers(NULL);
 
     /* Verify the log handler is active by writing a startup marker.
      * This also ensures the static FILE* inside the handler has been opened,
@@ -2058,7 +2165,7 @@ int main(int argc, char *argv[]) {
      * gtk_init() registers new GLib domains (GLib-GIO, GDBus, GVfs, etc.) that
      * were not present before. Without this re-registration, messages from those
      * domains fall through to the default stderr formatter and bypass our log file. */
-    register_all_log_handlers();
+    register_all_log_handlers(NULL);
 
     /* Set the default GLib log handler as a catch-all for any domain we haven't
      * explicitly registered (e.g., GModule, GIO modules). This ensures every

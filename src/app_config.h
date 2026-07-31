@@ -137,6 +137,12 @@ typedef struct _AppConfig {
                                        ///< Empty string "" is treated as "auto".
                                        ///< @see CFG-007: Language
 
+   /* Debug Settings */
+   bool debug_logs;                ///< Enable verbose (DEBUG-level) logging to stderr.
+                                      ///< When false, only INFO and above are shown on stderr.
+                                      ///< File log (/tmp/transcriber.log) always captures all levels.
+                                      ///< Default: false.
+
 } AppConfig;
 
 /*---------------------------------------------------------------------------
@@ -563,6 +569,24 @@ void config_set_language(AppConfig* config, const char* lang);
  *         Returns "auto" if not set.
  */
 const char* config_get_language(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6.7: Debug Logging Configuration Accessors
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Set whether debug-level logging is enabled.
+ * @param config   Pointer to AppConfig. Must not be NULL.
+ * @param enabled  true = enable DEBUG/MESSAGE logs, false = INFO and above only.
+ */
+void config_set_debug_logs(AppConfig* config, bool enabled);
+
+/**
+ * Get the current debug logging state.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if debug logging is enabled, false otherwise.
+ */
+bool config_get_debug_logs(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

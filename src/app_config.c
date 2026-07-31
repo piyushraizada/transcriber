@@ -257,6 +257,9 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->language, "auto", sizeof(config->language) - 1);
     config->language[sizeof(config->language) - 1] = '\0';
 
+    /* Debug logging — disabled by default */
+    config->debug_logs = false;
+
     set_error(NULL);
 }
 
@@ -505,6 +508,12 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
+    /* Debug logging */
+    item = cJSON_GetObjectItemCaseSensitive(root, "debug_logs");
+    if (item && cJSON_IsBool(item)) {
+        config->debug_logs = cJSON_IsTrue(item);
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -590,6 +599,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
 
     /* Language */
     cJSON_AddStringToObject(root, "language", config->language);
+
+    /* Debug logging */
+    cJSON_AddBoolToObject(root, "debug_logs", config->debug_logs);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -952,4 +964,20 @@ const char* config_get_language(const AppConfig* config)
 {
     if (!config || config->language[0] == '\0') return "auto";
     return config->language;
+}
+
+/* ----------------------------------------------------------------
+ * Debug logging configuration accessors
+ * ---------------------------------------------------------------- */
+
+void config_set_debug_logs(AppConfig* config, bool enabled)
+{
+    if (!config) return;
+    config->debug_logs = enabled;
+}
+
+bool config_get_debug_logs(const AppConfig* config)
+{
+    if (!config) return false;
+    return config->debug_logs;
 }

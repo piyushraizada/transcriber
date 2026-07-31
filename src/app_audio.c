@@ -644,7 +644,7 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         }
     }
 
-    g_log("app-audio", G_LOG_LEVEL_WARNING,
+    g_log("app-audio", G_LOG_LEVEL_DEBUG,
           "[flow] audio_recorder_start() — created WAV '%s', ring_buffer=%p\n",
           recorder->wav_path, (void*)recorder->ring_buffer);
 
@@ -788,16 +788,88 @@ bool audio_recorder_delete_wav(AudioRecorder *recorder) {
  * Device listing
  * =================================================================== */
 
-/* Try to open a device for capture to verify it's actually usable */
-static bool test_capture_device(const char *device_name) {
-    snd_pcm_t *pcm;
-    int err = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0);
-    if (err < 0) return false;
-    snd_pcm_close(pcm);
-    return true;
+/* Device entry for enumeration — used by helper functions below */
+typedef struct { gchar *display; gchar *name; } DevEntry;
+
+/**
+ * Extract the "CARD=X,DEV=Y" key from an ALSA device name for deduplication.
+ * Both "hw:CARD=Seri,DEV=0" and "plughw:CARD=Seri,DEV=0" produce "Seri:0".
+ */
+static void extract_card_dev_key(const char *device_name, char *key_out, size_t key_size) {
+    const char *card_start = strstr(device_name, "CARD=");
+    if (!card_start) {
+        g_snprintf(key_out, key_size, "%s", device_name);
+        return;
+    }
+    card_start += 5;  // skip "CARD="
+    const char *comma = strchr(card_start, ',');
+    if (comma) {
+        size_t card_len = (size_t)(comma - card_start);
+        g_snprintf(key_out, key_size, "%.*s%s", (int)card_len, card_start, comma + 1);
+    } else {
+        g_snprintf(key_out, key_size, "%s", card_start);
+    }
 }
 
-AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
+/**
+ * Check if a card key already exists in the entries array.
+ */
+static gboolean device_key_exists(char (*keys)[64], gint count, const char *key) {
+    for (gint i = 0; i < count; i++) {
+        if (strcmp(keys[i], key) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+/**
+ * Build a cleaned display name from an ALSA description string.
+ * Returns a g_strdup'd string that the caller must free.
+ */
+static gchar *build_display_name(const char *desc, const char *name) {
+    if (desc && desc[0] != '\0') {
+        gchar *d = g_strdup(desc);
+        /* Remove newlines */
+        for (char *p = d; *p; p++) {
+            if (*p == '\n') *p = ' ';
+        }
+        /* Truncate at first comma */
+        char *comma = strchr(d, ',');
+        if (comma) *comma = '\0';
+        /* Trim trailing whitespace */
+        size_t len = strlen(d);
+        while (len > 0 && d[len - 1] == ' ') {
+            d[--len] = '\0';
+        }
+        return d;
+    }
+    return g_strdup(name);
+}
+
+/**
+ * Add a device to the entries if it is not already present (deduplication).
+ * Note: We do NOT test-open devices here, since PipeWire may hold them at
+ * startup time but release them when recording starts. The actual open will
+ * happen later in try_alsa_device() which handles errors gracefully.
+ */
+static gboolean try_add_device(DevEntry *entries, char keys[][64], gint *n_entries, gint max_entries,
+                               const char *name, const char *desc) {
+    char key[64];
+    extract_card_dev_key(name, key, sizeof(key));
+    if (device_key_exists(keys, *n_entries, key)) return FALSE;
+
+    gchar *display = build_display_name(desc, name);
+    if (*n_entries < max_entries) {
+        entries[*n_entries].display = display;
+        entries[*n_entries].name = g_strdup(name);
+        memcpy(keys[*n_entries], key, sizeof(key));
+        (*n_entries)++;
+    } else {
+        g_free(display);
+    }
+    return TRUE;
+}
+
+AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder, bool log_enumeration) {
     UNUSED(recorder);
 
     void **hints = NULL;
@@ -806,90 +878,66 @@ AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
         goto fallback;
     }
 
-    typedef struct { gchar *display; gchar *name; } DevEntry;
-    gint max_entries = 64;
+    /* Two-pass approach:
+     * Pass 1 — try plughw: devices first (shared access via ALSA plugin chain).
+     * Pass 2 — try hw: devices for any card not found in pass 1.
+     * This avoids listing both "hw:CARD=X" and "plughw:CARD=X" as separate entries,
+     * since they represent the same physical microphone. */
+
+    gint max_entries = 32;
     DevEntry *entries = (DevEntry *)calloc(max_entries, sizeof(DevEntry));
+    char keys[32][64];  // parallel array for deduplication keys
     if (!entries) {
         snd_device_name_free_hint(hints);
         goto fallback;
     }
     gint n_entries = 0;
 
-    for (void **h = hints; *h != NULL; h++) {
+    /* Pass 1: plughw: devices (preferred — shared access on PipeWire systems) */
+    for (void **h = hints; *h != NULL && n_entries < max_entries; h++) {
         char *name = snd_device_name_get_hint(*h, "NAME");
         char *desc = snd_device_name_get_hint(*h, "DESC");
         char *ioid = snd_device_name_get_hint(*h, "IOID");
 
-        /* IOID "Input" = capture device; NULL = both input+output */
         gboolean is_capture = (ioid == NULL) || (strcmp(ioid, "Input") == 0);
         free(ioid);
 
-        if (!is_capture || !name) {
-            free(name);
-            free(desc);
-            continue;
+        if (!is_capture || !name || strncmp(name, "plughw:", 7) != 0) {
+            free(name); free(desc); continue;
         }
+        try_add_device(entries, keys, &n_entries, max_entries, name, desc);
+        free(name); free(desc);
+    }
 
-        /* Only show direct hardware devices (hw: prefix) — skip plugins/virtual.
-         * Rationale: ALSA plugin devices (e.g., "default", "plug:", "surround:")
-         * go through the ALSA plugin chain which can introduce latency, resampling,
-         * or channel remapping that breaks the 16kHz mono PCM requirement for
-         * whisper.cpp. Direct hw: devices provide raw hardware access with
-         * predictable format. Users with PipeWire/PulseAudio should ensure their
-         * hw: devices are properly routed. The "default" virtual device is still
-         * available as a fallback in the config dialog device list. */
-        if (strncmp(name, "hw:", 3) != 0) {
-            free(name);
-            free(desc);
-            continue;
-        }
+    /* Pass 2: hw: devices (fallback for cards not reachable via plughw:) */
+    for (void **h = hints; *h != NULL && n_entries < max_entries; h++) {
+        char *name = snd_device_name_get_hint(*h, "NAME");
+        char *desc = snd_device_name_get_hint(*h, "DESC");
+        char *ioid = snd_device_name_get_hint(*h, "IOID");
 
-        /* Actually test if the device can be opened for capture */
-        if (!test_capture_device(name)) {
-            free(name);
-            free(desc);
-            continue;
-        }
+        gboolean is_capture = (ioid == NULL) || (strcmp(ioid, "Input") == 0);
+        free(ioid);
 
-        /* Build display name from description only (no device identifier) */
-        gchar *display;
-        if (desc && desc[0] != '\0') {
-            /* Clean up description — remove newlines */
-            char *d = desc;
-            while (*d) {
-                if (*d == '\n') *d = ' ';
-                d++;
-            }
-            /* Truncate at first comma to keep name short and readable */
-            char *comma = strchr(desc, ',');
-            if (comma) {
-                *comma = '\0';
-            }
-            /* Trim trailing whitespace */
-            d = desc + strlen(desc) - 1;
-            while (d >= desc && *d == ' ') {
-                *d = '\0';
-                d--;
-            }
-            display = g_strdup(desc);
-        } else {
-            display = g_strdup(name);
+        if (!is_capture || !name || strncmp(name, "hw:", 3) != 0) {
+            free(name); free(desc); continue;
         }
-
-        if (n_entries < max_entries) {
-            entries[n_entries].display = display;
-            entries[n_entries].name = g_strdup(name);  /* duplicate for return */
-            n_entries++;
-        } else {
-            g_free(display);
-        }
-        free(name);
-        free(desc);
+        try_add_device(entries, keys, &n_entries, max_entries, name, desc);
+        free(name); free(desc);
     }
 
     snd_device_name_free_hint(hints);
 
     if (n_entries > 0) {
+        /* Log enumerated microphones at INFO level for startup diagnostics only */
+        if (log_enumeration) {
+            g_log("app-audio", G_LOG_LEVEL_INFO,
+                  "[audio] Enumerated %d microphone device(s):", n_entries);
+            for (gint i = 0; i < n_entries; i++) {
+                g_log("app-audio", G_LOG_LEVEL_INFO,
+                      "[audio]   [%d] %s (%s)", i + 1, entries[i].display, entries[i].name);
+            }
+        }
+
         AudioDeviceList *list = g_new0(AudioDeviceList, 1);
         list->display_names = g_new0(gchar *, n_entries + 1);
         list->device_names = g_new0(gchar *, n_entries + 1);
@@ -905,6 +953,11 @@ AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder) {
 
 fallback:
     {
+        if (log_enumeration) {
+            g_log("app-audio", G_LOG_LEVEL_INFO,
+                  "[audio] No microphone devices found — falling back to default device");
+        }
+
         AudioDeviceList *list = g_new0(AudioDeviceList, 1);
         list->display_names = g_new0(gchar *, 2);
         list->device_names = g_new0(gchar *, 2);

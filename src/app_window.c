@@ -175,6 +175,7 @@ struct _TextWindow {
     GtkWindow *window;
     GtkTextView *text_view;
     GtkTextBuffer *buffer;
+    GtkWindow *main_window;  /* Reference to MainWindow for positioning */
     gboolean auto_position;  /* TRUE = auto-position on next show; FALSE = respect user position */
 };
 
@@ -202,6 +203,7 @@ static GdkPixbuf *get_cached_icon(MainWindow *win, const char *icon_name);
 /* TextWindow helpers */
 static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data);
 static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data);
+static void position_text_window(TextWindow *tw, GtkWindow *main_window_gtk);
 
 /* ------------------------------------------------------------------ */
 /* Asset management                                                    */
@@ -635,6 +637,57 @@ static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, 
     return TRUE; /* Prevent the window from being destroyed */
 }
 
+/**
+ * position_text_window — Position the TextWindow relative to the MainWindow.
+ *
+ * If the main window is visible, uses its frame extents to place the text
+ * window directly below (or above if it would go off-screen). If the main
+ * window is hidden (tray mode), falls back to the saved config position so
+ * the text window doesn't appear at (0, 0).
+ */
+static void position_text_window(TextWindow *tw, GtkWindow *main_window_gtk) {
+    if (!tw || !tw->window || !tw->auto_position) return;
+
+    int tx, ty;
+    gboolean positioned = FALSE;
+
+    /* Try to use live frame extents of the main window */
+    if (main_window_gtk && gtk_widget_get_visible(GTK_WIDGET(main_window_gtk))) {
+        GdkWindow *gdk_win = gtk_widget_get_window(GTK_WIDGET(main_window_gtk));
+        if (gdk_win) {
+            GdkRectangle frame_rect;
+            gdk_window_get_frame_extents(gdk_win, &frame_rect);
+
+            int tw_w, tw_h;
+            gtk_window_get_size(tw->window, &tw_w, &tw_h);
+
+            tx = frame_rect.x;
+            ty = frame_rect.y + frame_rect.height + TEXT_WINDOW_OFFSET_Y;
+
+            /* Screen boundary check */
+            GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(tw->window));
+            GdkMonitor *mon = gdk_display_get_monitor_at_window(display, gtk_widget_get_window(GTK_WIDGET(tw->window)));
+            GdkRectangle monitor;
+            gdk_monitor_get_geometry(mon, &monitor);
+
+            if (ty + tw_h > monitor.y + monitor.height) {
+                ty = frame_rect.y - tw_h - TEXT_WINDOW_OFFSET_Y;
+                if (ty < monitor.y) ty = monitor.y;
+            }
+
+            positioned = TRUE;
+        }
+    }
+
+    /* Fallback: use saved config position or defaults */
+    if (!positioned) {
+        tx = DEFAULT_WINDOW_X;
+        ty = DEFAULT_WINDOW_Y + 60;  /* Offset below the main window default */
+    }
+
+    gtk_window_move(tw->window, tx, ty);
+}
+
 /* Reposition TextWindow when MainWindow moves */
 static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
     TextWindow *tw = (TextWindow *)user_data;
@@ -1065,42 +1118,8 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
      * window is hidden (tray app). Setting these causes the window manager to
      * send a delete-event to the TextWindow immediately after showing it. */
 
-    /* Position below MainWindow, with screen boundary check */
-    if (main_window_gtk && gtk_widget_get_visible(GTK_WIDGET(main_window_gtk))) {
-        /* Use gdk_window_get_frame_extents to get the outer frame rectangle
-         * (including title bar and borders). gtk_window_get_position() returns
-         * the outer frame position, but gtk_window_get_size() returns only the
-         * client area. Using frame extents ensures the TextWindow is placed
-         * below the actual bottom edge of the window, not overlapping the
-         * status bar. */
-        GdkWindow *gdk_win = gtk_widget_get_window(GTK_WIDGET(main_window_gtk));
-        GdkRectangle frame_rect;
-        gdk_window_get_frame_extents(gdk_win, &frame_rect);
-
-        /* Get TextWindow size */
-        int tw_w, tw_h;
-        gtk_window_get_size(tw->window, &tw_w, &tw_h);
-
-        /* Try to position below MainWindow */
-        int tx = frame_rect.x;
-        int ty = frame_rect.y + frame_rect.height + TEXT_WINDOW_OFFSET_Y;
-
-        /* Check if it would go off the bottom of the screen */
-        GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(tw->window));
-        GdkMonitor *mon = gdk_display_get_monitor_at_window(display, gtk_widget_get_window(GTK_WIDGET(tw->window)));
-        GdkRectangle monitor;
-        gdk_monitor_get_geometry(mon, &monitor);
-
-        if (ty + tw_h > monitor.y + monitor.height) {
-            /* Position above the MainWindow instead */
-            ty = frame_rect.y - tw_h - TEXT_WINDOW_OFFSET_Y;
-            if (ty < monitor.y) {
-                ty = monitor.y;
-            }
-        }
-
-        gtk_window_move(tw->window, tx, ty);
-    }
+    /* Store reference to main window for positioning on show */
+    tw->main_window = main_window_gtk;
 
     /* Set default size */
     gtk_window_set_default_size(tw->window, 400, 200);
@@ -1166,6 +1185,9 @@ void app_text_window_append_text(TextWindow *tw, const char *text) {
 
     gint chars_after = gtk_text_buffer_get_char_count(tw->buffer);
 
+    /* Position relative to main window before showing */
+    position_text_window(tw, tw->main_window);
+
     /* Show the window without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
      * notification bubble in the top panel, so we use show_all + deiconify
@@ -1196,6 +1218,9 @@ void app_text_window_set_error(TextWindow *tw, const char *error) {
     gtk_text_buffer_insert(tw->buffer, &end, error, -1);
     gtk_text_buffer_insert(tw->buffer, &end, "\n", 1);
 
+    /* Position relative to main window before showing */
+    position_text_window(tw, tw->main_window);
+
     /* Show the window without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
      * notification bubble in the top panel, so we use show_all + deiconify
@@ -1211,6 +1236,9 @@ void app_text_window_clear_text(TextWindow *tw) {
     gtk_text_buffer_get_start_iter(tw->buffer, &start);
     gtk_text_buffer_get_end_iter(tw->buffer, &end);
     gtk_text_buffer_delete(tw->buffer, &start, &end);
+
+    /* Position relative to main window before showing */
+    position_text_window(tw, tw->main_window);
 
     /* Show the window without triggering GNOME desktop notifications.
      * gtk_window_present() causes GNOME Shell to display a transient
