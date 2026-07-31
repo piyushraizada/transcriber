@@ -724,7 +724,7 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     }
 
     /* Set window properties */
-    gtk_window_set_title(win->window, "Transcriber");
+    gtk_window_set_title(win->window, "Transcriber " APP_VERSION);
     gtk_window_set_resizable(win->window, FALSE);
     gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_NORMAL);
 

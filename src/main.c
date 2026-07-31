@@ -2023,6 +2023,15 @@ static void app_destroy(TranscriberApp *app) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
+    /* Handle --version flag before any subsystem initialization or debug
+     * logging is enabled, so the output is clean (no GLib-GIO-DEBUG noise). */
+    for (int i = 1; i < argc; i++) {
+        if (g_strcmp0(argv[i], "--version") == 0) {
+            g_print("transcriber %s\n", APP_VERSION);
+            return 0;
+        }
+    }
+
     /* Enable ALL GLib log levels (DEBUG, INFO, MESSAGE) for all domains.
      * By default, g_log() only emits ERROR/CRITICAL/WARNING. Setting this
      * environment variable before any logging occurs ensures our file handler
