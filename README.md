@@ -194,6 +194,7 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **Language** — transcription language as `"auto"` (auto-detect) or a 2-letter ISO 639-1 code (e.g., `"en"`, `"fr"`); default: `auto`
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
 - **Flash attention** — when `true`, enables whisper.cpp flash attention to reduce GPU VRAM usage (no effect in CPU-only mode; default: `true`)
+- **Noise suppression** — when `true`, applies RNNoise-based automatic noise reduction to the audio stream during capture for cleaner transcription (default: `true`)
 
 A configuration dialog is available from the system tray context menu ("Show Window" → gear icon) or directly via the gear button in the main window's status bar (bottom-left corner).
 
@@ -234,6 +235,10 @@ Transcriber bundles the following third-party components:
 ### WebRTC VAD (Voice Activity Detection)
 
 Voice activity detection is provided by the **WebRTC VAD** library, packaged and maintained by **[CPUImage](https://github.com/cpuimage/webrtc_vad)**. The original implementation is part of Google's WebRTC project. The source code resides in `third_party/webrtc_vad/` and is distributed under the **BSD-3-Clause** license. Full license text is available in [`third_party/webrtc_vad/LICENSE`](third_party/webrtc_vad/LICENSE).
+
+### RNNoise (Noise Suppression)
+
+Automatic noise reduction is provided by the **[RNNoise](https://github.com/xiph/rnnoise)** library from Xiph.org. RNNoise uses a deep neural network to suppress background noise in real-time, improving transcription quality in noisy environments. The library is fetched via CMake FetchContent (pinned to tag `v0.2`) and is distributed under the **BSD-3-Clause** license.
 
 ## License
 
