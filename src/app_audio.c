@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <pthread.h>
 #include <math.h>
@@ -541,17 +542,19 @@ static void *capture_thread_func(void *arg) {
         iteration++;
     }
 
-    /* Cleanup ALSA */
+    /* Cleanup ALSA under mutex to prevent race with audio_recorder_destroy().
+      * Without the lock, destroy() could close alsa_pcm concurrently while this
+      * thread is also closing it, causing double-close and potential crashes. */
+    pthread_mutex_lock(&recorder->mutex);
     if (recorder->alsa_pcm) {
         snd_pcm_drop(recorder->alsa_pcm);
         snd_pcm_close(recorder->alsa_pcm);
         recorder->alsa_pcm = NULL;
     }
 
-    /* Set is_recording = FALSE under mutex for thread safety.
-     * The main thread only reads is_recording after pthread_join() returns,
-     * which provides a happens-before guarantee. */
-    pthread_mutex_lock(&recorder->mutex);
+    /* Set is_recording = FALSE under the same mutex for thread safety.
+      * The main thread only reads is_recording after pthread_join() returns,
+      * which provides a happens-before guarantee. */
     recorder->is_recording = false;
     pthread_mutex_unlock(&recorder->mutex);
 
@@ -611,6 +614,28 @@ bool audio_recorder_start(AudioRecorder *recorder) {
     /* Use owner-only permissions (0600) for privacy. */
     chmod(recorder->wav_path, 0600);
 
+    /* Check available disk space before writing WAV data.
+      * Minimum 1 MiB free to avoid silent partial files on full disks.
+      * statvfs operates on the directory containing the temp file (/tmp). */
+    {
+        struct statvfs vfs;
+        if (statvfs(g_get_tmp_dir(), &vfs) == 0) {
+            gsize available = (gsize)vfs.f_bavail * (gsize)vfs.f_bsize;
+            if (available < (1024 * 1024)) {
+                char msg[512];
+                g_snprintf(msg, sizeof(msg),
+                           "Insufficient disk space for recording (%zu bytes free, need >= 1 MiB)",
+                           available);
+                set_audio_error(msg);
+                close(recorder->wav_fd);
+                recorder->wav_fd = -1;
+                if (recorder->wav_path[0]) unlink(recorder->wav_path);
+                pthread_mutex_unlock(&recorder->mutex);
+                return false;
+            }
+        }
+    }
+
     recorder->wav_file = fdopen(recorder->wav_fd, "w+");
     if (!recorder->wav_file) {
         close(recorder->wav_fd);
@@ -642,6 +667,10 @@ bool audio_recorder_start(AudioRecorder *recorder) {
             g_log("app-audio", G_LOG_LEVEL_WARNING,
                   "[audio] Failed to create ring buffer — in-memory transcription unavailable\n");
         }
+    } else {
+        /* Reset the ring buffer from any previous recording session to prevent
+         * stale audio data from being transcribed. */
+        ring_buffer_reset(recorder->ring_buffer);
     }
 
     g_log("app-audio", G_LOG_LEVEL_DEBUG,

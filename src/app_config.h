@@ -74,7 +74,7 @@ typedef struct _AppConfig {
                                   ///< @see CFG-010: Microphone Selection
                                   ///< @see CFG-015: Audio Device Validation
 
-   int max_duration;            ///< Maximum recording duration in seconds (5-30)
+    int max_duration;            ///< Maximum recording duration in seconds (5-30)
                                    ///< @see CFG-014: Max Recording Duration
                                    ///< @see FR-007a: Maximum Session Limit
 

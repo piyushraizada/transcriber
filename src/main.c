@@ -110,57 +110,6 @@
 static bool g_debug_logs_enabled = false;
 
 /**
- * GLib log callback that writes g_log() messages to /tmp/transcriber.log.
- * When debug logging is disabled, only ERROR, CRITICAL, WARNING, and INFO are written.
- * Registered for every domain used by our application (see register_all_log_handlers()).
- * Format: [timestamp] [level] domain: message
- */
-static void transcriber_file_log_handler(const gchar *log_domain,
-                                         GLogLevelFlags log_level,
-                                         const gchar *message,
-                                         gpointer user_data) {
-    (void)user_data;
-
-    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
-    if (!g_debug_logs_enabled &&
-        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
-        return;
-    }
-
-    static FILE *log_file = NULL;
-
-    if (!log_file) {
-        log_file = fopen("/tmp/transcriber.log", "w");  /* Truncate on each startup */
-        if (!log_file) return;
-        setlinebuf(log_file);   /* Line-buffered so each message flushes immediately */
-    }
-
-    /* Format a human-readable timestamp */
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    char time_str[32];
-    if (localtime_r(&now, &tm_buf)) {
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
-    } else {
-        strcpy(time_str, "???");
-    }
-
-    /* Map log level flags to a short label */
-    const char *level;
-    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
-    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
-    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
-    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
-    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
-    else                                        level = "DEBUG";
-
-    /* Write: [timestamp] [level] domain: message */
-    fprintf(log_file, "[%s] [%s] %s: %s\n", time_str, level,
-            log_domain ? log_domain : "(null)",
-            message ? message : "(null)");
-}
-
-/**
  * Stderr log handler — conditionally filters output based on debug_logs setting.
  * When debug_logs is false, only ERROR, CRITICAL, WARNING, and INFO are printed.
  * When debug_logs is true, all levels including DEBUG and MESSAGE pass through.
@@ -205,12 +154,59 @@ static const char *LOG_DOMAINS[] = {
  * all pending buffered data is written. Safe to call multiple times or before the
  * log handler has been invoked (no-op in both cases).
  */
+static FILE *g_log_file_handle = NULL;
+
+/* File-based log handler that writes g_log() messages to /tmp/transcriber.log.
+ * Uses a module-level static FILE* so it can be explicitly closed during shutdown. */
+static void transcriber_file_log_handler(const gchar *log_domain,
+                                          GLogLevelFlags log_level,
+                                          const gchar *message,
+                                          gpointer user_data) {
+    (void)user_data;
+
+    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
+    if (!g_debug_logs_enabled &&
+        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
+        return;
+    }
+
+    if (!g_log_file_handle) {
+        g_log_file_handle = fopen("/tmp/transcriber.log", "w");  /* Truncate on each startup */
+        if (!g_log_file_handle) return;
+        setlinebuf(g_log_file_handle);   /* Line-buffered so each message flushes immediately */
+    }
+
+    /* Format a human-readable timestamp */
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    char time_str[32];
+    if (localtime_r(&now, &tm_buf)) {
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    } else {
+        strcpy(time_str, "???");
+    }
+
+    /* Map log level flags to a short label */
+    const char *level;
+    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
+    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
+    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
+    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
+    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
+    else                                        level = "DEBUG";
+
+    /* Write: [timestamp] [level] domain: message */
+    fprintf(g_log_file_handle, "[%s] [%s] %s: %s\n", time_str, level,
+            log_domain ? log_domain : "(null)",
+            message ? message : "(null)");
+}
+
 static void close_log_file(void) {
-    /* We cannot directly access the static FILE* inside transcriber_file_log_handler,
-     * so we reopen /tmp/transcriber.log with "a" mode to force a final flush of
-     * any kernel-level pipe buffers. The actual fclose() is handled by process exit,
-     * but calling fflush(stderr) ensures stderr (which may point to the same file)
-     * is flushed before we close it. */
+    if (g_log_file_handle) {
+        fflush(g_log_file_handle);
+        fclose(g_log_file_handle);
+        g_log_file_handle = NULL;
+    }
     if (stderr) {
         fflush(stderr);
     }
@@ -369,7 +365,7 @@ static gboolean on_transcription_result_idle(gpointer data) {
         g_free(icd);
         return FALSE;
     }
-    on_transcription_result(app, icd->data, true);
+    on_transcription_result(app, icd->data ? icd->data : "", true);
     g_free(icd->data);
     g_free(icd);
     return FALSE;
@@ -739,13 +735,23 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
     if (response && response->success && response->text && response->text[0] != '\0') {
         /* Marshal success to GTK main thread */
         IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
-        icd->app = app;
-        icd->data = g_strdup(response->text);
-        whisper_response_free(response);
-        g_idle_add(on_transcription_result_idle, icd);
+        if (!icd) {
+            g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate IdleCallbackData for scanner result\n");
+            whisper_response_free(response);
+        } else {
+            icd->app = app;
+            icd->data = g_strdup(response->text);
+            if (!icd->data) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup scanner result text\n");
+                g_free(icd);
+            } else {
+                whisper_response_free(response);
+                g_idle_add(on_transcription_result_idle, icd);
 
-        /* Restart watchdog timer so continuous recording doesn't expire */
-        g_idle_add(restart_watchdog_idle, app);
+                /* Restart watchdog timer so continuous recording doesn't expire */
+                g_idle_add(restart_watchdog_idle, app);
+            }
+        }
     } else if (response && response->success && is_continuous) {
         /* Whisper succeeded but returned empty text — treat as silence in
          * continuous mode. Do not show an error to the user. This happens
@@ -768,10 +774,20 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
             error = "Scanner transcription returned empty result";
         }
         IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
-        icd->app = app;
-        icd->data = g_strdup(error);
-        whisper_response_free(response);
-        g_idle_add(on_transcription_error_idle, icd);
+        if (!icd) {
+            g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate IdleCallbackData for scanner error\n");
+            whisper_response_free(response);
+        } else {
+            icd->app = app;
+            icd->data = g_strdup(error);
+            if (!icd->data) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup scanner error message\n");
+                g_free(icd);
+            } else {
+                whisper_response_free(response);
+                g_idle_add(on_transcription_error_idle, icd);
+            }
+        }
     }
 }
 
@@ -801,8 +817,10 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
         }
     }
 
-    /* Update the UI */
-    if (app->main_window) {
+    /* Update the UI — use GTK type checks to prevent assertions on destroyed widgets.
+      * This guards against desync: if a signal handler or assertion fires between
+      * updating the main window and tray, both remain in valid states. */
+    if (app->main_window && GTK_IS_WIDGET(app_window_get_gtk_window(app->main_window))) {
         app_window_set_state(app->main_window, STATE_LISTENING);
         /* In continuous mode, do not show the countdown timer. */
         if (continuous_dictation) {
@@ -838,13 +856,28 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
              *   - Scanner thread exiting while still referenced */
             if (config_get_continuous_dictation(app->controller.config)) {
                 /* Stop and destroy old scanner before creating a new one.
-                 * This is safe even on first entry where app->silence_scanner==NULL. */
+                  * This is safe even on first entry where app->silence_scanner==NULL.
+                  * IMPORTANT: Before destroying, ensure any in-flight transcription
+                  * callback from the old scanner has completed. The scanner's segment
+                  * callback holds scanner_transcribe_mutex during whisper.cpp calls.
+                  * If we destroy the scanner while that mutex is held, pthread_join()
+                  * inside silence_scanner_destroy() will block indefinitely because
+                  * the GTK main thread (which runs the idle callbacks) can't release
+                  * the lock until this function returns. Acquiring the mutex here
+                  * ensures no in-flight callback is active before destruction. */
                 if (app->silence_scanner) {
                     g_log("main", G_LOG_LEVEL_DEBUG,
                           "[flow] Destroying old silence scanner before restart\n");
+
+                    /* Wait for any in-flight transcription callback to complete.
+                      * This prevents deadlock: the scanner thread may be blocked
+                      * inside on_scanner_segment holding this mutex while we try
+                      * to join it via silence_scanner_destroy(). */
+                    pthread_mutex_lock(&app->scanner_transcribe_mutex);
                     silence_scanner_stop(app->silence_scanner);
                     silence_scanner_destroy(app->silence_scanner);
                     app->silence_scanner = NULL;
+                    pthread_mutex_unlock(&app->scanner_transcribe_mutex);
                 }
 
                 AudioRingBuffer *rb = audio_recorder_get_ring_buffer(app->audio_recorder);
@@ -909,8 +942,8 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
     /* Stop volume polling */
     stop_volume_poll(app);
 
-    /* Update the UI */
-    if (app->main_window) {
+    /* Update the UI — GTK type check prevents assertion on destroyed widget */
+    if (app->main_window && GTK_IS_WIDGET(app_window_get_gtk_window(app->main_window))) {
         app_window_set_state(app->main_window, STATE_TRANSCRIBING);
     }
 
@@ -975,6 +1008,20 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
                         (GThreadFunc)transcribe_thread_func,
                         app);
         pthread_mutex_unlock(&app->transcribe_thread_mutex);
+
+        if (!app->transcribe_thread) {
+            /* Thread creation failed — transition back to IDLE so the user
+              * isn't stuck in TRANSCRIBING state forever. */
+            g_log("main", G_LOG_LEVEL_ERROR,
+                  "[flow] Failed to create transcription thread\n");
+            if (app->text_window) {
+                app_text_window_set_error(app->text_window, "Failed to start transcription thread");
+            }
+            app_transition_to(&app->controller, STATE_IDLE);
+            if (app->main_window) {
+                app_window_set_state(app->main_window, STATE_IDLE);
+            }
+        }
     } else {
         /* No whisper client or WAV path — return to IDLE */
         if (app->text_window) {
@@ -993,17 +1040,28 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
 static gpointer transcribe_thread_func(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
-    const char *model_path = config_get_model_path(app->controller.config);
-    whisper_client_set_model_path(app->whisper_client, model_path);
-    const char *language = config_get_language(app->controller.config);
-    whisper_client_set_language(app->whisper_client, language);
+    /* Snapshot config values into local variables to prevent torn reads on
+      * non-x86 architectures. The AppConfig struct may be modified by the
+      * main thread (via config dialog save) while this worker thread is running. */
+    char model_path_buf[512] = {0};
+    char language_buf[16] = {0};
+    bool is_continuous_snapshot = false;
+
+    if (app->controller.config) {
+        const char *mp = config_get_model_path(app->controller.config);
+        if (mp) strncpy(model_path_buf, mp, sizeof(model_path_buf) - 1);
+        const char *lang = config_get_language(app->controller.config);
+        if (lang) strncpy(language_buf, lang, sizeof(language_buf) - 1);
+        is_continuous_snapshot = config_get_continuous_dictation(app->controller.config);
+    }
+
+    whisper_client_set_model_path(app->whisper_client, model_path_buf);
+    whisper_client_set_language(app->whisper_client, language_buf);
 
     /* DEBUG: Log entry state */
-    bool is_continuous_debug = app->controller.config
-        ? config_get_continuous_dictation(app->controller.config) : false;
     g_log("main", G_LOG_LEVEL_MESSAGE,
           "[DEBUG-transcribe-thread] ENTRY continuous=%s user_requested_stop=%d\n",
-          is_continuous_debug ? "true" : "false",
+          is_continuous_snapshot ? "true" : "false",
           atomic_load(&app->user_requested_stop));
 
     /* Stop the silence scanner first to prevent it from reading the ring buffer
@@ -1164,10 +1222,9 @@ static gpointer transcribe_thread_func(gpointer data) {
     /* If both ring buffer and WAV path are empty, check if this is continuous
      * mode. In that case, silently skip transcription and let the app
      * transition to IDLE without showing an error. */
-    bool continuous = app->controller.config
-        ? config_get_continuous_dictation(app->controller.config) : false;
+    /* Use snapshot instead of re-reading config (torn-read prevention) */
     if (!response) {
-        if (continuous) {
+        if (is_continuous_snapshot) {
             /* In continuous mode, audio may have been entirely silence or noise.
              * Create a success response with empty text so the app transitions to
              * IDLE without showing an error. Using an empty string rather than NULL
@@ -1194,10 +1251,19 @@ static gpointer transcribe_thread_func(gpointer data) {
     if (app->controller.on_transcription_result) {
         if (response && response->success && response->text && response->text[0] != '\0') {
             IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
-            icd->app = app;
-            icd->data = g_strdup(response->text);
-            g_idle_add(on_transcription_result_idle, icd);
-        } else if (response && response->success && continuous) {
+            if (!icd) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate IdleCallbackData for transcription result\n");
+            } else {
+                icd->app = app;
+                icd->data = g_strdup(response->text);
+                if (!icd->data) {
+                    g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup transcription text\n");
+                    g_free(icd);
+                } else {
+                    g_idle_add(on_transcription_result_idle, icd);
+                }
+            }
+        } else if (response && response->success && is_continuous_snapshot) {
             /* Whisper succeeded but returned empty text — treat as silence in
              * continuous mode. Do not show an error to the user. This happens
              * when whisper processes audio containing only silence or very short
@@ -1207,9 +1273,18 @@ static gpointer transcribe_thread_func(gpointer data) {
             g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Transcription succeeded but empty text — skipping in continuous mode\n");
             IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
-            icd->app = app;
-            icd->data = NULL;  /* Empty result */
-            g_idle_add(on_transcription_result_idle, icd);
+            if (!icd) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate IdleCallbackData for empty result\n");
+            } else {
+                icd->app = app;
+                icd->data = g_strdup("");  /* Empty string — not NULL for safe idle callback */
+                if (!icd->data) {
+                    g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup empty result\n");
+                    g_free(icd);
+                } else {
+                    g_idle_add(on_transcription_result_idle, icd);
+                }
+            }
         } else {
             const char *error = whisper_client_get_error(app->whisper_client);
             if (!error || error[0] == '\0') {
@@ -1218,9 +1293,18 @@ static gpointer transcribe_thread_func(gpointer data) {
                         : "Transcription returned empty result";
             }
             IdleCallbackData *icd = g_new0(IdleCallbackData, 1);
-            icd->app = app;
-            icd->data = g_strdup(error);
-            g_idle_add(on_transcription_error_idle, icd);
+            if (!icd) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate IdleCallbackData for transcription error\n");
+            } else {
+                icd->app = app;
+                icd->data = g_strdup(error);
+                if (!icd->data) {
+                    g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup transcription error message\n");
+                    g_free(icd);
+                } else {
+                    g_idle_add(on_transcription_error_idle, icd);
+                }
+            }
         }
         if (response) {
             whisper_response_free(response);
@@ -1270,20 +1354,46 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
         }
 
         /* In continuous mode, accumulate all segments into a single buffer so
-         * the clipboard always holds the full transcript. In normal mode, just
-         * copy the current segment as before. */
+          * the clipboard always holds the full transcript. In normal mode, just
+          * copy the current segment as before. */
         if (continuous) {
             pthread_mutex_lock(&app->continuous_clipboard_mutex);
+
+            /* Cap accumulated clipboard text to prevent unbounded memory growth.
+              * 500 KiB is more than enough for hours of continuous dictation.
+              * If the buffer exceeds this limit, truncate from the front (oldest)
+              * so the most recent transcription remains intact. */
+            #define CONTINUOUS_CLIPBOARD_MAX_BYTES (512 * 1024)
+
+            if (app->continuous_clipboard_text) {
+                size_t current_len = strlen(app->continuous_clipboard_text);
+                size_t incoming_len = strlen(text_or_error);
+                if (current_len + incoming_len + 2 > CONTINUOUS_CLIPBOARD_MAX_BYTES) {
+                    /* Truncate oldest text to make room for new segment.
+                      * Keep at least the last quarter of existing text plus the new segment. */
+                    size_t keep_from = current_len / 4;
+                    memmove(app->continuous_clipboard_text,
+                            app->continuous_clipboard_text + keep_from,
+                            (current_len - keep_from) + 1);
+                }
+            }
+
             char *accumulated = g_strdup_printf("%s%s%s",
                 app->continuous_clipboard_text ? app->continuous_clipboard_text : "",
                 app->continuous_clipboard_text ? " " : "",
                 text_or_error);
-            g_free(app->continuous_clipboard_text);
-            app->continuous_clipboard_text = accumulated;
-            pthread_mutex_unlock(&app->continuous_clipboard_mutex);
+            if (!accumulated) {
+                g_log("main", G_LOG_LEVEL_ERROR,
+                      "[oom] Cannot allocate clipboard buffer — skipping copy\n");
+                pthread_mutex_unlock(&app->continuous_clipboard_mutex);
+            } else {
+                g_free(app->continuous_clipboard_text);
+                app->continuous_clipboard_text = accumulated;
 
-            if (clipboard_is_available(NULL)) {
-                clipboard_copy_text_both(NULL, app->continuous_clipboard_text);
+                if (clipboard_is_available(NULL)) {
+                    clipboard_copy_text_both(NULL, app->continuous_clipboard_text);
+                }
+                pthread_mutex_unlock(&app->continuous_clipboard_mutex);
             }
         } else {
             /* Normal mode: reset accumulator and copy just this segment. */
@@ -1381,18 +1491,31 @@ static void on_model_status_change(TranscriberApp *app, ModelStatus status) {
 static gpointer model_loading_thread_func(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
-    /* Set model path and language from config */
-    const char *model_path = config_get_model_path(app->controller.config);
-    whisper_client_set_model_path(app->whisper_client, model_path);
-    const char *language = config_get_language(app->controller.config);
-    whisper_client_set_language(app->whisper_client, language);
+    /* Snapshot config values into local variables to prevent torn reads on
+      * non-x86 architectures. The AppConfig struct may be modified by the
+      * main thread while this worker thread is running. */
+    char model_path_buf[512] = {0};
+    char language_buf[16] = {0};
+    char gpu_mode_buf[32] = {0};
+    bool flash_attention_snapshot = false;
+
+    if (app->controller.config) {
+        const char *mp = config_get_model_path(app->controller.config);
+        if (mp) strncpy(model_path_buf, mp, sizeof(model_path_buf) - 1);
+        const char *lang = config_get_language(app->controller.config);
+        if (lang) strncpy(language_buf, lang, sizeof(language_buf) - 1);
+        const char *gm = config_get_gpu_mode(app->controller.config);
+        if (gm) strncpy(gpu_mode_buf, gm, sizeof(gpu_mode_buf) - 1);
+        flash_attention_snapshot = config_get_flash_attention(app->controller.config);
+    }
+
+    whisper_client_set_model_path(app->whisper_client, model_path_buf);
+    whisper_client_set_language(app->whisper_client, language_buf);
 
     /* Load the model with GPU mode from config.
-     * gpu_mode can be "auto", "cpu", or "gpu:N".
-     * This blocks until the model is loaded (or fails). */
-    const char *gpu_mode = config_get_gpu_mode(app->controller.config);
-    bool flash_attention = config_get_flash_attention(app->controller.config);
-    bool loaded = whisper_client_load_model(app->whisper_client, gpu_mode, flash_attention);
+      * gpu_mode can be "auto", "cpu", or "gpu:N".
+      * This blocks until the model is loaded (or fails). */
+    bool loaded = whisper_client_load_model(app->whisper_client, gpu_mode_buf, flash_attention_snapshot);
 
     /* Marshal result back to GTK main thread */
     if (loaded) {
@@ -1400,9 +1523,18 @@ static gpointer model_loading_thread_func(gpointer data) {
     } else {
         const char *error = whisper_client_get_error(app->whisper_client);
         ModelLoadFailedData *mlfd = g_new0(ModelLoadFailedData, 1);
-        mlfd->app = app;
-        mlfd->error_msg = error ? g_strdup(error) : g_strdup("Failed to load model");
-        g_idle_add(on_model_load_failed_idle, mlfd);
+        if (!mlfd) {
+            g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot allocate ModelLoadFailedData\n");
+        } else {
+            mlfd->app = app;
+            mlfd->error_msg = error ? g_strdup(error) : g_strdup("Failed to load model");
+            if (!mlfd->error_msg) {
+                g_log("main", G_LOG_LEVEL_ERROR, "[oom] Cannot strdup model load error message\n");
+                g_free(mlfd);
+            } else {
+                g_idle_add(on_model_load_failed_idle, mlfd);
+            }
+        }
     }
 
     return NULL;
@@ -1613,8 +1745,23 @@ static void on_microphone_toggle(void *user_data) {
                 app->model_load_thread = NULL;
             }
             app->model_load_thread = g_thread_new("model_loading",
-                                  model_loading_thread_func, app);
+                                   model_loading_thread_func, app);
             pthread_mutex_unlock(&app->model_load_thread_mutex);
+
+            if (!app->model_load_thread) {
+                /* Thread creation failed — clear WAIT overlay and show error */
+                g_log("main", G_LOG_LEVEL_ERROR,
+                      "[toggle] Failed to create model load thread\n");
+                app_set_model_status(&app->controller, MODEL_UNAVAILABLE);
+                if (app->main_window) {
+                    app_window_set_model_loading(app->main_window, FALSE);
+                    app_window_set_model_status(app->main_window, MODEL_UNAVAILABLE);
+                }
+                show_auto_close_dialog(app, "Model Load Error", GTK_MESSAGE_ERROR,
+                    "Failed to start model loading thread.\n\n"
+                    "Please check system resources and try again.");
+                return;
+            }
 
             return; /* Wait for loading to complete before recording */
         }
@@ -1719,8 +1866,25 @@ static void perform_initial_model_load(TranscriberApp *app) {
         app->model_load_thread = NULL;
     }
     app->model_load_thread = g_thread_new("startup_model_load",
-                                        model_loading_thread_func, app);
+                                         model_loading_thread_func, app);
     pthread_mutex_unlock(&app->model_load_thread_mutex);
+
+    /* If thread creation failed, clear the WAIT overlay immediately so the UI
+      * doesn't get stuck showing a loading indicator forever. */
+    if (!app->model_load_thread) {
+        g_log("main", G_LOG_LEVEL_ERROR,
+              "[startup] Failed to create model load thread — clearing WAIT overlay\n");
+        if (app->main_window) {
+            app_window_set_model_loading(app->main_window, FALSE);
+        }
+        app_set_model_status(&app->controller, MODEL_UNAVAILABLE);
+        if (app->main_window) {
+            app_window_set_model_status(app->main_window, MODEL_UNAVAILABLE);
+        }
+        if (app->tray) {
+            tray_set_model_status(app->tray, MODEL_UNAVAILABLE);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1816,7 +1980,7 @@ static void on_state_change(TranscriberApp *app, AppState previous_state, AppSta
         case STATE_IDLE:
             g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Entering IDLE\n");
-            if (app->main_window) {
+            if (app->main_window && GTK_IS_WIDGET(app_window_get_gtk_window(app->main_window))) {
                 app_window_set_state(app->main_window, STATE_IDLE);
             }
             break;
@@ -2102,6 +2266,7 @@ static void app_destroy(TranscriberApp *app) {
     pthread_mutex_destroy(&app->wav_path_mutex);
     pthread_mutex_destroy(&app->transcribe_thread_mutex);
     pthread_mutex_destroy(&app->model_load_thread_mutex);
+    pthread_mutex_destroy(&app->scanner_transcribe_mutex);
     pthread_mutex_destroy(&app->continuous_clipboard_mutex);
 
     /* Drain any pending GTK idle callbacks that may reference 'app' before
@@ -2109,9 +2274,21 @@ static void app_destroy(TranscriberApp *app) {
      * via g_idle_add() that capture the 'app' pointer. Even after the worker
      * threads are joined, those callbacks may still be pending in the GTK main
      * loop. Processing them here ensures they execute while 'app' is still valid,
-     * and their internal shutting_down checks will cause them to bail out safely. */
-    while (g_main_context_pending(NULL)) {
-        g_main_context_iteration(NULL, FALSE);
+     * and their internal shutting_down checks will cause them to bail out safely.
+     * Cap iterations at 500 to prevent infinite loops if a callback keeps
+     * re-queuing itself — after the limit, remaining callbacks are abandoned. */
+    {
+        int drain_iterations = 0;
+        const int max_drain_iterations = 500;
+        while (g_main_context_pending(NULL) && drain_iterations < max_drain_iterations) {
+            g_main_context_iteration(NULL, FALSE);
+            drain_iterations++;
+        }
+        if (drain_iterations >= max_drain_iterations) {
+            g_log("main", G_LOG_LEVEL_WARNING,
+                  "[shutdown] GTK drain loop hit %d iteration limit — abandoning remaining callbacks\n",
+                  max_drain_iterations);
+        }
     }
 
     g_free(app);

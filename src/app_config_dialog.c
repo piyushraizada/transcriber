@@ -46,6 +46,7 @@ struct _ConfigDialog {
     GtkComboBox *language_combo;
     GtkComboBox *gpu_mode_combo;
     GtkCheckButton *flash_attention_checkbox;
+    bool flash_attention_was_enabled;  /* Preserved state when CPU mode forces checkbox off */
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
@@ -129,7 +130,7 @@ bool config_dialog_validate_model_path(const char *path) {
  * @return true if valid (5 <= duration <= 30)
  */
 bool config_dialog_validate_duration(int duration) {
-    return duration >= 5 && duration <= 120;
+    return duration >= 5 && duration <= 30;
 }
 
 /**
@@ -297,7 +298,7 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     /* Validate duration */
     int duration = (int)gtk_spin_button_get_value(dlg->duration_spin);
     if (!config_dialog_validate_duration(duration)) {
-        config_dialog_show_error(dlg->duration_error, "Duration must be between 5 and 30 seconds");
+        config_dialog_show_error(dlg->duration_error, "Duration must be between 5-30 seconds");
         valid = FALSE;
     } else {
         config_dialog_clear_error(dlg->duration_error);
@@ -574,9 +575,13 @@ static void update_flash_attention_sensitivity(ConfigDialog *dlg) {
 
     gtk_widget_set_sensitive(GTK_WIDGET(dlg->flash_attention_checkbox), !is_cpu);
     if (!is_cpu && dlg->flash_attention_checkbox) {
-        /* Re-enable the checkbox so user can toggle it */
+        /* Re-enable the checkbox and restore user's previous selection */
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox),
+                                     dlg->flash_attention_was_enabled);
     } else if (is_cpu) {
-        /* Force off when CPU mode is active to avoid confusion on save */
+        /* Save current state before forcing off — restores when GPU mode is re-selected */
+        dlg->flash_attention_was_enabled =
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox));
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox), FALSE);
     }
 }
@@ -643,6 +648,7 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     /* Allocate ConfigDialog on heap to avoid stack overflow */
     ConfigDialog *dlg = g_new0(ConfigDialog, 1);
     dlg->config = config;
+    dlg->flash_attention_was_enabled = config_get_flash_attention(config);
     dlg->dialog = GTK_DIALOG(gtk_dialog_new_with_buttons(
         "Transcriber Settings",
         parent_window,
