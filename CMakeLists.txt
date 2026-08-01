@@ -96,10 +96,15 @@ endif()
 # before passing audio to Whisper for transcription.
 # Licensed under BSD-3-Clause. Processes 480-sample frames at 48kHz;
 # our wrapper handles 16kHz↔48kHz resampling transparently.
+#
+# NOTE: Using master branch instead of v0.2 tag because the v0.2 release is
+# missing pre-generated rnnoise_data.h/.c files (they require Python/autotools
+# to generate). Master has these data files committed as rnn_data.h/.c, making
+# it buildable with a pure C/CMake workflow.
 FetchContent_Declare(
     rnnoise
     GIT_REPOSITORY https://github.com/xiph/rnnoise.git
-    GIT_TAG        v0.2
+    GIT_TAG        6cbfd53eb348
     GIT_SHALLOW    ON
 )
 # Use Populate only (not MakeAvailable) since RNNoise uses autotools, not CMake.
@@ -129,18 +134,15 @@ set(SOURCES
     src/app_noisereduction.c
 )
 
-# Append RNNoise library sources (inline, not as separate target — avoids CMake conflicts)
+# Append RNNoise library sources (inline, not as separate target — avoids CMake conflicts).
+# Master branch has pre-generated rnn_data.h/.c committed, so no autotools step needed.
 list(APPEND SOURCES
     ${RNNOISE_SOURCE_DIR}/src/celt_lpc.c
     ${RNNOISE_SOURCE_DIR}/src/kiss_fft.c
     ${RNNOISE_SOURCE_DIR}/src/denoise.c
-    ${RNNOISE_SOURCE_DIR}/src/nnet.c
-    ${RNNOISE_SOURCE_DIR}/src/nnet_default.c
     ${RNNOISE_SOURCE_DIR}/src/pitch.c
     ${RNNOISE_SOURCE_DIR}/src/rnn.c
-    ${RNNOISE_SOURCE_DIR}/src/rnnoise_tables.c
-    ${RNNOISE_SOURCE_DIR}/src/parse_lpcnet_weights.c
-    ${RNNOISE_SOURCE_DIR}/src/rnnoise_data_little.c
+    ${RNNOISE_SOURCE_DIR}/src/rnn_data.c
 )
 
 # Determine the install prefix for assets directory
