@@ -840,6 +840,11 @@ static void handle_enter_listening(TranscriberApp *app, AppState previous_state)
         if (max_duration <= 0) max_duration = DEFAULT_MAX_DURATION_SECONDS;
         g_log("main", G_LOG_LEVEL_DEBUG,
               "[flow] Starting audio recorder (max_duration=%ds)\n", max_duration);
+
+        /* Configure noise suppression before starting capture */
+        bool ns_enabled = app->controller.config ? config_get_noise_suppression(app->controller.config) : true;
+        audio_recorder_set_noise_suppression(app->audio_recorder, ns_enabled);
+
         if (audio_recorder_start(app->audio_recorder)) {
             g_log("main", G_LOG_LEVEL_DEBUG,
                   "[flow] Audio recording started successfully\n");
@@ -1561,6 +1566,15 @@ static gboolean on_model_loaded_idle(gpointer data) {
         app_window_set_model_loading(app->main_window, FALSE);
     }
 
+    /* If GPU fallback occurred, show a non-intrusive info dialog so the user knows
+     * that the configured GPU was not used. This is informational only — the model
+     * loaded successfully on an alternate device or CPU. */
+    const char *gpu_fallback = whisper_client_get_gpu_fallback_message(app->whisper_client);
+    if (gpu_fallback && gpu_fallback[0] != '\0') {
+        show_auto_close_dialog(app, "GPU Fallback", GTK_MESSAGE_INFO,
+            "%s\n\nThe application is fully functional.", gpu_fallback);
+    }
+
     /* Update connection status to connected */
     app_set_model_status(&app->controller, MODEL_AVAILABLE);
     if (app->main_window) {
@@ -1610,10 +1624,19 @@ static gboolean on_model_load_failed_idle(gpointer data) {
     }
 
     /* Show non-modal, auto-closing warning dialog */
-    show_auto_close_dialog(app, "Model Load Warning", GTK_MESSAGE_WARNING,
-        "Failed to load Whisper model at startup.\n\n%s\n\n"
-        "The application will attempt to load the model when you "
-        "first click the microphone icon.", error_msg ? error_msg : "Unknown error");
+    const char *gpu_fallback = whisper_client_get_gpu_fallback_message(app->whisper_client);
+    if (gpu_fallback && gpu_fallback[0] != '\0') {
+        show_auto_close_dialog(app, "Model Load Warning", GTK_MESSAGE_WARNING,
+            "Failed to load Whisper model at startup.\n\n%s\n\n%s\n\n"
+            "The application will attempt to load the model when you "
+            "first click the microphone icon.",
+            gpu_fallback, error_msg ? error_msg : "Unknown error");
+    } else {
+        show_auto_close_dialog(app, "Model Load Warning", GTK_MESSAGE_WARNING,
+            "Failed to load Whisper model at startup.\n\n%s\n\n"
+            "The application will attempt to load the model when you "
+            "first click the microphone icon.", error_msg ? error_msg : "Unknown error");
+    }
 
     g_free(error_msg);
     g_free(mlfd);

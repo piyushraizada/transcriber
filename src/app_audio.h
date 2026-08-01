@@ -92,6 +92,18 @@ void audio_recorder_destroy(AudioRecorder *recorder);
 bool audio_recorder_set_device(AudioRecorder *recorder, const char *device);
 
 /**
+ * Enable or disable noise suppression for the next recording session.
+ *
+ * Call this before audio_recorder_start() to configure whether RNNoise-based
+ * background noise removal should be applied during capture. The setting is
+ * evaluated when start() creates the internal processing handle.
+ *
+ * @param recorder AudioRecorder handle
+ * @param enabled  true = enable noise suppression, false = disable
+ */
+void audio_recorder_set_noise_suppression(AudioRecorder *recorder, bool enabled);
+
+/**
  * Get the current audio device name.
  *
  * @param recorder AudioRecorder handle

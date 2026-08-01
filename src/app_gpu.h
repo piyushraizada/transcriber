@@ -152,6 +152,19 @@ bool gpu_get_memory_info(int device_idx, size_t *free_bytes, size_t *total_bytes
 bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes);
 
 /**
+ * Select the GPU device with the most free memory that meets a minimum threshold.
+ *
+ * Iterates over all available GPU devices and selects the one with the highest
+ * free memory value that is at least min_free_bytes. If no GPU meets the
+ * threshold, returns false.
+ *
+ * @param best_device_idx  Output parameter for the selected device index
+ * @param min_free_bytes   Minimum required free memory in bytes
+ * @return true if a suitable GPU was found, false otherwise
+ */
+bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes);
+
+/**
  * Release CUDA contexts on all GPU devices except the one in use.
  *
  * When CUDA devices are enumerated or queried (via cudaSetDevice +
@@ -167,6 +180,22 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes);
  * @return true if cleanup was performed, false if CUDA not available
  */
 bool gpu_release_unused_devices(int used_device_idx);
+
+/**
+ * Release CUDA contexts on unused GPU devices, skipping specified devices.
+ *
+ * Like gpu_release_unused_devices() but skips cudaDeviceReset() on any device
+ * listed in skip_devices (up to count). This is important after failed model
+ * load attempts: a failed whisper.cpp init can leave the CUDA context in an
+ * undefined state, and calling cudaDeviceReset() on such devices causes crashes
+ * when subsequent code queries their properties.
+ *
+ * @param used_device_idx The GPU device index that is actively in use (>= 0)
+ * @param skip_devices   Array of device indices to skip resetting (can be NULL)
+ * @param skip_count     Number of entries in skip_devices array
+ * @return true if cleanup was performed, false if CUDA not available
+ */
+bool gpu_release_unused_devices_skip(int used_device_idx, int *skip_devices, int skip_count);
 
 /*---------------------------------------------------------------------------
  * Section 4: GPU Mode String Parsing

@@ -118,6 +118,7 @@ struct _WhisperClient {
     atomic_bool model_loading;         // true while model load is in progress
     atomic_uint ctx_refcount;          // reference count for in-flight transcriptions
     atomic_bool destroying;            // true during whisper_client_destroy cleanup
+    char gpu_fallback_message[512];    // Human-readable GPU fallback info (empty if no fallback)
 };
 
 /* ===================================================================
@@ -387,50 +388,158 @@ static bool load_model_internal(WhisperClient *client) {
     }
 
     bool gpu_loaded = false;
+    int final_gpu_idx = -1;  // Actual GPU device used (-1 = CPU)
 
-    // Log which GPU device will be used
-    if (try_gpu && gpu_idx >= 0) {
-        char gpu_name[256];
-        if (gpu_get_device_name(gpu_idx, gpu_name, sizeof(gpu_name))) {
-            g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-                   "[whisper] Using GPU device %d: %s", gpu_idx, gpu_name);
-        } else {
-            g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-                   "[whisper] Using GPU device %d", gpu_idx);
-        }
-    } else if (!try_gpu) {
-        g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
-               "[whisper] Using CPU (no GPU)");
-    }
+    /* Clear any previous fallback message */
+    client->gpu_fallback_message[0] = '\0';
 
     struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = try_gpu;
     cparams.flash_attn = client->flash_attention;
 
-    // Set GPU device if we have a specific index
 #ifdef HAVE_CUDA
-    if (try_gpu && gpu_idx >= 0) {
-        cparams.gpu_device = gpu_idx;
-        /* Ensure the CUDA current device matches before model init.
-         * whisper_init_from_file_with_params() uses cudaSetDevice internally,
-         * but intermediate GPU queries may have left us on a different device. */
-        cudaSetDevice(gpu_idx);
+    /* Build a sorted list of GPU devices by free memory for fallback iteration.
+     * When the primary GPU fails (e.g., insufficient VRAM), we try remaining GPUs
+     * in descending order of available free memory before falling back to CPU. */
+    struct whisper_context *ctx = NULL;
+    typedef struct { int idx; size_t free_mem; } gpu_candidate;
+    /* Track failed GPUs so cudaDeviceReset() is not called on them later (crashes). */
+    int failed_gpus[16] = {0};
+    int n_failed = 0;
+    gpu_candidate candidates[16];  // Max 16 GPUs is more than sufficient
+    int n_candidates = 0;
+
+    if (try_gpu && whisper_gpu_available()) {
+        int device_count = 0;
+        if (gpu_get_device_count(&device_count)) {
+            for (int i = 0; i < device_count && n_candidates < 16; i++) {
+                size_t free_mem = 0;
+                if (gpu_get_memory_info(i, &free_mem, NULL)) {
+                    candidates[n_candidates].idx = i;
+                    candidates[n_candidates].free_mem = free_mem;
+                    n_candidates++;
+                }
+            }
+        }
+
+        /* Sort candidates by free memory descending (simple insertion sort) */
+        for (int i = 1; i < n_candidates; i++) {
+            gpu_candidate key = candidates[i];
+            int j = i - 1;
+            while (j >= 0 && candidates[j].free_mem < key.free_mem) {
+                candidates[j + 1] = candidates[j];
+                j--;
+            }
+            candidates[j + 1] = key;
+        }
+
+        /* If primary GPU was specified and not at the top of the list, move it there */
+        if (gpu_idx >= 0 && n_candidates > 0) {
+            int pos = -1;
+            for (int i = 0; i < n_candidates; i++) {
+                if (candidates[i].idx == gpu_idx) { pos = i; break; }
+            }
+            if (pos > 0) {
+                gpu_candidate tmp = candidates[0];
+                candidates[0] = candidates[pos];
+                candidates[pos] = tmp;
+            }
+        }
+
+        /* Iterate through GPU candidates until one succeeds.
+     * Track failed GPUs so we don't call cudaDeviceReset() on them later —
+     * a failed whisper.cpp load can leave the CUDA context in an undefined state,
+     * and resetting it causes crashes when other code (e.g., config dialog) queries
+     * device properties afterward. */
+        int original_gpu_idx = gpu_idx;
+
+        for (int ci = 0; ci < n_candidates && !ctx; ci++) {
+            int attempt_idx = candidates[ci].idx;
+            cparams.use_gpu = true;
+            cparams.gpu_device = attempt_idx;
+
+            char gpu_name[256];
+            bool is_fallback = (attempt_idx != original_gpu_idx);
+
+            if (gpu_get_device_name(attempt_idx, gpu_name, sizeof(gpu_name))) {
+                g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+                       "[whisper] %sGPU device %d: %s (%.1f GB free)",
+                       is_fallback ? "Trying fallback " : "Using ",
+                       attempt_idx, gpu_name,
+                       (double)candidates[ci].free_mem / (1024.0 * 1024.0 * 1024.0));
+            } else {
+                g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+                       "[whisper] %sGPU device %d (%.1f GB free)",
+                       is_fallback ? "Trying fallback " : "Using ",
+                       attempt_idx,
+                       (double)candidates[ci].free_mem / (1024.0 * 1024.0 * 1024.0));
+            }
+
+            cudaSetDevice(attempt_idx);
+            ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
+
+            if (ctx) {
+                gpu_loaded = true;
+                final_gpu_idx = attempt_idx;
+
+                /* Build fallback message for user notification */
+                if (is_fallback) {
+                    char orig_name[256] = "GPU";
+                    char alt_name[256] = "GPU";
+                    gpu_get_device_name(original_gpu_idx, orig_name, sizeof(orig_name));
+                    gpu_get_device_name(attempt_idx, alt_name, sizeof(alt_name));
+                    snprintf(client->gpu_fallback_message, sizeof(client->gpu_fallback_message),
+                              "The configured GPU (%s) did not have enough free VRAM. "
+                              "Model loaded on %s instead.", orig_name, alt_name);
+                }
+                break;  // Success — stop iterating
+            }
+
+            /* This GPU failed — record it so we skip cudaDeviceReset() later */
+            if (n_failed < 16) {
+                failed_gpus[n_failed++] = attempt_idx;
+            }
+            g_log("app-whisper", G_LOG_LEVEL_WARNING,
+                   "[whisper] GPU device %d failed to load model, trying next...", attempt_idx);
+        }
     }
+#else
+    struct whisper_context *ctx = NULL;
+    int n_candidates = 0;
+    (void)gpu_idx;  // Suppress unused warning when CUDA not available
 #endif
 
-    struct whisper_context *ctx = NULL;
+    /* If no GPU succeeded, fall back to CPU */
+    if (!ctx) {
+        cparams.use_gpu = false;
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE,
+               "[whisper] Falling back to CPU for model loading");
 
-    if (try_gpu) {
-        ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
-
-        if (ctx) {
-            gpu_loaded = true;
-        } else {
-            cparams.use_gpu = false;
-            ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
+#ifdef HAVE_CUDA
+        if (n_candidates > 0) {
+            /* Build a list of failed GPU names for the fallback message */
+            char gpu_list[256] = "";
+            int listed = 0;
+            for (int ci = 0; ci < n_candidates && listed < 4; ci++) {
+                char name[128];
+                if (!gpu_get_device_name(candidates[ci].idx, name, sizeof(name))) {
+                    snprintf(name, sizeof(name), "GPU %d", candidates[ci].idx);
+                }
+                if (listed > 0) strncat(gpu_list, ", ", sizeof(gpu_list) - strlen(gpu_list) - 1);
+                strncat(gpu_list, name, sizeof(gpu_list) - strlen(gpu_list) - 1);
+                listed++;
+            }
+            snprintf(client->gpu_fallback_message, sizeof(client->gpu_fallback_message),
+                      "No GPU had enough free VRAM to load the model (%s). Using CPU instead.", gpu_list);
+        } else if (!whisper_gpu_available()) {
+            snprintf(client->gpu_fallback_message, sizeof(client->gpu_fallback_message),
+                      "CUDA runtime not available. Using CPU for model loading.");
         }
-    } else {
+#endif
+
         ctx = safe_whisper_init_from_file_with_params(client->model_path, cparams);
+    } else if (!gpu_loaded) {
+        /* GPU was never attempted (e.g., gpu_index == CPU_ONLY) */
+        g_log("app-whisper", G_LOG_LEVEL_MESSAGE, "[whisper] Using CPU (no GPU)");
     }
 
     if (!ctx) {
@@ -454,7 +563,7 @@ static bool load_model_internal(WhisperClient *client) {
                "[whisper] Post-load validation failed: invalid vocab size (%d) — model may be corrupted\n",
                n_vocab);
 #ifdef HAVE_CUDA
-        if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
+        if (gpu_loaded && final_gpu_idx >= 0) cudaSetDevice(final_gpu_idx);
 #endif
         safe_whisper_free(ctx);
         client->ctx = NULL;
@@ -474,7 +583,7 @@ static bool load_model_internal(WhisperClient *client) {
         g_log("app-whisper", G_LOG_LEVEL_WARNING,
                "[whisper] Post-load validation failed: cannot resolve 'en' language ID\n");
 #ifdef HAVE_CUDA
-        if (try_gpu && gpu_idx >= 0) cudaSetDevice(gpu_idx);
+        if (gpu_loaded && final_gpu_idx >= 0) cudaSetDevice(final_gpu_idx);
 #endif
         safe_whisper_free(ctx);
         client->ctx = NULL;
@@ -487,7 +596,7 @@ static bool load_model_internal(WhisperClient *client) {
     /* Store the actual active GPU device so transcription can restore
      * the CUDA context before each call. The current device can drift
      * after gpu_release_unused_devices() and multi-threaded operations. */
-    client->active_gpu_device = gpu_loaded && gpu_idx >= 0 ? gpu_idx : -1;
+    client->active_gpu_device = gpu_loaded && final_gpu_idx >= 0 ? final_gpu_idx : -1;
 
     /* Reset refcount for new context */
     atomic_store(&client->ctx_refcount, 0);
@@ -500,11 +609,14 @@ static bool load_model_internal(WhisperClient *client) {
            n_vocab, gpu_loaded ? "yes" : "no");
 
     /* Release CUDA contexts on GPUs not used by the loaded model.
-     * whisper_init_from_file_with_params() enumerates all CUDA devices
-     * internally, creating ~256 MiB contexts on each. Clean them up. */
-    if (gpu_loaded && gpu_idx >= 0) {
-        gpu_release_unused_devices(gpu_idx);
+      * whisper_init_from_file_with_params() enumerates all CUDA devices
+      * internally, creating ~256 MiB contexts on each. Clean them up.
+      * Skip devices that had failed load attempts — their context is corrupted. */
+#ifdef HAVE_CUDA
+    if (gpu_loaded && final_gpu_idx >= 0) {
+        gpu_release_unused_devices_skip(final_gpu_idx, failed_gpus, n_failed);
     }
+#endif
 
     return true;
 }
@@ -787,6 +899,7 @@ WhisperClient* whisper_client_create(void) {
     strncpy(client->language, "auto", sizeof(client->language) - 1);
     client->language[sizeof(client->language) - 1] = '\0';
     client->error_message[0] = '\0';
+    client->gpu_fallback_message[0] = '\0';
     client->error_code = 0;
     atomic_store(&client->cancel_requested, 0);
 
@@ -1339,6 +1452,18 @@ const char* whisper_client_get_error(WhisperClient* client) {
     if (!client) return "No client";
     pthread_mutex_lock(&client->mutex);
     snprintf(local_buffer, sizeof(local_buffer), "%s", client->error_message);
+    pthread_mutex_unlock(&client->mutex);
+    return local_buffer[0] != '\0' ? local_buffer : "";
+}
+
+/* ===================================================================
+ * Public API: whisper_client_get_gpu_fallback_message
+ * =================================================================== */
+const char* whisper_client_get_gpu_fallback_message(WhisperClient* client) {
+    static __thread char local_buffer[512] = {0};
+    if (!client) return "";
+    pthread_mutex_lock(&client->mutex);
+    snprintf(local_buffer, sizeof(local_buffer), "%s", client->gpu_fallback_message);
     pthread_mutex_unlock(&client->mutex);
     return local_buffer[0] != '\0' ? local_buffer : "";
 }

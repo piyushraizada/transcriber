@@ -313,6 +313,20 @@ void whisper_response_free(WhisperResponse* response);
 const char* whisper_client_get_error(WhisperClient* client);
 
 /**
+ * Get GPU fallback information from the last model load attempt.
+ *
+ * When a CUDA model fails to load on the configured GPU due to insufficient
+ * VRAM, this function returns a human-readable message describing which GPU
+ * was used instead (or that CPU was selected as a final fallback). The
+ * message is cleared on each new successful model load with no fallback.
+ *
+ * @param client Pointer to a valid WhisperClient. Must not be NULL.
+ * @return A null-terminated string containing the fallback info, or an
+ *         empty string if no GPU fallback occurred.
+ */
+const char* whisper_client_get_gpu_fallback_message(WhisperClient* client);
+
+/**
  * Request graceful cancellation of an in-flight transcription request.
  *
  * This function sets an atomic cancellation flag that is checked during

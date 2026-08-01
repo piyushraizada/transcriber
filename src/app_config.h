@@ -137,11 +137,18 @@ typedef struct _AppConfig {
                                        ///< Empty string "" is treated as "auto".
                                        ///< @see CFG-007: Language
 
-   /* Debug Settings */
-   bool debug_logs;                ///< Enable verbose (DEBUG-level) logging to stderr.
-                                      ///< When false, only INFO and above are shown on stderr.
-                                      ///< File log (/tmp/transcriber.log) always captures all levels.
-                                      ///< Default: false.
+    /* Debug Settings */
+    bool debug_logs;                ///< Enable verbose (DEBUG-level) logging to stderr.
+                                       ///< When false, only INFO and above are shown on stderr.
+                                       ///< File log (/tmp/transcriber.log) always captures all levels.
+                                       ///< Default: false.
+
+    /* Audio Processing Settings */
+    bool noise_suppression;         ///< Enable RNNoise-based background noise suppression.
+                                       ///< Removes stationary noise (fans, AC hum) before passing
+                                       ///< audio to Whisper. Works at 16kHz via internal resampling
+                                       ///< to/from RNNoise's native 48kHz processing rate.
+                                       ///< Default: true.
 
 } AppConfig;
 
@@ -587,6 +594,24 @@ void config_set_debug_logs(AppConfig* config, bool enabled);
  * @return true if debug logging is enabled, false otherwise.
  */
 bool config_get_debug_logs(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6.8: Noise Suppression Configuration Accessors
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Set whether RNNoise-based noise suppression is enabled.
+ * @param config   Pointer to AppConfig. Must not be NULL.
+ * @param enabled  true = enable noise suppression, false = disable.
+ */
+void config_set_noise_suppression(AppConfig* config, bool enabled);
+
+/**
+ * Get the current noise suppression state.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @return true if noise suppression is enabled, false otherwise.
+ */
+bool config_get_noise_suppression(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

@@ -260,6 +260,11 @@ void config_set_defaults(AppConfig* config)
     /* Debug logging — disabled by default */
     config->debug_logs = false;
 
+    /* Noise suppression — disabled by default. RNNoise at 16kHz via linear
+     * upsample/downsample introduces artifacts that can degrade speech quality.
+     * Enable only if background noise is a problem and test with your setup. */
+    config->noise_suppression = false;
+
     set_error(NULL);
 }
 
@@ -514,6 +519,12 @@ bool config_load_from_path(AppConfig* config, const char* path)
         config->debug_logs = cJSON_IsTrue(item);
     }
 
+    /* Noise suppression */
+    item = cJSON_GetObjectItemCaseSensitive(root, "noise_suppression");
+    if (item && cJSON_IsBool(item)) {
+        config->noise_suppression = cJSON_IsTrue(item);
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -602,6 +613,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
 
     /* Debug logging */
     cJSON_AddBoolToObject(root, "debug_logs", config->debug_logs);
+
+    /* Noise suppression */
+    cJSON_AddBoolToObject(root, "noise_suppression", config->noise_suppression);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -980,4 +994,20 @@ bool config_get_debug_logs(const AppConfig* config)
 {
     if (!config) return false;
     return config->debug_logs;
+}
+
+/* ----------------------------------------------------------------
+ * Noise suppression configuration accessors
+ * ---------------------------------------------------------------- */
+
+void config_set_noise_suppression(AppConfig* config, bool enabled)
+{
+    if (!config) return;
+    config->noise_suppression = enabled;
+}
+
+bool config_get_noise_suppression(const AppConfig* config)
+{
+    if (!config) return true;  /* Default: enabled */
+    return config->noise_suppression;
 }

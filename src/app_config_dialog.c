@@ -54,6 +54,7 @@ struct _ConfigDialog {
     GtkComboBox   *vad_silence_combo;
     GtkSpinButton *min_segment_spin;
     GtkCheckButton *continuous_dictation_checkbox;
+    GtkCheckButton *noise_suppression_checkbox;
     GtkCheckButton *debug_logs_checkbox;
     GtkLabel *model_path_error;
     GtkLabel *duration_error;
@@ -367,6 +368,8 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         (float)gtk_spin_button_get_value(dlg->min_segment_spin));
     config_set_continuous_dictation(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox)));
+    config_set_noise_suppression(dlg->config,
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->noise_suppression_checkbox)));
     config_set_debug_logs(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->debug_logs_checkbox)));
     /* Save Language */
@@ -1187,6 +1190,13 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->continuous_dictation_checkbox),
                                      config_get_continuous_dictation(config));
         gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->continuous_dictation_checkbox), FALSE, FALSE, 0);
+
+        // Noise suppression checkbox
+        dlg->noise_suppression_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(
+            "Noise suppression (remove background noise)"));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dlg->noise_suppression_checkbox),
+                                     config_get_noise_suppression(config));
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->noise_suppression_checkbox), FALSE, FALSE, 0);
 
         // Debug logs checkbox
         dlg->debug_logs_checkbox = GTK_CHECK_BUTTON(gtk_check_button_new_with_label(

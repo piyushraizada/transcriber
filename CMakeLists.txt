@@ -91,6 +91,23 @@ if(NOT APPINDICATOR_FOUND)
     message(FATAL_ERROR "ayatana-appindicator3-0.1 or libappindicator3-0.1 is required for system tray icon support")
 endif()
 
+# RNNoise — Neural network-based noise suppression library (Xiph.Org)
+# Provides real-time removal of stationary background noise (fans, AC hum)
+# before passing audio to Whisper for transcription.
+# Licensed under BSD-3-Clause. Processes 480-sample frames at 48kHz;
+# our wrapper handles 16kHz↔48kHz resampling transparently.
+FetchContent_Declare(
+    rnnoise
+    GIT_REPOSITORY https://github.com/xiph/rnnoise.git
+    GIT_TAG        v0.2
+    GIT_SHALLOW    ON
+)
+# Use Populate only (not MakeAvailable) since RNNoise uses autotools, not CMake.
+FetchContent_Populate(rnnoise)
+
+message(STATUS "RNNoise source dir: ${rnnoise_SOURCE_DIR}")
+set(RNNOISE_SOURCE_DIR "${rnnoise_SOURCE_DIR}")
+
 # Source files
 set(SOURCES
     src/app_controller.c
@@ -109,6 +126,21 @@ set(SOURCES
     src/app_vad.c
     src/app_ring_buffer.c
     src/app_silence_scanner.c
+    src/app_noisereduction.c
+)
+
+# Append RNNoise library sources (inline, not as separate target — avoids CMake conflicts)
+list(APPEND SOURCES
+    ${RNNOISE_SOURCE_DIR}/src/celt_lpc.c
+    ${RNNOISE_SOURCE_DIR}/src/kiss_fft.c
+    ${RNNOISE_SOURCE_DIR}/src/denoise.c
+    ${RNNOISE_SOURCE_DIR}/src/nnet.c
+    ${RNNOISE_SOURCE_DIR}/src/nnet_default.c
+    ${RNNOISE_SOURCE_DIR}/src/pitch.c
+    ${RNNOISE_SOURCE_DIR}/src/rnn.c
+    ${RNNOISE_SOURCE_DIR}/src/rnnoise_tables.c
+    ${RNNOISE_SOURCE_DIR}/src/parse_lpcnet_weights.c
+    ${RNNOISE_SOURCE_DIR}/src/rnnoise_data_little.c
 )
 
 # Determine the install prefix for assets directory
@@ -127,6 +159,12 @@ set(WEBRTC_VAD_SOURCES
     third_party/webrtc_vad/vad_sp.c
     third_party/webrtc_vad/signal_processing_library.c
 )
+
+# RNNoise — Neural network-based noise suppression library (Xiph.Org)
+# Provides real-time removal of stationary background noise (fans, AC hum)
+# before passing audio to Whisper for transcription.
+# Licensed under BSD-3-Clause. Processes 480-sample frames at 48kHz;
+# our wrapper handles 16kHz↔48kHz resampling transparently.
 
 # Embed XPM assets as static C data for GdkPixbuf loading
 # Each .xpm file is a valid C source defining: static const char *NAME_XPM[] = { ... };
@@ -148,6 +186,9 @@ target_include_directories(transcriber PRIVATE
     ${whisper_SOURCE_DIR}/examples
     # WebRTC VAD headers
     third_party/webrtc_vad/include
+    # RNNoise headers
+    ${RNNOISE_SOURCE_DIR}/include
+    ${RNNOISE_SOURCE_DIR}/src
 )
 
 # 2. ADD LINK LIBRARIES

@@ -167,6 +167,48 @@ bool gpu_release_unused_devices(int used_device_idx)
     return true;
 }
 
+bool gpu_release_unused_devices_skip(int used_device_idx, int *skip_devices, int skip_count)
+{
+    if (used_device_idx < 0) return false;
+
+#ifndef HAVE_CUDA
+    return false;
+#endif
+
+    int device_count = 0;
+    if (!gpu_get_device_count(&device_count)) {
+        return false;
+    }
+
+    for (int i = 0; i < device_count; i++) {
+        /* Skip the active device */
+        if (i == used_device_idx) continue;
+
+        /* Skip devices that had failed load attempts — their CUDA context is in
+         * an undefined state and resetting it causes crashes on subsequent queries. */
+        bool should_skip = false;
+        for (int s = 0; s < skip_count; s++) {
+            if (skip_devices[s] == i) { should_skip = true; break; }
+        }
+        if (should_skip) continue;
+
+        cudaSetDevice(i);
+        cudaError_t err = cudaDeviceReset();
+        if (err != cudaSuccess) {
+            g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+                    "[gpu] cudaDeviceReset(%d) failed: %s\n",
+                    i, cudaGetErrorString(err));
+        } else {
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG,
+                    "[gpu] Released CUDA context on device %d\n", i);
+        }
+    }
+
+    /* Ensure the used device is the current one */
+    cudaSetDevice(used_device_idx);
+    return true;
+}
+
 bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
 {
     if (!best_device_idx) return false;

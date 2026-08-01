@@ -26,6 +26,7 @@
 #include "app_audio.h"
 #include "app.h"  /* For UNUSED macro */
 #include "app_config.h"
+#include "app_noisereduction.h"
 #include "app_vad.h"
 #include "app_ring_buffer.h"
 
@@ -61,6 +62,14 @@ static void scrub_memory(void *ptr, size_t len) {
 
 /* RIFF WAV header size */
 #define WAV_HEADER_SIZE 44
+
+/* Noise suppression native capture configuration.
+ * RNNoise processes 480-sample frames at 48kHz; the denoised output is
+ * decimated to 160 samples at 16kHz, matching the pipeline format. */
+#define NS_CAPTURE_RATE   48000u
+#define NS_IN_FRAME       480
+#define NS_OUT_FRAME      160
+#define NS_CARRY_MAX      (NS_IN_FRAME + NS_IN_FRAME)  /* one full read + leftover */
 
 /* File-scope error string — protected by mutex for thread safety */
 static char g_audio_error[512] = {0};
@@ -213,6 +222,21 @@ struct _AudioRecorder {
 
     /* In-memory ring buffer for continuous transcription (replaces WAV file) */
     AudioRingBuffer *ring_buffer;    ///< Ring buffer, created on start
+
+    /* Noise suppression via RNNoise */
+    bool noise_suppression_enabled;  ///< Whether to apply noise suppression during capture
+    NoiseReductionHandle *ns_handle; ///< RNNoise state handle (owned by recorder)
+
+    /* Capture parameters — differ from `format` when NS is enabled, because
+     * RNNoise processes natively at 48kHz. `format` always describes the
+     * 16kHz output written to the WAV file and ring buffer. */
+    unsigned int capture_rate;              ///< Device sample rate actually requested
+    snd_pcm_uframes_t capture_buffer_size;  ///< Frames per ALSA read
+
+    /* Partial-frame assembly for 48kHz -> 16kHz downsampling */
+    int16_t *ns_carry;    ///< Leftover 48kHz samples carried between reads
+    size_t ns_carry_len;  ///< Valid samples in ns_carry
+    int16_t *ns_out;      ///< 160-sample 16kHz output per RNNoise frame
 };
 
 /* ===================================================================
@@ -223,9 +247,9 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
     int err;
     snd_pcm_t *pcm;
     snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
-    unsigned int rate = rec->format.sample_rate;
+    unsigned int rate = rec->capture_rate;
     unsigned int channels = rec->format.channels;
-    snd_pcm_uframes_t buffer_size = rec->format.buffer_size;
+    snd_pcm_uframes_t buffer_size = rec->capture_buffer_size;
 
     err = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
@@ -294,11 +318,11 @@ static bool try_alsa_device(AudioRecorder *rec, const char *device_name) {
         return false;
     }
 
-    /* Validate that the actual rate matches requested 16kHz.
+    /* Validate that the actual rate matches the requested capture rate.
      * Mismatched rates produce distorted audio. */
-    if (actual_rate != 16000) {
-        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "[audio] Device '%s' provides %u Hz instead of 16000 Hz — skipping\n",
-                device_name, actual_rate);
+    if (actual_rate != rec->capture_rate) {
+        g_log("app-audio", G_LOG_LEVEL_MESSAGE, "[audio] Device '%s' provides %u Hz instead of %u Hz — skipping\n",
+                device_name, actual_rate, rec->capture_rate);
         snd_pcm_close(pcm);
         return false;
     }
@@ -347,6 +371,18 @@ AudioRecorder *audio_recorder_create(const AudioFormat *format) {
     /* Ring buffer initialized to NULL — created on start */
     recorder->ring_buffer = NULL;
 
+    /* Noise suppression initialized to NULL — created on start if enabled */
+    recorder->noise_suppression_enabled = false;
+    recorder->ns_handle = NULL;
+    recorder->ns_carry = NULL;
+    recorder->ns_carry_len = 0;
+    recorder->ns_out = NULL;
+
+    /* Capture rate matches output format until audio_recorder_start()
+     * overrides it to 48kHz when noise suppression is enabled. */
+    recorder->capture_rate = recorder->format.sample_rate;
+    recorder->capture_buffer_size = recorder->format.buffer_size;
+
     return recorder;
 }
 
@@ -384,6 +420,14 @@ void audio_recorder_destroy(AudioRecorder *recorder) {
         recorder->ring_buffer = NULL;
     }
 
+    /* Destroy noise suppression handle if it was created */
+    if (recorder->ns_handle) {
+        noise_reduction_destroy(recorder->ns_handle);
+        recorder->ns_handle = NULL;
+    }
+    g_clear_pointer(&recorder->ns_carry, g_free);
+    g_clear_pointer(&recorder->ns_out, g_free);
+
     scrub_memory(recorder->wav_path, sizeof(recorder->wav_path));
     scrub_memory(recorder->device, sizeof(recorder->device));
 
@@ -409,6 +453,13 @@ const char *audio_recorder_get_device(const AudioRecorder *recorder) {
     return recorder->device;
 }
 
+void audio_recorder_set_noise_suppression(AudioRecorder *recorder, bool enabled) {
+    if (!recorder) return;
+    pthread_mutex_lock(&recorder->mutex);
+    recorder->noise_suppression_enabled = enabled;
+    pthread_mutex_unlock(&recorder->mutex);
+}
+
 /* ===================================================================
  * Capture thread
  * =================================================================== */
@@ -416,7 +467,7 @@ const char *audio_recorder_get_device(const AudioRecorder *recorder) {
 static void *capture_thread_func(void *arg) {
     AudioRecorder *recorder = (AudioRecorder *)arg;
     gsize bytes_per_frame = recorder->format.channels * (recorder->format.bits_per_sample / 8);
-    gsize buffer_bytes = recorder->format.buffer_size * bytes_per_frame;
+    gsize buffer_bytes = recorder->capture_buffer_size * bytes_per_frame;
 
     guchar *buffer = g_malloc(buffer_bytes);
     if (!buffer) {
@@ -482,7 +533,7 @@ static void *capture_thread_func(void *arg) {
 
     /* Use atomic load for the stop flag check */
     while (!atomic_load(&recorder->stop_flag)) {
-        err = snd_pcm_readi(recorder->alsa_pcm, buffer, recorder->format.buffer_size);
+        err = snd_pcm_readi(recorder->alsa_pcm, buffer, recorder->capture_buffer_size);
         if (err == -EPIPE) {
             snd_pcm_prepare(recorder->alsa_pcm);
             continue;  /* Loop will check stop_flag at while() condition */
@@ -496,52 +547,111 @@ static void *capture_thread_func(void *arg) {
             continue;
         }
 
-        gsize bytes_written_count = (gsize)err * bytes_per_frame;
-        size_t written = fwrite(buffer, 1, (size_t)bytes_written_count, recorder->wav_file);
-        if (written != (size_t)bytes_written_count) {
-            set_audio_error("Failed to write audio data to WAV file");
-            break;
-        }
-        /* Protect wav_data_size with mutex for portable thread safety. */
-        pthread_mutex_lock(&recorder->mutex);
-        recorder->wav_data_size += (size_t)bytes_written_count;
-        pthread_mutex_unlock(&recorder->mutex);
-        total_frames += (gsize)err;
-
-        /* Calculate RMS volume level from PCM samples (16-bit signed) */
-        {
-            double sum_squares = 0.0;
-            int16_t *samples = (int16_t *)buffer;
+        if (recorder->ns_handle && recorder->ns_carry && recorder->ns_out) {
+            /* ---- Noise suppression path: 48kHz capture, 16kHz output ----
+             * Accumulate raw 48kHz frames in the carry buffer, feed complete
+             * 480-sample RNNoise frames, and write the 160-sample 16kHz
+             * output to the WAV file and ring buffer. */
             int num_samples = err * recorder->format.channels;
-            for (int i = 0; i < num_samples; i++) {
-                double val = (double)samples[i];
-                sum_squares += val * val;
+            memcpy(recorder->ns_carry + recorder->ns_carry_len, buffer,
+                   (size_t)num_samples * sizeof(int16_t));
+            recorder->ns_carry_len += (size_t)num_samples;
+
+            size_t consumed = 0;
+            while (recorder->ns_carry_len - consumed >= NS_IN_FRAME) {
+                noise_reduction_process_frame(recorder->ns_handle,
+                                              recorder->ns_carry + consumed,
+                                              recorder->ns_out,
+                                              NS_IN_FRAME);
+
+                gsize bytes_written_count = NS_OUT_FRAME * bytes_per_frame;
+                size_t written = fwrite(recorder->ns_out, 1, (size_t)bytes_written_count,
+                                        recorder->wav_file);
+                if (written != (size_t)bytes_written_count) {
+                    set_audio_error("Failed to write audio data to WAV file");
+                    goto cleanup_alsa;
+                }
+                pthread_mutex_lock(&recorder->mutex);
+                recorder->wav_data_size += (size_t)bytes_written_count;
+                pthread_mutex_unlock(&recorder->mutex);
+                total_frames += NS_OUT_FRAME;
+
+                /* Calculate RMS volume level from the denoised 16kHz samples */
+                double sum_squares = 0.0;
+                for (size_t i = 0; i < NS_OUT_FRAME; i++) {
+                    double val = (double)recorder->ns_out[i];
+                    sum_squares += val * val;
+                }
+                double rms = sqrt(sum_squares / (double)NS_OUT_FRAME);
+                double normalized = rms / 32768.0;
+                if (normalized > 1.0) normalized = 1.0;
+                pthread_mutex_lock(&recorder->volume_mutex);
+                recorder->rms_volume = normalized;
+                pthread_mutex_unlock(&recorder->volume_mutex);
+
+                /* Write denoised 16kHz samples to the ring buffer */
+                if (recorder->ring_buffer) {
+                    ring_buffer_write(recorder->ring_buffer, recorder->ns_out, NS_OUT_FRAME);
+                }
+
+                consumed += NS_IN_FRAME;
             }
-            double rms = (num_samples > 0) ? sqrt(sum_squares / num_samples) : 0.0;
-            /* Normalize to 0.0-1.0 range (full scale for int16 is 32768) */
-            double normalized = rms / 32768.0;
-            if (normalized > 1.0) normalized = 1.0;
-            pthread_mutex_lock(&recorder->volume_mutex);
-            recorder->rms_volume = normalized;
-            pthread_mutex_unlock(&recorder->volume_mutex);
-        }
 
-        /* Write all frames to ring buffer unconditionally.
-         * In continuous mode the silence scanner handles segment detection.
-         * Thread safety: recorder->ring_buffer is set once during
-         * audio_recorder_start() before pthread_create() returns, and is
-         * never modified during recording. The pthread_create() call provides
-         * a happens-before guarantee, ensuring the capture thread sees the
-         * initialized ring_buffer pointer without additional synchronization. */
-        if (recorder->ring_buffer) {
-            int num_samples = err * recorder->format.channels;
-            int16_t *samples = (int16_t *)buffer;
-            ring_buffer_write(recorder->ring_buffer, samples, (size_t)num_samples);
+            /* Keep the leftover (< 480 samples) for the next read */
+            memmove(recorder->ns_carry, recorder->ns_carry + consumed,
+                    (recorder->ns_carry_len - consumed) * sizeof(int16_t));
+            recorder->ns_carry_len -= consumed;
+        } else {
+            /* ---- No noise suppression: 16kHz passthrough (unchanged) ---- */
+
+            gsize bytes_written_count = (gsize)err * bytes_per_frame;
+            size_t written = fwrite(buffer, 1, (size_t)bytes_written_count, recorder->wav_file);
+            if (written != (size_t)bytes_written_count) {
+                set_audio_error("Failed to write audio data to WAV file");
+                break;
+            }
+            /* Protect wav_data_size with mutex for portable thread safety. */
+            pthread_mutex_lock(&recorder->mutex);
+            recorder->wav_data_size += (size_t)bytes_written_count;
+            pthread_mutex_unlock(&recorder->mutex);
+            total_frames += (gsize)err;
+
+            /* Calculate RMS volume level from PCM samples (16-bit signed) */
+            {
+                double sum_squares = 0.0;
+                int16_t *samples = (int16_t *)buffer;
+                int num_samples = err * recorder->format.channels;
+                for (int i = 0; i < num_samples; i++) {
+                    double val = (double)samples[i];
+                    sum_squares += val * val;
+                }
+                double rms = (num_samples > 0) ? sqrt(sum_squares / num_samples) : 0.0;
+                /* Normalize to 0.0-1.0 range (full scale for int16 is 32768) */
+                double normalized = rms / 32768.0;
+                if (normalized > 1.0) normalized = 1.0;
+                pthread_mutex_lock(&recorder->volume_mutex);
+                recorder->rms_volume = normalized;
+                pthread_mutex_unlock(&recorder->volume_mutex);
+            }
+
+            /* Write all frames to ring buffer unconditionally.
+             * In continuous mode the silence scanner handles segment detection.
+             * Thread safety: recorder->ring_buffer is set once during
+             * audio_recorder_start() before pthread_create() returns, and is
+             * never modified during recording. The pthread_create() call provides
+             * a happens-before guarantee, ensuring the capture thread sees the
+             * initialized ring_buffer pointer without additional synchronization. */
+            if (recorder->ring_buffer) {
+                int num_samples = err * recorder->format.channels;
+                int16_t *samples = (int16_t *)buffer;
+                ring_buffer_write(recorder->ring_buffer, samples, (size_t)num_samples);
+            }
         }
 
         iteration++;
     }
 
+cleanup_alsa:
     /* Cleanup ALSA under mutex to prevent race with audio_recorder_destroy().
       * Without the lock, destroy() could close alsa_pcm concurrently while this
       * thread is also closing it, causing double-close and potential crashes. */
@@ -671,6 +781,45 @@ bool audio_recorder_start(AudioRecorder *recorder) {
         /* Reset the ring buffer from any previous recording session to prevent
          * stale audio data from being transcribed. */
         ring_buffer_reset(recorder->ring_buffer);
+    }
+
+    /* Create noise suppression handle if enabled for this session.
+     * Destroy any leftover handle from a previous session first. */
+    if (recorder->ns_handle) {
+        noise_reduction_destroy(recorder->ns_handle);
+        recorder->ns_handle = NULL;
+    }
+    if (recorder->noise_suppression_enabled) {
+        recorder->ns_handle = noise_reduction_create(NS_CAPTURE_RATE);
+        if (!recorder->ns_handle) {
+            g_log("app-audio", G_LOG_LEVEL_WARNING,
+                  "[audio] Failed to create noise suppression handle — disabling\n");
+        } else {
+            g_log("app-audio", G_LOG_LEVEL_DEBUG,
+                  "[audio] Noise suppression enabled (RNNoise @ 48kHz -> 16kHz)\n");
+        }
+    }
+
+    /* Configure capture parameters and buffers.
+     * With noise suppression the device runs at RNNoise's native 48kHz and
+     * the capture thread downsamples each frame to 16kHz. Without it the
+     * device runs at the pipeline rate (16kHz) — a passthrough path. */
+    if (recorder->ns_handle) {
+        recorder->capture_rate = NS_CAPTURE_RATE;
+        recorder->capture_buffer_size = NS_IN_FRAME;
+        if (!recorder->ns_carry) {
+            recorder->ns_carry = g_new(int16_t, NS_CARRY_MAX);
+        }
+        if (!recorder->ns_out) {
+            recorder->ns_out = g_new(int16_t, NS_OUT_FRAME);
+        }
+        recorder->ns_carry_len = 0;
+    } else {
+        recorder->capture_rate = recorder->format.sample_rate;
+        recorder->capture_buffer_size = recorder->format.buffer_size;
+        g_clear_pointer(&recorder->ns_carry, g_free);
+        g_clear_pointer(&recorder->ns_out, g_free);
+        recorder->ns_carry_len = 0;
     }
 
     g_log("app-audio", G_LOG_LEVEL_DEBUG,
