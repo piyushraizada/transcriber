@@ -48,3 +48,16 @@ plans/
 
 # AI agent instructions (local-only, not for source control)
 AGENTS.md
+
+# Local tooling and MCP configuration
+.config/
+.playwright-mcp/
+.roo/
+.zoo/
+
+# Chat exports and local notes
+teams-chat-export/
+
+# Empty placeholder directories
+design/
+docs/

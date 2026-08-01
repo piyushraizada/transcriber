@@ -1027,13 +1027,27 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
         pthread_mutex_unlock(&client->mutex);
         strncpy(response->error_message, "Failed to read WAV file", sizeof(response->error_message) - 1);
         response->error_code = WHISPER_ERR_WAV_READ_FAIL;
+        g_free(samples);
         ctx_unref(client);
         return response;
     }
 
-    // Perform transcription with context ref held
-    response = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, samples, n_samples);
+    // Perform transcription with context ref held.
+    // Use a local variable to receive the result from transcribe_with_context(),
+    // then copy the data into our original 'response' struct to avoid leaking
+    // the initial allocation when overwriting the pointer.
+    WhisperResponse *result = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, samples, n_samples);
     g_free(samples);
+
+    if (result) {
+        response->success = result->success;
+        response->error_code = result->error_code;
+        memcpy(response->error_message, result->error_message, sizeof(response->error_message));
+        // Steal the text pointer so we don't duplicate it
+        response->text = result->text;
+        result->text = NULL;  // Prevent whisper_response_free from double-freeing
+        whisper_response_free(result);
+    }
 
     // Release context reference
     ctx_unref(client);
@@ -1045,8 +1059,8 @@ WhisperResponse* whisper_transcribe(WhisperClient* client, const char* wav_path)
  * Public API: whisper_transcribe_samples (in-memory, no WAV file)
  * =================================================================== */
 WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
-                                             const int16_t *samples,
-                                             int n_samples) {
+                                              const int16_t *samples,
+                                              int n_samples) {
     WhisperResponse *response = g_new0(WhisperResponse, 1);
     if (!response) return NULL;
 
@@ -1113,9 +1127,22 @@ WhisperResponse* whisper_transcribe_samples(WhisperClient* client,
         float_samples[i] = (float)samples[i] / 32768.0f;
     }
 
-    // Perform transcription with context ref held
-    response = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, float_samples, n_samples);
+    // Perform transcription with context ref held.
+    // Use a local variable to receive the result from transcribe_with_context(),
+    // then copy the data into our original 'response' struct to avoid leaking
+    // the initial allocation when overwriting the pointer.
+    WhisperResponse *result = transcribe_with_context(client, ctx, n_threads_cfg, lang, gpu_device, float_samples, n_samples);
     g_free(float_samples);
+
+    if (result) {
+        response->success = result->success;
+        response->error_code = result->error_code;
+        memcpy(response->error_message, result->error_message, sizeof(response->error_message));
+        // Steal the text pointer so we don't duplicate it
+        response->text = result->text;
+        result->text = NULL;  // Prevent whisper_response_free from double-freeing
+        whisper_response_free(result);
+    }
 
     // Release context reference
     ctx_unref(client);
