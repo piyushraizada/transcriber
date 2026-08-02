@@ -132,6 +132,7 @@ struct _MainWindow {
     GtkLabel *countdown_label;
     GtkLevelBar *volume_level_bar;
     GtkDrawingArea *indicator_area;
+    GtkLabel *version_label;
     AppConfig *config;
     AppStateController *controller;
     WhisperClient *whisper_client;
@@ -777,7 +778,7 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     }
 
     /* Set window properties */
-    gtk_window_set_title(win->window, "Transcriber " APP_VERSION);
+    gtk_window_set_title(win->window, "Transcriber");
     gtk_window_set_resizable(win->window, FALSE);
     gtk_window_set_type_hint(win->window, GDK_WINDOW_TYPE_HINT_NORMAL);
 
@@ -812,6 +813,16 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     gtk_overlay_add_overlay(overlay, GTK_WIDGET(win->animation_area));
     gtk_widget_hide(GTK_WIDGET(win->animation_area));  // Hide until STATE_LISTENING
     gtk_box_pack_start(win->main_box, GTK_WIDGET(overlay), TRUE, TRUE, TRUE);
+
+    /* Version label row — positioned above the status bar, right-aligned */
+    GtkBox *version_row = GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
+    gtk_widget_set_size_request(GTK_WIDGET(version_row), -1, 18);
+    GtkLabel *version_spacer = GTK_LABEL(gtk_label_new(""));
+    gtk_box_pack_start(version_row, GTK_WIDGET(version_spacer), TRUE, TRUE, 0);
+    win->version_label = GTK_LABEL(gtk_label_new(APP_VERSION));
+    gtk_widget_set_tooltip_text(GTK_WIDGET(win->version_label), "Version");
+    gtk_box_pack_start(version_row, GTK_WIDGET(win->version_label), FALSE, FALSE, 4);
+    gtk_box_pack_start(win->main_box, GTK_WIDGET(version_row), FALSE, FALSE, FALSE);
 
     /* Create the status bar */
     win->status_bar = GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));

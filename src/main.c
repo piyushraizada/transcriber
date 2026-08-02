@@ -1345,7 +1345,7 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
         if (app->text_window) {
             bool append_mode = app->controller.config
                 ? config_get_append_transcription_text(app->controller.config) : true;
-            if (!append_mode) {
+            if (!append_mode && !continuous) {
                 app_text_window_clear_text(app->text_window);
             }
             app_text_window_append_text(app->text_window, text_or_error);
