@@ -18,50 +18,102 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 
 ## Prerequisites
 
-The following packages are required to build Transcriber from source. Install them using your distribution's package manager.
+Transcriber depends on system libraries (hard requirements) and optional acceleration libraries that improve performance. CMake auto-detects all installed libraries and enables them automatically — no manual configuration flags are needed when they are present.
 
-### Debian / Ubuntu
+### Hard Requirements
 
+These packages **must** be installed before building. The build will fail without them.
+
+| Package | Purpose |
+|---------|---------|
+| **GCC / G++** (≥9) or Clang | C/C++ compiler toolchain |
+| **CMake** (≥3.16) | Build system |
+| **pkg-config** | Dependency discovery |
+| **GTK3** (≥3.20) | UI framework (includes GLib, GDK, GIO/GDBus) |
+| **ALSA** (≥1.1.0) | Audio capture from microphone |
+| **cJSON** (≥1.7.14) | JSON configuration file parsing |
+| **OpenBLAS** | CPU matrix operation acceleration for whisper.cpp inference |
+| **libayatana-appindicator3** or **libappindicator3** | System tray icon support |
+| **Git** | Downloads whisper.cpp and RNNoise sources during build |
+
+#### Install Commands
+
+**Debian / Ubuntu:**
 ```bash
 sudo apt-get install build-essential cmake pkg-config \
     libgtk-3-dev libasound2-dev \
-    libcjson-dev libayatana-appindicator3-dev \
+    libcjson-dev libopenblas-dev libayatana-appindicator3-dev \
     git
 ```
 
-### Fedora / RHEL
-
+**Fedora / RHEL:**
 ```bash
 sudo dnf install gcc gcc-c++ cmake pkgconf-pkg-config \
     gtk3-devel alsa-lib-devel \
-    cjson-devel libayatana-appindicator3-devel \
+    cjson-devel openblas-devel libayatana-appindicator3-devel \
     git
 ```
 
-### Arch Linux
-
+**Arch Linux:**
 ```bash
 sudo pacman -S base-devel cmake pkgconf \
-    gtk3 alsa-lib cjson libayatana-appindicator \
+    gtk3 alsa-lib cjson openblas libayatana-appindicator \
     git
 ```
 
-### Optional: GPU Acceleration
+### Optional: Performance Acceleration Libraries
 
-For NVIDIA GPU acceleration, install the CUDA toolkit:
+These packages are **not required** for a successful build. CMake detects them and enables acceleration automatically when present. Install any or all of these to improve transcription speed.
 
+| Package | When Needed | Impact | Source |
+|---------|-------------|--------|--------|
+| **CUDA toolkit** | NVIDIA GPU available — single or multi-GPU | Major: 5–10× faster transcription on GPU vs CPU | [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) |
+| **cuBLAS** (included with CUDA) | Any CUDA build — used automatically for matrix multiply ops on GPU | Included in CUDA toolkit; no separate install needed | Bundled with CUDA |
+| **NCCL** | Multiple NVIDIA GPUs — enables cross-GPU communication for parallel inference | Only useful with 2+ GPUs; ignored on single-GPU systems | [NVIDIA NCCL](https://developer.nvidia.com/nccl) |
+| **OpenMP** | Multi-threaded CPU inference | Usually included with GCC/Clang; no extra install needed | Bundled with compiler |
+
+> **Note:** whisper.cpp v1.9.1 uses cuBLAS (not cuDNN) for GPU matrix operations. cuDNN is not supported and will not be used even if installed.
+
+#### Install Commands
+
+**Debian / Ubuntu — CUDA + NCCL:**
 ```bash
-# Debian / Ubuntu
+# CUDA toolkit (includes cuBLAS automatically)
 sudo apt-get install nvidia-cuda-toolkit
 
-# Fedora
-sudo dnf install cuda-toolkit
-
-# Arch Linux
-sudo pacman -S cuda
+# NCCL for multi-GPU support (optional, only needed with 2+ GPUs)
+sudo apt-get install libnccl-dev
 ```
 
-If CUDA is not installed, the build will automatically fall back to CPU-only mode.
+**Fedora — CUDA + NCCL:**
+```bash
+sudo dnf install cuda-toolkit nccl-devel
+```
+
+**Arch Linux — CUDA + NCCL:**
+```bash
+sudo pacman -S cuda nccl
+```
+
+Without any optional acceleration libraries, CPU inference uses OpenBLAS for accelerated matrix operations (OpenBLAS is a hard requirement). CUDA and NCCL remain optional for GPU users.
+
+### Verifying Detection
+
+After running `cmake`, check the output to confirm which acceleration backends were detected:
+
+```bash
+mkdir build && cd build
+cmake ..
+```
+
+Look for these lines in the CMake output:
+
+- `"CUDA found (v...) - GPU acceleration enabled"` — CUDA/cuBLAS active ✅
+- `"Including BLAS backend"` — OpenBLAS/BLAS active ✅
+- `"OpenMP ... found"` — Multi-threaded CPU support ✅
+- `"NCCL: ...libnccl.so"` — Multi-GPU support ✅
+
+If a library you installed is not detected, verify the `-dev` package was installed (not just the runtime) and re-run `cmake` in a clean build directory.
 
 ## Building from Source
 
@@ -107,7 +159,6 @@ You can also download any GGML/GGUF Whisper model manually and configure its pat
 | Option | Default | Description |
 |--------|---------|-------------|
 | `DOWNLOAD_DEFAULT_MODEL` | `OFF` | Create the `download-default-model` target (downloads model to `~/.cache/whisper/`) |
-| `ENABLE_BLAS` | `ON` | Enable BLAS/OpenBLAS acceleration for whisper.cpp CPU inference |
 | `ENABLE_ASAN` | `OFF` | Enable AddressSanitizer for memory error detection |
 | `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer for data race detection |
 | `ENABLE_LTO` | `OFF` | Enable Link Time Optimization for release builds |
@@ -212,7 +263,9 @@ Configure this command as a custom shortcut in your desktop environment's keyboa
 
 ### Log File
 
-All application logs are written to `/tmp/transcriber.log` on each startup (truncated at launch). Use this file to diagnose crashes, transcription failures, GPU initialization errors, or audio device issues. The log includes timestamps, severity levels, and module-specific tags for easy filtering:
+All application logs are written to `/tmp/transcriber.log` on each startup (truncated at launch). Use this file to diagnose crashes, transcription failures, GPU initialization errors, or audio device issues. The log includes timestamps, severity levels, and module-specific tags for easy filtering.
+
+`MESSAGE`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL` messages are always written. Verbose `DEBUG`-level messages are only written when the **Debug logs** option is enabled in Settings (or when `debug_logs` is set to `true` in `~/.config/transcriber/config.json`):
 
 ```bash
 # View the full log

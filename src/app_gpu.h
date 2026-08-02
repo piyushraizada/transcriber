@@ -48,6 +48,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,12 +67,31 @@ extern "C" {
 /*---------------------------------------------------------------------------
  * GPU Memory Thresholds
  *---------------------------------------------------------------------------
- * Minimum free VRAM (in bytes) to consider a GPU suitable for model loading.
- * Set to 2 GB as a conservative minimum — smaller models (tiny, base) need
- * about 1-1.5 GB, but we leave headroom for CUDA context overhead.
- * Used by both app_gpu.c and app_whisper.c for consistent threshold checking.
+ * Minimum free VRAM floor (in bytes) — absolute minimum to consider any GPU,
+ * regardless of model size. Covers CUDA context overhead (~300 MiB).
  */
-#define GPU_MIN_FREE_VRAM_BYTES ((size_t)(2UL * 1024 * 1024 * 1024))
+#define GPU_MIN_FREE_VRAM_FLOOR ((size_t)(512UL * 1024 * 1024))
+
+/* ---------------------------------------------------------------------------
+ * VRAM headroom padding for dynamic threshold calculation.
+ * Model file size on disk maps roughly 1:1 to runtime VRAM usage, with a
+ * flat 500 MiB overhead for CUDA context, KV cache, and internal buffers.
+ * The formula is: max(GPU_MIN_FREE_VRAM_FLOOR, model_size + 500 MiB)
+ */
+#define GPU_VRAM_HEADROOM_PADDING ((size_t)(500UL * 1024 * 1024))
+
+/**
+ * Calculate minimum free VRAM required for a given model file size.
+ * Returns the larger of: GPU_MIN_FREE_VRAM_FLOOR or
+ * (model_file_size + GPU_VRAM_HEADROOM_PADDING).
+ */
+static inline size_t gpu_min_vram_for_model(size_t model_file_bytes) {
+    size_t estimated = model_file_bytes + GPU_VRAM_HEADROOM_PADDING;
+    return (estimated > GPU_MIN_FREE_VRAM_FLOOR) ? estimated : GPU_MIN_FREE_VRAM_FLOOR;
+}
+
+/* Backward-compatible alias for code that still references the old name. */
+#define GPU_MIN_FREE_VRAM_BYTES GPU_MIN_FREE_VRAM_FLOOR
 
 /*---------------------------------------------------------------------------
  * Section 1: GPU Availability and Discovery

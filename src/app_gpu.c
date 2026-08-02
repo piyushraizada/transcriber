@@ -59,7 +59,7 @@ bool gpu_get_device_count(int *count_out)
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] cudaGetDeviceCount failed: %s\n",
+        g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] cudaGetDeviceCount failed: %s\n",
                 cudaGetErrorString(err));
         return false;
     }
@@ -78,7 +78,7 @@ bool gpu_get_device_name(int device_idx, char *name_out, size_t name_size)
     struct cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, device_idx);
     if (err != cudaSuccess) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] cudaGetDeviceProperties(%d) failed: %s\n",
+        g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] cudaGetDeviceProperties(%d) failed: %s\n",
                 device_idx, cudaGetErrorString(err));
         return false;
     }
@@ -105,7 +105,7 @@ bool gpu_get_memory_info(int device_idx, size_t *free_bytes, size_t *total_bytes
     /* Set target device */
     cudaError_t err = cudaSetDevice(device_idx);
     if (err != cudaSuccess) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] cudaSetDevice(%d) failed: %s\n",
+        g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] cudaSetDevice(%d) failed: %s\n",
                 device_idx, cudaGetErrorString(err));
         /* Restore original device */
         cudaSetDevice(current_device);
@@ -116,7 +116,7 @@ bool gpu_get_memory_info(int device_idx, size_t *free_bytes, size_t *total_bytes
     size_t free_mem = 0, total_mem = 0;
     err = cudaMemGetInfo(&free_mem, &total_mem);
     if (err != cudaSuccess) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] cudaMemGetInfo on device %d failed: %s\n",
+        g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] cudaMemGetInfo on device %d failed: %s\n",
                 device_idx, cudaGetErrorString(err));
         cudaSetDevice(current_device);
         return false;
@@ -152,7 +152,7 @@ bool gpu_release_unused_devices(int used_device_idx)
             cudaSetDevice(i);
             cudaError_t err = cudaDeviceReset();
             if (err != cudaSuccess) {
-                g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+                g_log("app-gpu", G_LOG_LEVEL_DEBUG,
                         "[gpu] cudaDeviceReset(%d) failed: %s\n",
                         i, cudaGetErrorString(err));
             } else {
@@ -195,7 +195,7 @@ bool gpu_release_unused_devices_skip(int used_device_idx, int *skip_devices, int
         cudaSetDevice(i);
         cudaError_t err = cudaDeviceReset();
         if (err != cudaSuccess) {
-            g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG,
                     "[gpu] cudaDeviceReset(%d) failed: %s\n",
                     i, cudaGetErrorString(err));
         } else {
@@ -215,12 +215,12 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
 
     int device_count = 0;
     if (!gpu_get_device_count(&device_count)) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] No CUDA devices available\n");
+        g_log("app-gpu", G_LOG_LEVEL_WARNING, "[gpu] No CUDA devices available\n");
         return false;
     }
 
     if (device_count == 0) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] No CUDA devices found\n");
+        g_log("app-gpu", G_LOG_LEVEL_WARNING, "[gpu] No CUDA devices found\n");
         return false;
     }
 
@@ -229,18 +229,26 @@ bool gpu_select_best_by_free_memory(int *best_device_idx, size_t *free_bytes)
 
     for (int i = 0; i < device_count; i++) {
         size_t free_mem = 0;
-        if (gpu_get_memory_info(i, &free_mem, NULL)) {
+        size_t total_mem = 0;
+        if (gpu_get_memory_info(i, &free_mem, &total_mem)) {
+            char dev_name[128] = "unknown";
+            gpu_get_device_name(i, dev_name, sizeof(dev_name));
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG,
+                  "[gpu] Device %d (%s): %.2f GiB free / %.2f GiB total",
+                  i, dev_name,
+                  (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+                  (double)total_mem / (1024.0 * 1024.0 * 1024.0));
             if (best_idx < 0 || free_mem > best_free) {
                 best_free = free_mem;
                 best_idx = i;
             }
         } else {
-            g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] Failed to query memory for device %d, skipping\n", i);
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] Failed to query memory for device %d, skipping\n", i);
         }
     }
 
     if (best_idx < 0) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] Failed to query memory for all devices\n");
+        g_log("app-gpu", G_LOG_LEVEL_WARNING, "[gpu] Failed to query memory for all devices\n");
         return false;
     }
 
@@ -275,6 +283,13 @@ bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes
     for (int i = 0; i < device_count; i++) {
         size_t free_mem = 0;
         if (gpu_get_memory_info(i, &free_mem, NULL)) {
+            char dev_name[128] = "unknown";
+            gpu_get_device_name(i, dev_name, sizeof(dev_name));
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG,
+                  "[gpu] Device %d (%s): %.2f GiB free (need >= %.2f GiB)",
+                  i, dev_name,
+                  (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+                  (double)min_free_bytes / (1024.0 * 1024.0 * 1024.0));
             if (free_mem >= min_free_bytes && (best_idx < 0 || free_mem > best_free)) {
                 best_free = free_mem;
                 best_idx = i;
@@ -283,7 +298,7 @@ bool gpu_select_with_min_free_memory(int *best_device_idx, size_t min_free_bytes
     }
 
     if (best_idx < 0) {
-        g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+        g_log("app-gpu", G_LOG_LEVEL_WARNING,
                 "[gpu] No GPU with >= %.1f GB free memory found",
                 (double)min_free_bytes / (1024.0 * 1024.0 * 1024.0));
         return false;
@@ -329,7 +344,7 @@ bool gpu_mode_parse(const char *mode_str, int *gpu_index_out)
 
         /* Validate: must be a non-negative integer with no trailing chars */
         if (endptr == num_str || *endptr != '\0' || val < 0) {
-            g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] Invalid GPU mode string: \"%s\"\n", mode_str);
+            g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] Invalid GPU mode string: \"%s\"\n", mode_str);
             return false;
         }
 
@@ -339,7 +354,7 @@ bool gpu_mode_parse(const char *mode_str, int *gpu_index_out)
         int device_count = 0;
         if (gpu_get_device_count(&device_count)) {
             if (device_idx >= device_count) {
-                g_log("app-gpu", G_LOG_LEVEL_MESSAGE,
+                g_log("app-gpu", G_LOG_LEVEL_DEBUG,
                         "[gpu] GPU %d requested but only %d device(s) available, falling back to CPU",
                         device_idx, device_count);
                 *gpu_index_out = GPU_INDEX_CPU_ONLY;
@@ -353,7 +368,7 @@ bool gpu_mode_parse(const char *mode_str, int *gpu_index_out)
         return true;
     }
 
-    g_log("app-gpu", G_LOG_LEVEL_MESSAGE, "[gpu] Unknown GPU mode string: \"%s\"\n", mode_str);
+    g_log("app-gpu", G_LOG_LEVEL_DEBUG, "[gpu] Unknown GPU mode string: \"%s\"\n", mode_str);
     return false;
 }
 

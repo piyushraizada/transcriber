@@ -99,45 +99,16 @@
 #include <sys/stat.h>
 
 /* ------------------------------------------------------------------ */
-/* File-based logging via GLib log handler                             */
+/* Logging via a unified GLib log handler (stderr + /tmp log file)    */
 /* ------------------------------------------------------------------ */
 
 /**
- * Global flag controlling whether DEBUG/MESSAGE levels are logged.
+ * Global flag controlling whether DEBUG-level logging is enabled.
  * Set to false by default; updated when the user toggles "Debug logs" in settings.
- * Both file and stderr log handlers check this flag to filter output consistently.
+ * The unified log handler checks this flag to filter output consistently.
+ * MESSAGE, INFO, WARNING, ERROR, and CRITICAL are always logged.
  */
 static bool g_debug_logs_enabled = false;
-
-/**
- * Stderr log handler — conditionally filters output based on debug_logs setting.
- * When debug_logs is false, only ERROR, CRITICAL, WARNING, and INFO are printed.
- * When debug_logs is true, all levels including DEBUG and MESSAGE pass through.
- */
-static void transcriber_stderr_log_handler(const gchar *log_domain,
-                                            GLogLevelFlags log_level,
-                                            const gchar *message,
-                                            gpointer user_data) {
-    (void)user_data;
-
-    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
-    if (!g_debug_logs_enabled &&
-        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
-        return;
-    }
-
-    const char *level;
-    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
-    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
-    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
-    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
-    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
-    else                                        level = "DEBUG";
-
-    fprintf(stderr, "[%s] %s: %s\n",
-            log_domain ? log_domain : "(null)",
-            level, message ? message : "(null)");
-}
 
 /**
  * List of all application-specific log domains for iterating.
@@ -149,30 +120,60 @@ static const char *LOG_DOMAINS[] = {
 #define LOG_DOMAINS_COUNT (sizeof(LOG_DOMAINS) / sizeof(LOG_DOMAINS[0]))
 
 /**
- * Flush and close the static log file handle opened by transcriber_file_log_handler().
+ * Flush and close the static log file handle opened by transcriber_log_handler().
  * Call this during application shutdown to release the file descriptor and ensure
  * all pending buffered data is written. Safe to call multiple times or before the
  * log handler has been invoked (no-op in both cases).
  */
 static FILE *g_log_file_handle = NULL;
 
-/* File-based log handler that writes g_log() messages to /tmp/transcriber.log.
- * Uses a module-level static FILE* so it can be explicitly closed during shutdown. */
-static void transcriber_file_log_handler(const gchar *log_domain,
-                                          GLogLevelFlags log_level,
-                                          const gchar *message,
-                                          gpointer user_data) {
+/* Whether the log file has already been truncated for this process. The file is
+ * truncated once ("w") on the first message; any later reopen (e.g., after
+ * close_log_file() runs during shutdown) appends ("a") so a session's log is
+ * never wiped by teardown-time logging. */
+static bool g_log_file_truncated = false;
+
+/* Unified log handler — writes every g_log() message to BOTH stderr and the
+ * log file /tmp/transcriber.log.
+ *
+ * IMPORTANT: only ONE handler may be registered per domain. GLib invokes only
+ * the last-registered handler for a domain, so registering separate file and
+ * stderr handlers would silently drop the earlier one. This single handler
+ * therefore performs both outputs itself.
+ *
+ * When debug_logs is false, only DEBUG-level messages are suppressed; when
+ * true, all levels including DEBUG pass through. */
+static void transcriber_log_handler(const gchar *log_domain,
+                                    GLogLevelFlags log_level,
+                                    const gchar *message,
+                                    gpointer user_data) {
     (void)user_data;
 
-    /* Filter out DEBUG/MESSAGE when debug logging is disabled */
-    if (!g_debug_logs_enabled &&
-        !(log_level & (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO))) {
+    /* Filter out DEBUG-level messages when debug logging is disabled */
+    if (!g_debug_logs_enabled && (log_level & G_LOG_LEVEL_DEBUG)) {
         return;
     }
 
+    /* Map log level flags to a short label */
+    const char *level;
+    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
+    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
+    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
+    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
+    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
+    else                                        level = "DEBUG";
+
+    /* Mirror to stderr (terminal) */
+    fprintf(stderr, "[%s] %s: %s\n",
+            log_domain ? log_domain : "(null)",
+            level, message ? message : "(null)");
+
+    /* Open the log file lazily on the first message that passes the filter */
     if (!g_log_file_handle) {
-        g_log_file_handle = fopen("/tmp/transcriber.log", "w");  /* Truncate on each startup */
+        g_log_file_handle = fopen("/tmp/transcriber.log",
+                                  g_log_file_truncated ? "a" : "w");
         if (!g_log_file_handle) return;
+        g_log_file_truncated = true;
         setlinebuf(g_log_file_handle);   /* Line-buffered so each message flushes immediately */
     }
 
@@ -185,15 +186,6 @@ static void transcriber_file_log_handler(const gchar *log_domain,
     } else {
         strcpy(time_str, "???");
     }
-
-    /* Map log level flags to a short label */
-    const char *level;
-    if (log_level & G_LOG_LEVEL_ERROR)       level = "ERROR";
-    else if (log_level & G_LOG_LEVEL_CRITICAL) level = "CRITICAL";
-    else if (log_level & G_LOG_LEVEL_WARNING)  level = "WARNING";
-    else if (log_level & G_LOG_LEVEL_MESSAGE)  level = "MESSAGE";
-    else if (log_level & G_LOG_LEVEL_INFO)     level = "INFO";
-    else                                        level = "DEBUG";
 
     /* Write: [timestamp] [level] domain: message */
     fprintf(g_log_file_handle, "[%s] [%s] %s: %s\n", time_str, level,
@@ -213,8 +205,10 @@ static void close_log_file(void) {
 }
 
 /**
- * Register log handlers for every domain used by our application.
- * Both file and stderr handlers filter based on the shared g_debug_logs_enabled flag.
+ * Register the log handler for every domain used by our application.
+ * Must be called exactly once: GLib invokes only the last-registered handler for
+ * a domain, so re-invoking this function would leave just the final registration
+ * active and silently drop messages.
  */
 static void register_all_log_handlers(AppConfig *config) {
     GLogLevelFlags mask =
@@ -224,8 +218,7 @@ static void register_all_log_handlers(AppConfig *config) {
     g_debug_logs_enabled = config ? config_get_debug_logs(config) : false;
 
     for (size_t i = 0; i < LOG_DOMAINS_COUNT; i++) {
-        g_log_set_handler(LOG_DOMAINS[i], mask, transcriber_file_log_handler, NULL);
-        g_log_set_handler(LOG_DOMAINS[i], mask, transcriber_stderr_log_handler, NULL);
+        g_log_set_handler(LOG_DOMAINS[i], mask, transcriber_log_handler, NULL);
     }
 }
 
@@ -2344,48 +2337,37 @@ int main(int argc, char *argv[]) {
         if (_truncate_log) fclose(_truncate_log);
     }
 
-    /* Install file-based log handlers BEFORE any subsystem initialization.
-     * Registers transcriber_file_log_handler for every domain used by the app
-     * so all g_log() messages are captured to /tmp/transcriber.log.
-     * Config is NULL here — stderr handler defaults to INFO+ only (no debug). */
+    /* Install the log handler BEFORE any subsystem initialization.
+     * Registers transcriber_log_handler for every domain used by the app so all
+     * g_log() messages are captured to /tmp/transcriber.log and stderr.
+     * Config is NULL here — debug logging is disabled until config is loaded. */
     register_all_log_handlers(NULL);
 
     /* Verify the log handler is active by writing a startup marker.
-     * This also ensures the static FILE* inside the handler has been opened,
-     * so we can safely reopen stderr into the same file below. */
-    g_log("main", G_LOG_LEVEL_MESSAGE, "[startup] Log handlers installed — /tmp/transcriber.log active\n");
+     * This also opens the static FILE* inside the handler on first use. */
+    g_log("main", G_LOG_LEVEL_INFO, "[startup] Log handlers installed — /tmp/transcriber.log active\n");
 
     /* Initialize GTK early so GIO/GDBus domains are registered before we set up
-     * catch-all log handlers and redirect stderr. If we register handlers or
-     * reopen stderr after gtk_init(), some GLib internal messages may have
-     * already been emitted to the original stderr and lost. */
+     * the catch-all default log handler below. If we set the default handler
+     * before gtk_init(), some GLib internal messages may have already been
+     * emitted to the original stderr and lost. */
     gtk_init(&argc, &argv);
 
-    /* Re-register all log handlers AFTER GTK init. This is critical because
-     * gtk_init() registers new GLib domains (GLib-GIO, GDBus, GVfs, etc.) that
-     * were not present before. Without this re-registration, messages from those
-     * domains fall through to the default stderr formatter and bypass our log file. */
-    register_all_log_handlers(NULL);
+    /* Do NOT re-register the per-domain handlers here — GLib invokes only the
+     * last-registered handler for a domain, so a second register_all_log_handlers()
+     * call would leave just the final registration active. The handler registered
+     * before gtk_init() remains valid; GTK-introduced domains (GLib-GIO, GDBus,
+     * GVfs, etc.) are covered by the catch-all default handler set below. */
+    g_log_set_default_handler(transcriber_log_handler, NULL);
 
-    /* Set the default GLib log handler as a catch-all for any domain we haven't
-     * explicitly registered (e.g., GModule, GIO modules). This ensures every
-     * g_log() message lands in the log file regardless of its domain name. */
-    g_log_set_default_handler(transcriber_file_log_handler, NULL);
-
-    /* Redirect stderr to append into /tmp/transcriber.log so that messages from
-     * libraries not using GLib logging (e.g., whisper.cpp via fprintf(stderr))
-     * are also captured in the same log file. The g_log handler above opened the
-     * file with "w" mode and wrote the startup marker, so reopening stderr with
-     * "a" mode appends after that marker without truncating. */
-    if (freopen("/tmp/transcriber.log", "a", stderr)) {
-        setlinebuf(stderr);  /* Line-buffered for immediate flushing */
-    }
+    /* Do NOT redirect stderr to the log file — that would bypass our filtered
+     * handlers and let DEBUG/MESSAGE leak through when debug is disabled.
+     * The file handler captures all GLib messages; whisper.cpp stderr output
+     * goes to actual stderr only (visible in terminal, not logged). */
 
     /* Set the default application icon name for icon theme resolution. */
     gtk_window_set_default_icon_name("redmic");
 
-    /* Enable whisper.cpp logging to stderr so it appears in /tmp/transcriber.log.
-     * This helps debug model loading failures and transcription errors. */
     // whisper_log_set(NULL, NULL);  // Previously suppressed — now enabled for debugging
 
     /* Create and initialize the application */
@@ -2408,11 +2390,13 @@ int main(int argc, char *argv[]) {
     /* Start the GTK main loop */
     gtk_main();
 
-    /* Flush log file before destroying the application to ensure final messages are written. */
-    close_log_file();
-
     /* Destroy the application and free all resources */
     app_destroy(app);
+
+    /* Flush and close the log file AFTER teardown so any shutdown-time messages
+     * append to the session log instead of truncating it (the handler reopens in
+     * append mode once the file has already been truncated this run). */
+    close_log_file();
 
     return 0;
 }

@@ -347,7 +347,11 @@ static bool load_model_internal(WhisperClient *client) {
         return false;
     }
 
-    // Determine GPU strategy
+    // Determine GPU strategy using dynamic VRAM threshold based on model size.
+    // The static 2 GB minimum was too conservative for small models (base/tiny ~700 MB).
+    // Now we calculate: max(512 MiB, model_size * 1.5 + 300 MiB) to match actual needs.
+    size_t min_vram = gpu_min_vram_for_model((size_t)st.st_size);
+
     bool try_gpu = false;
     int gpu_idx = client->gpu_index;
 
@@ -359,8 +363,7 @@ static bool load_model_internal(WhisperClient *client) {
         int best_gpu = -1;
         size_t free_mem = 0;
         if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
-            // Check if free memory meets minimum threshold (2 GB)
-            if (free_mem >= GPU_MIN_FREE_VRAM_BYTES) {
+            if (free_mem >= min_vram) {
                 try_gpu = true;
                 gpu_idx = best_gpu;
             } else {
@@ -380,7 +383,7 @@ static bool load_model_internal(WhisperClient *client) {
         int best_gpu = -1;
         size_t free_mem = 0;
         if (gpu_select_best_by_free_memory(&best_gpu, &free_mem)) {
-            if (free_mem >= GPU_MIN_FREE_VRAM_BYTES) {
+            if (free_mem >= min_vram) {
                 try_gpu = true;
                 gpu_idx = best_gpu;
             }
@@ -414,6 +417,13 @@ static bool load_model_internal(WhisperClient *client) {
             for (int i = 0; i < device_count && n_candidates < 16; i++) {
                 size_t free_mem = 0;
                 if (gpu_get_memory_info(i, &free_mem, NULL)) {
+                    char dev_name[128] = "unknown";
+                    gpu_get_device_name(i, dev_name, sizeof(dev_name));
+                    g_log("app-whisper", G_LOG_LEVEL_DEBUG,
+                          "[whisper] GPU candidate %d (%s): %.2f GiB free (threshold: %.2f GiB)",
+                          i, dev_name,
+                          (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+                          (double)min_vram / (1024.0 * 1024.0 * 1024.0));
                     candidates[n_candidates].idx = i;
                     candidates[n_candidates].free_mem = free_mem;
                     n_candidates++;

@@ -138,10 +138,11 @@ typedef struct _AppConfig {
                                        ///< @see CFG-007: Language
 
     /* Debug Settings */
-    bool debug_logs;                ///< Enable verbose (DEBUG-level) logging to stderr.
-                                       ///< When false, only INFO and above are shown on stderr.
-                                       ///< File log (/tmp/transcriber.log) always captures all levels.
-                                       ///< Default: false.
+    bool debug_logs;                ///< Enable verbose (DEBUG-level) logging.
+                                   ///< When false, DEBUG-level messages are suppressed on
+                                   ///< both stderr and the file log (/tmp/transcriber.log).
+                                   ///< MESSAGE, INFO, WARNING, ERROR, and CRITICAL are
+                                   ///< always logged. Default: false.
 
     /* Audio Processing Settings */
     bool noise_suppression;         ///< Enable RNNoise-based background noise suppression.

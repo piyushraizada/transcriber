@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(transcriber VERSION 2.1.1 LANGUAGES C CXX)
+project(transcriber VERSION 2.1.2 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -49,16 +49,15 @@ else()
     message(STATUS "CUDA not found - whisper.cpp will use CPU only")
 endif()
 # BLAS/OpenBLAS acceleration for whisper.cpp CPU inference.
-# Enabled by default for better CPU transcription performance.
-# Disable if you encounter build issues or prefer smaller binary size.
-option(ENABLE_BLAS "Enable BLAS/OpenBLAS acceleration for whisper.cpp" ON)
-if(ENABLE_BLAS)
-    set(WHISPER_OPENBLAS ON CACHE BOOL "Enable OpenBLAS if available" FORCE)
-    set(WHISPER_BLAS ON CACHE BOOL "Enable BLAS if available" FORCE)
-else()
-    set(WHISPER_OPENBLAS OFF CACHE BOOL "Disable OpenBLAS" FORCE)
-    set(WHISPER_BLAS OFF CACHE BOOL "Disable BLAS" FORCE)
-endif()
+# REQUIRED: OpenBLAS provides essential CPU matrix operation acceleration
+# for Whisper transcription performance. Builds will fail without it.
+pkg_check_modules(OPENBLAS REQUIRED openblas)
+
+# Force GGML_BLAS before FetchContent_MakeAvailable so whisper.cpp/ggml picks it up.
+set(GGML_BLAS ON CACHE BOOL "Use BLAS for GGML matrix operations" FORCE)
+# Legacy options kept for backward compatibility with older whisper.cpp versions
+set(WHISPER_OPENBLAS ON CACHE BOOL "Enable OpenBLAS if available" FORCE)
+set(WHISPER_BLAS ON CACHE BOOL "Enable BLAS if available" FORCE)
 set(WHISPER_SILERO_VAD OFF CACHE BOOL "Disable Silero VAD" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Static libs only" FORCE)
 FetchContent_MakeAvailable(whisper)
@@ -182,6 +181,7 @@ target_include_directories(transcriber PRIVATE
     ${GTK3_INCLUDE_DIRS}
     ${ALSA_INCLUDE_DIRS}
     ${CJSON_INCLUDE_DIRS}
+    ${OPENBLAS_INCLUDE_DIRS}
     ${APPINDICATOR_INCLUDE_DIRS}
     # whisper.cpp headers via FetchContent
     ${whisper_SOURCE_DIR}/include
@@ -200,6 +200,7 @@ target_link_libraries(transcriber PRIVATE
     ${CJSON_LIBRARIES}
     ${APPINDICATOR_LIBRARIES}
     whisper
+    ${OPENBLAS_LIBRARIES}
     pthread
     m
     X11
@@ -224,6 +225,7 @@ target_compile_definitions(transcriber PRIVATE
 target_compile_options(transcriber PRIVATE
     ${GTK3_CFLAGS_OTHER}
     ${ALSA_CFLAGS_OTHER}
+    ${OPENBLAS_CFLAGS_OTHER}
     ${APPINDICATOR_CFLAGS_OTHER}
 )
 
