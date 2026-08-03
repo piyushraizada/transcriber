@@ -23,12 +23,16 @@
  *                          (RGB 0.165, 0.655, 0.259) with a line width of
  *                          6.0 pixels and 70% opacity. Hidden during
  *                          STATE_IDLE and STATE_TRANSCRIBING.
- *   4. Countdown Timer  — GtkLabel in the center of the status bar that counts
+ *   4. Spinning Arrows Animation — 3 green arrows rotating in a circle on the
+ *                          animation overlay. Started when the user clicks the
+ *                          green mic to end recording; visible throughout
+ *                          STATE_TRANSCRIBING; stopped on STATE_IDLE (red mic).
+ *   5. Countdown Timer  — GtkLabel in the center of the status bar that counts
  *                          down from max_duration to 0 during STATE_LISTENING.
  *                          Hidden during all other states.
- *   5. Status Bar       — 16-pixel bar with gear button (left), countdown timer
+ *   6. Status Bar       — 16-pixel bar with gear button (left), countdown timer
  *                          (center), and connection indicator (right).
- *   6. Config Callback  — Invoked when the Configuration Dialog saves changes,
+ *   7. Config Callback  — Invoked when the Configuration Dialog saves changes,
  *                          allowing the main application to apply runtime config
  *                          updates (e.g., audio device selection).
  *
@@ -98,6 +102,23 @@
 /* TextWindow offset below MainWindow */
 #define TEXT_WINDOW_OFFSET_Y 10
 
+/* Spinning arrows animation */
+#define ARROW_COUNT 3
+#define ARROW_ROTATION_INCREMENT 0.2  /* ~12° per tick for smooth rotation */
+/* Arrowhead size tied to the line width so the head extends only ~10%
+ * beyond the arrow thickness: total extent 2 * ARROW_HEAD_SIZE =
+ * WAVE_LINE_WIDTH * 1.1. */
+#define ARROW_HEAD_SIZE (WAVE_LINE_WIDTH * 0.55)
+#define ARROW_SWEEP_ANGLE (M_PI / 3.0) /* 60° arc per arrow segment */
+#define ARROW_COLOR_A 1.0             /* Fully opaque so the arrows read as
+                                       * bright green, not washed-out gray */
+
+/* M_PI is not guaranteed by <math.h> under strict POSIX (_POSIX_C_SOURCE),
+ * so provide a constant fallback here rather than inside the draw loop. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Internal structures                                                 */
 /* ------------------------------------------------------------------ */
@@ -163,6 +184,12 @@ struct _MainWindow {
     /* Config changed callback — invoked when config dialog saves */
     void (*on_config_changed)(void *user_data);
     void *config_changed_user_data;
+    /* Spinning arrows animation — "transcribing" indicator. Started when the
+     * user clicks the green mic to end recording; runs throughout
+     * STATE_TRANSCRIBING; stopped when returning to STATE_IDLE (red mic). */
+    bool spinning_arrows_visible;
+    double arrow_rotation_angle;
+    guint arrows_animation_source_id;
 };
 
 /**
@@ -200,6 +227,10 @@ static void start_checking_blink(MainWindow *win);
 static void stop_checking_blink(MainWindow *win);
 static gboolean countdown_tick(gpointer user_data);
 static GdkPixbuf *get_cached_icon(MainWindow *win, const char *icon_name);
+
+/* Spinning arrows animation */
+static void draw_spinning_arrows(cairo_t *cr, int width, int height, double rotation_angle);
+static gboolean spinning_arrows_tick(gpointer user_data);
 
 /* TextWindow helpers */
 static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data);
@@ -405,12 +436,150 @@ static gboolean animation_tick(gpointer user_data) {
     return TRUE; /* Continue the timer */
 }
 
+/* ------------------------------------------------------------------ */
+/* Spinning arrows animation                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Draw 3 arrows spinning in a circle on the animation area.
+ * Each arrow is drawn as an arc segment (~60°) with an arrowhead triangle.
+ *
+ * @param cr             Cairo context
+ * @param width          Drawing area width
+ * @param height         Drawing area height
+ * @param rotation_angle Current rotation angle in radians
+ */
+static void draw_spinning_arrows(cairo_t *cr, int width, int height, double rotation_angle) {
+    /* Center of the drawing area. The animation area is sized to the mic icon
+     * (icon_width x icon_height), so `height` equals the mic height. */
+    double center_x = width / 2.0;
+    double center_y = height / 2.0;
+
+    /* The circle diameter is 2/3 of the mic height, so radius = height / 3. */
+    double radius = height / 3.0;
+
+    /* Bright, fully opaque green so the arrows read as green, not gray. The
+     * line width stays WAVE_LINE_WIDTH so the arcs match the sine wave. */
+    cairo_set_source_rgba(cr, WAVE_COLOR_R, WAVE_COLOR_G, WAVE_COLOR_B, ARROW_COLOR_A);
+    cairo_set_line_width(cr, WAVE_LINE_WIDTH);
+
+    /* Draw 3 arrows equally spaced (120° apart) */
+    for (int i = 0; i < ARROW_COUNT; i++) {
+        double base_angle = rotation_angle + (M_PI * 2.0 / ARROW_COUNT) * i;
+        double start_angle = base_angle - ARROW_SWEEP_ANGLE / 2.0;
+        double end_angle = base_angle + ARROW_SWEEP_ANGLE / 2.0;
+
+        /* Move to start of arc */
+        cairo_move_to(cr, center_x + radius * cos(start_angle),
+                      center_y + radius * sin(start_angle));
+
+        /* Draw the arc */
+        cairo_arc(cr, center_x, center_y, radius, start_angle, end_angle);
+        cairo_stroke(cr);
+
+        /* Draw arrowhead triangle */
+        cairo_save(cr);
+        cairo_translate(cr, center_x + radius * cos(end_angle),
+                        center_y + radius * sin(end_angle));
+        cairo_rotate(cr, -end_angle);
+
+        /* Draw triangle pointing in direction of rotation. Sized to the line
+         * width so it stays small (extends ~10% beyond the arrow thickness). */
+        double arrow_size = ARROW_HEAD_SIZE;
+        cairo_move_to(cr, 0, -arrow_size);
+        cairo_line_to(cr, -arrow_size, arrow_size);
+        cairo_line_to(cr, arrow_size, arrow_size);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+        cairo_restore(cr);
+    }
+}
+
+/**
+ * Timer callback for the spinning arrows animation.
+ * Increments the rotation angle and queues a redraw.
+ */
+static gboolean spinning_arrows_tick(gpointer user_data) {
+    MainWindow *win = (MainWindow *)user_data;
+    win->arrow_rotation_angle += ARROW_ROTATION_INCREMENT;
+    gtk_widget_queue_draw(GTK_WIDGET(win->animation_area));
+    return TRUE; /* Continue the timer */
+}
+
+void app_window_start_spinning_arrows(MainWindow *win) {
+    if (!win) return;
+
+    /* Don't start if already running */
+    if (win->arrows_animation_source_id != 0) {
+        g_log("app_window", G_LOG_LEVEL_DEBUG,
+              "[arrows] start_spinning_arrows: already running (id=%u)\n",
+              win->arrows_animation_source_id);
+        return;
+    }
+
+    /* Stop sine wave animation if running */
+    app_window_stop_animation(win);
+
+    /* Show the animation area if hidden */
+    gtk_widget_show(GTK_WIDGET(win->animation_area));
+
+    /* Enable spinning arrows */
+    win->spinning_arrows_visible = TRUE;
+    win->arrow_rotation_angle = 0.0;
+
+    /* Start arrows timer */
+    win->arrows_animation_source_id = g_timeout_add(ANIMATION_INTERVAL_MS,
+                                                    spinning_arrows_tick,
+                                                    win);
+    g_log("app_window", G_LOG_LEVEL_DEBUG,
+          "[arrows] start_spinning_arrows: started (id=%u)\n",
+          win->arrows_animation_source_id);
+
+    /* Queue an immediate first-frame draw so the arrows appear right away
+     * instead of waiting for the first 33 ms timer tick. Without this, fast
+     * transcription (small model, short recording) can complete before the
+     * timer fires and the animation is never rendered. */
+    gtk_widget_queue_draw(GTK_WIDGET(win->animation_area));
+}
+
+void app_window_stop_spinning_arrows(MainWindow *win) {
+    if (!win) return;
+
+    /* Stop arrows timer if running */
+    if (win->arrows_animation_source_id != 0) {
+        g_source_remove(win->arrows_animation_source_id);
+        win->arrows_animation_source_id = 0;
+        g_log("app_window", G_LOG_LEVEL_DEBUG,
+              "[arrows] stop_spinning_arrows: stopped timer\n");
+    } else {
+        g_log("app_window", G_LOG_LEVEL_DEBUG,
+              "[arrows] stop_spinning_arrows: no timer running\n");
+    }
+
+    /* Disable spinning arrows */
+    win->spinning_arrows_visible = FALSE;
+
+    /* Queue a redraw to clear the area */
+    gtk_widget_queue_draw(GTK_WIDGET(win->animation_area));
+}
+
 /**
  * Draw callback for the animation drawing area.
- * Renders the sine wave using Cairo.
+ * Renders the sine wave (LISTENING) or the spinning arrows (TRANSCRIBING).
  */
 static void on_animation_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     MainWindow *win = (MainWindow *)user_data;
+
+    /* Draw the spinning arrows when active (shown during transcription) */
+    if (win->spinning_arrows_visible) {
+        int width = gtk_widget_get_allocated_width(widget);
+        int height = gtk_widget_get_allocated_height(widget);
+
+        if (width > 0 && height > 0) {
+            draw_spinning_arrows(cr, width, height, win->arrow_rotation_angle);
+        }
+        return;
+    }
 
     /* Only draw the sine wave when animation is actively running */
     if (win->animation_source_id == 0) {
@@ -906,6 +1075,7 @@ void app_window_destroy(MainWindow *win) {
 
     /* Stop animations */
     app_window_stop_animation(win);
+    app_window_stop_spinning_arrows(win);
     stop_checking_blink(win);
 
     /* Destroy the GTK window */
@@ -944,6 +1114,7 @@ void app_window_set_state(MainWindow *win, AppState state) {
             { GdkPixbuf *icon = get_cached_icon(win, "redmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
             app_window_stop_animation(win);
+            app_window_stop_spinning_arrows(win);
             app_window_stop_countdown(win);
             gtk_widget_hide(GTK_WIDGET(win->volume_level_bar));
             gtk_level_bar_set_value(win->volume_level_bar, 0.0);
@@ -953,6 +1124,8 @@ void app_window_set_state(MainWindow *win, AppState state) {
             /* Update taskbar icon to green mic (cached) */
             { GdkPixbuf *icon = get_cached_icon(win, "greenmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
+            /* The sine wave takes over the animation area, so stop the arrows. */
+            app_window_stop_spinning_arrows(win);
             gtk_widget_show(GTK_WIDGET(win->animation_area));
             gtk_widget_show(GTK_WIDGET(win->volume_level_bar));
             app_window_start_animation(win);
@@ -963,8 +1136,12 @@ void app_window_set_state(MainWindow *win, AppState state) {
             /* Update taskbar icon to green mic (cached) */
             { GdkPixbuf *icon = get_cached_icon(win, "greenmic.xpm");
               if (icon) { gtk_window_set_icon(win->window, icon); g_object_unref(icon); } }
-            app_window_stop_animation(win);
-            gtk_widget_hide(GTK_WIDGET(win->animation_area));
+            /* The spinning arrows were started by the mic click and remain visible
+             * for the whole transcription; they are stopped when the app returns
+             * to STATE_IDLE (red mic). start_spinning_arrows is a no-op if the
+             * arrows are already running, and stops any sine wave animation. */
+            app_window_start_spinning_arrows(win);
+            gtk_widget_show(GTK_WIDGET(win->animation_area));
             gtk_widget_hide(GTK_WIDGET(win->volume_level_bar));
             app_window_stop_countdown(win);
             break;

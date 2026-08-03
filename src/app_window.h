@@ -303,6 +303,35 @@ void app_window_start_animation(MainWindow *win);
  */
 void app_window_stop_animation(MainWindow *win);
 
+/* app_window_start_spinning_arrows — Start the spinning arrows animation.
+ *
+ * Shows 3 green arrows rotating in a circle on the animation overlay as a
+ * "transcribing" indicator. Called when the user clicks the green mic icon to
+ * end recording; the arrows stay visible for the whole of STATE_TRANSCRIBING
+ * and are stopped when the app returns to STATE_IDLE (red mic).
+ *
+ * Stops the sine wave animation first. If the arrows are already running,
+ * this is a no-op.
+ *
+ * Parameters:
+ *   win — The MainWindow handle.
+ *
+ * SRS: FR-012, UI-021
+ */
+void app_window_start_spinning_arrows(MainWindow *win);
+
+/* app_window_stop_spinning_arrows — Stop the spinning arrows animation.
+ *
+ * Destroys the GLib timeout source and disables the arrows so the animation
+ * area is cleared. If no arrows are running, this is a no-op.
+ *
+ * Parameters:
+ *   win — The MainWindow handle.
+ *
+ * SRS: FR-013, UI-022
+ */
+void app_window_stop_spinning_arrows(MainWindow *win);
+
 /* app_window_start_countdown — Start the recording countdown timer.
  *
  * Reads max_duration from the AppConfig and starts a 1-second interval

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(transcriber VERSION 2.1.3 LANGUAGES C CXX)
+project(transcriber VERSION 2.1.4 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -1798,6 +1798,16 @@ static void on_microphone_toggle(void *user_data) {
         }
     }
 
+    /* When the user clicks the green mic in LISTENING state to end recording,
+     * show the spinning-arrows "transcribing" animation. It remains visible
+     * through STATE_TRANSCRIBING and is stopped when the app returns to IDLE
+     * (red mic). */
+    if (current == STATE_LISTENING && app->main_window) {
+        g_log("main", G_LOG_LEVEL_DEBUG,
+              "[flow] Mic clicked in LISTENING — starting spinning arrows\n");
+        app_window_start_spinning_arrows(app->main_window);
+    }
+
     /* Toggle the state — on_state_change callback will handle the actual work.
       * If we reach here, either:
       * 1. Model was already loaded (normal fast path)
