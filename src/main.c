@@ -1673,10 +1673,13 @@ static void on_microphone_toggle(void *user_data) {
             const char *configured_device = config_get_audio_device(app->controller.config);
             bool device_valid = false;
 
-            /* "default" is always valid — ALSA will use the system default */
-            if (configured_device && g_strcmp0(configured_device, "default") == 0) {
+            /* "default" (or empty string) is always valid — ALSA will use the
+             * system default. The settings dialog stores an empty string when
+             * the user selects "Default (system microphone)". */
+            if (!configured_device || configured_device[0] == '\0' ||
+                g_strcmp0(configured_device, "default") == 0) {
                 device_valid = true;
-            } else if (configured_device && configured_device[0] != '\0') {
+            } else {
                 /* Check if the configured device exists in the available device list */
                 AudioDeviceList *devices = audio_recorder_get_device_list(app->audio_recorder, false);
                 if (devices) {
