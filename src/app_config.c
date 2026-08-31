@@ -265,6 +265,19 @@ void config_set_defaults(AppConfig* config)
      * Enable only if background noise is a problem and test with your setup. */
     config->noise_suppression = false;
 
+    /* ASR backend — default to in-process Whisper (no behavior change for
+     * existing users). The llama backend fields carry sensible local
+     * defaults for a llama-server running on this host. */
+    strncpy(config->asr_backend, "whisper", sizeof(config->asr_backend) - 1);
+    config->asr_backend[sizeof(config->asr_backend) - 1] = '\0';
+
+    strncpy(config->llama_server_url, "http://127.0.0.1:8005",
+            sizeof(config->llama_server_url) - 1);
+    config->llama_server_url[sizeof(config->llama_server_url) - 1] = '\0';
+
+    strncpy(config->llama_model, "gemma-4-12b", sizeof(config->llama_model) - 1);
+    config->llama_model[sizeof(config->llama_model) - 1] = '\0';
+
     set_error(NULL);
 }
 
@@ -525,6 +538,50 @@ bool config_load_from_path(AppConfig* config, const char* path)
         config->noise_suppression = cJSON_IsTrue(item);
     }
 
+    /* ASR backend — accept only known values, keep default otherwise.
+     * Missing key (pre-feature config file) silently keeps the default. */
+    item = cJSON_GetObjectItemCaseSensitive(root, "asr_backend");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        const char *backend = item->valuestring;
+        if (strcmp(backend, "whisper") == 0 || strcmp(backend, "llama") == 0) {
+            strncpy(config->asr_backend, backend, sizeof(config->asr_backend) - 1);
+            config->asr_backend[sizeof(config->asr_backend) - 1] = '\0';
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE,
+                  "[config] Invalid asr_backend \"%s\", using default (whisper)\n", backend);
+        }
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "llama_server_url");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        const char *url = item->valuestring;
+        if (strlen(url) < sizeof(config->llama_server_url) &&
+            (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0)) {
+            strncpy(config->llama_server_url, url, sizeof(config->llama_server_url) - 1);
+            config->llama_server_url[sizeof(config->llama_server_url) - 1] = '\0';
+            /* Normalize away trailing slashes */
+            size_t url_len = strlen(config->llama_server_url);
+            while (url_len > 0 && config->llama_server_url[url_len - 1] == '/') {
+                config->llama_server_url[--url_len] = '\0';
+            }
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE,
+                  "[config] Invalid llama_server_url \"%s\", using default\n", url);
+        }
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "llama_model");
+    if (item && cJSON_IsString(item) && item->valuestring) {
+        const char *model = item->valuestring;
+        if (model[0] != '\0' && strlen(model) < sizeof(config->llama_model)) {
+            strncpy(config->llama_model, model, sizeof(config->llama_model) - 1);
+            config->llama_model[sizeof(config->llama_model) - 1] = '\0';
+        } else {
+            g_log("app-config", G_LOG_LEVEL_MESSAGE,
+                  "[config] Invalid llama_model \"%s\", using default\n", model);
+        }
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -616,6 +673,11 @@ bool config_save_to_path(const AppConfig* config, const char* path)
 
     /* Noise suppression */
     cJSON_AddBoolToObject(root, "noise_suppression", config->noise_suppression);
+
+    /* ASR backend */
+    cJSON_AddStringToObject(root, "asr_backend", config->asr_backend);
+    cJSON_AddStringToObject(root, "llama_server_url", config->llama_server_url);
+    cJSON_AddStringToObject(root, "llama_model", config->llama_model);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -756,6 +818,26 @@ bool config_validate(const AppConfig* config)
     if (!gpu_mode_validate(config->gpu_mode)) {
         set_error("Invalid GPU mode");
         return false;
+    }
+
+    /* Validate asr_backend — must be a known value */
+    if (strcmp(config->asr_backend, "whisper") != 0 &&
+        strcmp(config->asr_backend, "llama") != 0) {
+        set_error("Invalid asr_backend (must be \"whisper\" or \"llama\")");
+        return false;
+    }
+
+    /* Validate llama backend fields — only meaningful when selected */
+    if (strcmp(config->asr_backend, "llama") == 0) {
+        if (strncmp(config->llama_server_url, "http://", 7) != 0 &&
+            strncmp(config->llama_server_url, "https://", 8) != 0) {
+            set_error("llama_server_url must start with http:// or https://");
+            return false;
+        }
+        if (config->llama_model[0] == '\0') {
+            set_error("llama_model is empty");
+            return false;
+        }
     }
 
     set_error(NULL);
@@ -1010,4 +1092,75 @@ bool config_get_noise_suppression(const AppConfig* config)
 {
     if (!config) return true;  /* Default: enabled */
     return config->noise_suppression;
+}
+
+/* ----------------------------------------------------------------
+ * ASR backend configuration accessors
+ * ---------------------------------------------------------------- */
+
+bool config_set_asr_backend(AppConfig* config, const char* backend)
+{
+    if (!config || !backend) {
+        set_error("NULL parameter");
+        return false;
+    }
+    if (strcmp(backend, "whisper") != 0 && strcmp(backend, "llama") != 0) {
+        set_error("Invalid ASR backend (must be \"whisper\" or \"llama\")");
+        return false;
+    }
+    snprintf(config->asr_backend, sizeof(config->asr_backend), "%s", backend);
+    return true;
+}
+
+const char* config_get_asr_backend(const AppConfig* config)
+{
+    if (!config) return "whisper";
+    return config->asr_backend;
+}
+
+bool config_set_llama_server_url(AppConfig* config, const char* url)
+{
+    if (!config) {
+        set_error("NULL config");
+        return false;
+    }
+    if (!url || url[0] == '\0' ||
+        strlen(url) >= sizeof(config->llama_server_url) ||
+        (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)) {
+        set_error("Invalid llama_server_url (must be non-empty http(s):// URL)");
+        return false;
+    }
+    snprintf(config->llama_server_url, sizeof(config->llama_server_url), "%s", url);
+    /* Normalize away trailing slashes */
+    size_t len = strlen(config->llama_server_url);
+    while (len > 0 && config->llama_server_url[len - 1] == '/') {
+        config->llama_server_url[--len] = '\0';
+    }
+    return true;
+}
+
+const char* config_get_llama_server_url(const AppConfig* config)
+{
+    if (!config) return "";
+    return config->llama_server_url;
+}
+
+bool config_set_llama_model(AppConfig* config, const char* model)
+{
+    if (!config || !model) {
+        set_error("NULL parameter");
+        return false;
+    }
+    if (model[0] == '\0' || strlen(model) >= sizeof(config->llama_model)) {
+        set_error("Invalid llama_model (must be non-empty)");
+        return false;
+    }
+    snprintf(config->llama_model, sizeof(config->llama_model), "%s", model);
+    return true;
+}
+
+const char* config_get_llama_model(const AppConfig* config)
+{
+    if (!config) return "";
+    return config->llama_model;
 }

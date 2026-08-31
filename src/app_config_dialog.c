@@ -17,6 +17,7 @@
 #include "app_config.h"
 #include "app_audio.h"
 #include "app_whisper.h"
+#include "app_llama.h"
 #include "app_model_info.h"
 #include "app_gpu.h"
 
@@ -35,12 +36,48 @@
  * Internal dialog state
  * =================================================================== */
 
+/* ASR backend combo indices (kept in sync with the entries appended in
+ * config_dialog_show; the stored config value is derived from the index). */
+enum {
+    BACKEND_COMBO_WHISPER = 0,
+    BACKEND_COMBO_LLAMA   = 1
+};
+
+/* Context for the async "Test Connection" check.
+ *
+ * Ownership: allocated by the button handler (owned by the dialog while the
+ * worker thread is starting), then handed to the main loop via
+ * g_idle_add_full() — from that point the idle source owns it and its
+ * destroy-notify frees it. The worker thread's LAST action is registering
+ * the idle source, so the close path (which joins the thread before
+ * touching ctx) can always cancel a still-pending source by ctx->idle_id.
+ * The idle callback clears dlg->backend_test_ctx when it delivers, so the
+ * close path can distinguish "delivered" (ctx already freed) from
+ * "pending" (ctx still owned by the main loop).
+ */
+typedef struct {
+    ConfigDialog *dlg;
+    LlamaClient *client;      /* throwaway client; destroyed by the worker */
+    bool ok;
+    char error[256];
+    guint idle_id;            /* written by the worker, read after join */
+} BackendTestCtx;
+
 struct _ConfigDialog {
     GtkDialog *dialog;
     AppConfig *config;
+    /* ASR backend selection */
+    GtkComboBox *backend_combo;
+    GtkEntry *llama_url_entry;
+    GtkEntry *llama_model_entry;
+    GtkButton *backend_test_button;
+    GtkLabel *backend_test_status;
+    GThread *backend_test_thread;   /* non-NULL while a connectivity check runs */
+    BackendTestCtx *backend_test_ctx; /* pending check result (see above) */
     /* Widgets */
     GtkEntry *model_path_entry;
     GtkButton *model_browse_button;
+    GtkLabel *model_path_label;
     GtkLabel *model_info_label;
     GtkComboBox *device_combo;
     GtkComboBox *language_combo;
@@ -305,12 +342,44 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
         config_dialog_clear_error(dlg->duration_error);
     }
 
+    /* Validate llama-server settings when the llama backend is selected.
+     * The Whisper model path above is validated unconditionally: it is the
+     * automatic fallback target for the llama backend. */
+    int backend_idx = gtk_combo_box_get_active(dlg->backend_combo);
+    bool llama_backend = (backend_idx == BACKEND_COMBO_LLAMA);
+    if (llama_backend) {
+        const char *llama_url = gtk_entry_get_text(dlg->llama_url_entry);
+        const char *llama_alias = gtk_entry_get_text(dlg->llama_model_entry);
+        bool url_ok = llama_url && llama_url[0] != '\0' &&
+            (g_str_has_prefix(llama_url, "http://") ||
+             g_str_has_prefix(llama_url, "https://"));
+        if (!url_ok) {
+            gtk_label_set_markup(dlg->backend_test_status,
+                "<span foreground='red'>Server URL must start with http:// or https://</span>");
+            valid = FALSE;
+        }
+        if (!llama_alias || llama_alias[0] == '\0') {
+            gtk_label_set_markup(dlg->backend_test_status,
+                "<span foreground='red'>Model alias must not be empty</span>");
+            valid = FALSE;
+        }
+    }
+
     if (!valid) {
         return;  /* Keep dialog open */
     }
 
     /* Apply values to config */
     config_set_model_path(dlg->config, model_path);
+
+    /* Apply ASR backend selection + llama-server settings */
+    config_set_asr_backend(dlg->config, llama_backend ? "llama" : "whisper");
+    if (llama_backend) {
+        config_set_llama_server_url(dlg->config,
+                                    gtk_entry_get_text(dlg->llama_url_entry));
+        config_set_llama_model(dlg->config,
+                               gtk_entry_get_text(dlg->llama_model_entry));
+    }
 
     /* Get selected audio device — column 0 = display name, column 1 = device name */
     GtkTreeIter device_iter;
@@ -644,6 +713,136 @@ static void on_copy_hotkey_clicked(GtkButton *button, ConfigDialog *dlg) {
  * @param config AppConfig struct to edit
  * @return true if user clicked Save, false if Cancel
  */
+/* ===================================================================
+ * ASR Backend (llama-server) — connectivity test + visibility wiring
+ * =================================================================== */
+
+static void backend_test_ctx_free(gpointer user_data) {
+    g_free(user_data);
+}
+
+/* GTK main thread: deliver the connectivity-test result to the widgets. */
+static gboolean backend_test_idle(gpointer user_data) {
+    BackendTestCtx *ctx = (BackendTestCtx *)user_data;
+    ConfigDialog *dlg = ctx->dlg;
+
+    /* Clear the "pending" pointer BEFORE touching widgets: once it is
+     * NULL the close path knows the ctx has already been freed. */
+    if (dlg->backend_test_ctx == ctx) {
+        dlg->backend_test_ctx = NULL;
+    }
+    dlg->backend_test_thread = NULL;
+
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->backend_test_button), TRUE);
+    gtk_button_set_label(dlg->backend_test_button, "Test Connection");
+
+    if (ctx->ok) {
+        gtk_label_set_markup(dlg->backend_test_status,
+            "<span foreground='green'>Server reachable</span>");
+    } else {
+        /* The error text comes from an external source — escape it. */
+        gchar *escaped = g_markup_escape_text(ctx->error[0] ? ctx->error
+                                                            : "unknown error", -1);
+        gchar *markup = g_strdup_printf(
+            "<span foreground='red'>%s</span>", escaped);
+        gtk_label_set_markup(dlg->backend_test_status, markup);
+        g_free(escaped);
+        g_free(markup);
+    }
+    return FALSE;  /* One-shot; destroy-notify frees the ctx */
+}
+
+/* Worker thread: run the (blocking) health check, then marshal the
+ * result back to the GTK main thread. The LAST action is registering the
+ * idle source — the close path relies on that join ordering. */
+static gpointer backend_test_thread_func(gpointer user_data) {
+    BackendTestCtx *ctx = (BackendTestCtx *)user_data;
+
+    ctx->ok = llama_check_connection(ctx->client);
+    if (!ctx->ok) {
+        const char *err = llama_client_get_error(ctx->client);
+        if (err && err[0] != '\0') {
+            strncpy(ctx->error, err, sizeof(ctx->error) - 1);
+            ctx->error[sizeof(ctx->error) - 1] = '\0';
+        } else {
+            strcpy(ctx->error, "unknown error");
+        }
+    }
+    llama_client_destroy(ctx->client);
+    ctx->client = NULL;
+
+    ctx->idle_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                                   backend_test_idle, ctx,
+                                   backend_test_ctx_free);
+    return NULL;
+}
+
+static void on_backend_test_clicked(GtkButton *button, ConfigDialog *dlg) {
+    if (dlg->backend_test_thread) {
+        return;  /* A check is already in flight */
+    }
+
+    const char *url = gtk_entry_get_text(dlg->llama_url_entry);
+    const char *model = gtk_entry_get_text(dlg->llama_model_entry);
+    if (!url || url[0] == '\0') {
+        gtk_label_set_markup(dlg->backend_test_status,
+            "<span foreground='red'>Enter a server URL first</span>");
+        return;
+    }
+
+    LlamaClient *client = llama_client_create(url, model ? model : "");
+    if (!client) {
+        gtk_label_set_markup(dlg->backend_test_status,
+            "<span foreground='red'>Could not initialize the connection check</span>");
+        return;
+    }
+
+    BackendTestCtx *ctx = g_new0(BackendTestCtx, 1);
+    ctx->dlg = dlg;
+    ctx->client = client;
+    dlg->backend_test_ctx = ctx;
+
+    gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+    gtk_button_set_label(button, "Checking\u2026");
+    gtk_label_set_markup(dlg->backend_test_status,
+        "<span foreground='gray' style='italic'>Checking\u2026</span>");
+
+    dlg->backend_test_thread = g_thread_new("backend-test",
+                                            backend_test_thread_func, ctx);
+    if (!dlg->backend_test_thread) {
+        /* Thread creation failed — undo and report (dialog still owns ctx). */
+        llama_client_destroy(client);
+        dlg->backend_test_ctx = NULL;
+        g_free(ctx);
+        gtk_widget_set_sensitive(GTK_WIDGET(button), TRUE);
+        gtk_button_set_label(button, "Test Connection");
+        gtk_label_set_markup(dlg->backend_test_status,
+            "<span foreground='red'>Could not start the connection check</span>");
+    }
+}
+
+/* Update backend-dependent widget state whenever the combo changes:
+ * llama rows are only active in llama mode, and the Whisper model-path
+ * label notes its auto-fallback role in that mode. */
+static void on_backend_changed(GtkComboBox *combo, ConfigDialog *dlg) {
+    UNUSED(combo);
+    if (!dlg || !dlg->backend_combo) return;
+    bool llama = (gtk_combo_box_get_active(dlg->backend_combo) == BACKEND_COMBO_LLAMA);
+
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->llama_url_entry), llama);
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->llama_model_entry), llama);
+    gtk_widget_set_sensitive(GTK_WIDGET(dlg->backend_test_button), llama);
+    if (!llama) {
+        gtk_label_set_text(dlg->backend_test_status, "");
+    }
+
+    if (dlg->model_path_label) {
+        gtk_label_set_text(dlg->model_path_label, llama
+            ? "Whisper Model Path (also used for auto-fallback):"
+            : "Whisper Model Path:");
+    }
+}
+
 bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     if (!parent_window || !config) return false;
 
@@ -717,10 +916,89 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     GtkWidget *separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(vbox), separator, FALSE, FALSE, 6);
 
+    /* ---- Transcription Backend ---- */
+    {
+        GtkWidget *backend_title = gtk_label_new("Transcription Backend:");
+        gtk_label_set_xalign(GTK_LABEL(backend_title), 0);
+        PangoAttrList *backend_attrs = pango_attr_list_new();
+        pango_attr_list_insert(backend_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(backend_title), backend_attrs);
+        pango_attr_list_unref(backend_attrs);
+        gtk_box_pack_start(GTK_BOX(vbox), backend_title, FALSE, FALSE, 0);
+
+        dlg->backend_combo = GTK_COMBO_BOX(gtk_combo_box_text_new());
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(dlg->backend_combo),
+                                       "Whisper (local, offline)");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(dlg->backend_combo),
+                                       "Gemma 4 12B (llama-server HTTP)");
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->backend_combo), FALSE, FALSE, 0);
+
+        GtkWidget *llama_url_label = gtk_label_new("  llama-server URL:");
+        gtk_label_set_xalign(GTK_LABEL(llama_url_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), llama_url_label, FALSE, FALSE, 0);
+
+        dlg->llama_url_entry = GTK_ENTRY(gtk_entry_new());
+        gtk_entry_set_placeholder_text(dlg->llama_url_entry, "http://127.0.0.1:8005");
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->llama_url_entry), FALSE, FALSE, 0);
+
+        GtkWidget *llama_model_label = gtk_label_new("  Model alias:");
+        gtk_label_set_xalign(GTK_LABEL(llama_model_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), llama_model_label, FALSE, FALSE, 0);
+
+        dlg->llama_model_entry = GTK_ENTRY(gtk_entry_new());
+        gtk_entry_set_placeholder_text(dlg->llama_model_entry, "gemma-4-12b");
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->llama_model_entry), FALSE, FALSE, 0);
+
+        GtkWidget *test_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        dlg->backend_test_button = GTK_BUTTON(gtk_button_new_with_label("Test Connection"));
+        g_signal_connect(dlg->backend_test_button, "clicked",
+                         G_CALLBACK(on_backend_test_clicked), dlg);
+        gtk_box_pack_start(GTK_BOX(test_box), GTK_WIDGET(dlg->backend_test_button),
+                           FALSE, FALSE, 0);
+        dlg->backend_test_status = GTK_LABEL(gtk_label_new(""));
+        gtk_label_set_xalign(GTK_LABEL(dlg->backend_test_status), 0);
+        gtk_label_set_use_markup(dlg->backend_test_status, TRUE);
+        gtk_box_pack_start(GTK_BOX(test_box), GTK_WIDGET(dlg->backend_test_status),
+                           TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), test_box, FALSE, FALSE, 0);
+
+        GtkWidget *backend_help = gtk_label_new(
+            "The llama backend sends audio to a local llama-server instance.\n"
+            "If the server is unavailable, transcription automatically falls\n"
+            "back to the local Whisper model below. Applies from the next\n"
+            "transcription.");
+        gtk_label_set_xalign(GTK_LABEL(backend_help), 0);
+        gtk_widget_set_opacity(backend_help, 0.6);
+        gtk_label_set_line_wrap(GTK_LABEL(backend_help), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), backend_help, FALSE, FALSE, 0);
+
+        /* Populate values, then wire the combo AFTER so the initial
+         * "changed" emission does not touch half-built state. */
+        const char *cur_backend = config_get_asr_backend(config);
+        gtk_combo_box_set_active(dlg->backend_combo,
+            (cur_backend && g_strcmp0(cur_backend, "llama") == 0)
+                ? BACKEND_COMBO_LLAMA : BACKEND_COMBO_WHISPER);
+        const char *cur_url = config_get_llama_server_url(config);
+        if (cur_url) gtk_entry_set_text(dlg->llama_url_entry, cur_url);
+        const char *cur_llama_model = config_get_llama_model(config);
+        if (cur_llama_model) gtk_entry_set_text(dlg->llama_model_entry, cur_llama_model);
+
+        g_signal_connect(dlg->backend_combo, "changed",
+                         G_CALLBACK(on_backend_changed), dlg);
+        on_backend_changed(dlg->backend_combo, dlg);  /* initial sensitivity */
+
+        gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
+    }
+
     /* ---- Whisper Model Path ---- */
-    GtkWidget *url_label = gtk_label_new("Whisper Model Path:");
-    gtk_label_set_xalign(GTK_LABEL(url_label), 0);
-    gtk_box_pack_start(GTK_BOX(vbox), url_label, FALSE, FALSE, 0);
+    dlg->model_path_label = GTK_LABEL(gtk_label_new("Whisper Model Path:"));
+    gtk_label_set_xalign(dlg->model_path_label, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->model_path_label), FALSE, FALSE, 0);
+
+    /* The initial on_backend_changed() above ran before this label existed
+     * (its guard skipped the update) — re-apply so the llama-mode fallback
+     * note shows on open when the llama backend is configured. */
+    on_backend_changed(dlg->backend_combo, dlg);
 
     /* Horizontal box: Entry + Browse Button */
     GtkWidget *model_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -1289,6 +1567,22 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
     if (dlg->model_info_idle_id > 0) {
         g_source_remove(dlg->model_info_idle_id);
         dlg->model_info_idle_id = 0;
+    }
+
+    /* If a "Test Connection" check is still running, wait for its worker
+     * thread: its last action is registering an idle source that
+     * references this dialog's widgets. Joining is bounded by the
+     * client's connect timeout. After the join, ctx->idle_id is
+     * definitive, so a still-pending source (result never delivered)
+     * can be cancelled here — its destroy-notify frees the ctx. If the
+     * result was already delivered, backend_test_ctx is NULL. */
+    if (dlg->backend_test_thread) {
+        g_thread_join(dlg->backend_test_thread);
+        dlg->backend_test_thread = NULL;
+    }
+    if (dlg->backend_test_ctx) {
+        g_source_remove(dlg->backend_test_ctx->idle_id);
+        dlg->backend_test_ctx = NULL;
     }
 
     /* Destroy dialog */

@@ -10,6 +10,8 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.2 | 2026-08-24 | Added the File Upload Transcription capability (§2.8) and its scope entry. Added missing configuration settings to §3.1: `flash_attention` (default true), `noise_suppression` (default false), `debug_logs` (default false). Corrected §3.3: the minimum-segment key is `scanner_min_segment_sec` (seconds, range 1–30, default 5.0) and it IS exposed in the Configuration Dialog; removed `audio_device_display_name` (no longer stored by the application). Corrected the GPU auto-select threshold in §3.1 to max(512 MiB, model size + 500 MiB) and the language count to ~77. |
+| 3.1 | 2026-08-24 | Corrected configuration constants to match the implementation: max_duration default 30s, range 5–30 (the v2.5 note of 60s / 5–120 was never reflected in code). Fixed the Appendix config example to use the real `scanner_silence_sec` key (the `vad_silence_ms` key shown previously is not read by the application) and the correct max_duration default. |
 | 3.0 | 2026-07-06 | Major rewrite: stripped implementation and architectural design details. Retained user-facing capabilities, configuration settings reference, and behavioral requirements only. Removed threading model, API call sequences, widget internals, code snippets, test plan, and deployment procedures. |
 | 2.5 | 2026-05-31 | Updated constants to match implementation: max_duration default 60s (was 30s), range 5-120 (was 5-30), vad_silence_ms range 500-5000 (was 500-3000), config key vad_silence_ms (was vad_silence_timeout_ms), VAD mode labels updated to match UI, audio buffer size 320 (was 1024), silence timeout UI uses seconds (was ms), removed Session Duration field (not in implementation), removed max_session_minutes config parameter |
 | 2.4 | 2026-05-30 | Augmented transcription behavior with VAD-driven continuous segmentation: audio recording is monitored in real-time by a Voice Activity Detector that automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues |
@@ -44,6 +46,7 @@ The Transcriber application provides:
 - Persistent, editable text area displaying accumulated transcribed text
 - System clipboard integration for copying transcribed text to other applications
 - Configurable model path, audio device, transcription language, GPU mode, VAD sensitivity, silence timeout, max segment duration, text append/overwrite mode, and continuous dictation toggle
+- Offline transcription of existing audio files (any format FFmpeg can decode) via the File button
 - GPU (CUDA) acceleration support with automatic CPU fallback
 - System tray icon with state-aware display and context menu
 - Global hotkey support via D-Bus for toggling recording without clicking the window
@@ -97,8 +100,8 @@ The application operates in three states:
 
 #### Main Window
 - Displays red microphone icon when idle, green microphone icon during recording/transcribing
-- Animated sine wave overlay visible only during LISTENING state
-- Status bar with gear/settings button (left), countdown timer (center), and model availability indicator (right)
+- Animated sine wave overlay visible onand File button (left), countdown timer (center), volume level bar
+- Status bar with gear/settings button and File button (left), countdown timer (center), volume level bar, and model availability indicator (right)
 - Real-time volume level bar displayed during recording
 - Non-resizable fixed-size window; position persists across sessions
 
@@ -157,11 +160,24 @@ The application operates in three states:
 - Bare filenames are searched in default directories: `~/.cache/whisper/` then `/usr/share/transcriber/models/`
 - Application verifies model file accessibility on startup and before recording begins
 - The Browse button validates the selected model file and displays its metadata (name, quantization, multilingual support) before saving
+### 2.8 File Upload Transcription
+
+- Transcribe existing audio files entirely offline via the **File** button in the main window status bar
+- Any container or codec FFmpeg can decode is accepted (no extension allowlist); decode errors are surfaced to the user
+- Constraints: maximum file size 1 GB; duration 2–600 seconds (enforced after decoding, since container duration metadata is not always present)
+- Audio is decoded and resampled to 16 kHz mono 16-bit PCM before transcription
+- Speech is segmented with VAD (30-second windows, split at natural silence boundaries) and each segment is transcribed
+- Results are written incrementally to a user-chosen `.txt` file (default name: `<original-name>_transcription.txt`)
+- A progress bar and status label in the status bar show job progress; the File button becomes a **Cancel** button while a job runs
+- Cancellation deletes the partial output file; no transcript is written
+- File transcription and live microphone transcription share a single transcription lock and never run concurrently; mic clicks are ignored while a file job is in progress
+- If the model is still loading when a file is selected, the job is queued and starts automatically once loading completes
+
 
 ---
 
-## 3. Configuration Settings Reference
-
+| 6 | `gpu_mode` | GPU Acceleration | Drop-down (combo box) | `"auto"` | Auto, CPU Only, GPU N (dynamatically populated with available devices) | Select the GPU acceleration mode. **Auto** selects the GPU with most free memory (minimum free VRAM = max(512 MiB, model size + 500 MiB)). **CPU Only** forces all processing to CPU. **GPU N** uses a specific NVIDIA GPU by index. Falls back to CPU if the selected GPU lacks sufficient free VRAM. Application must be restarted for GPU changes to take effect. |
+| 7 | `language` | Language | Drop-down (combo box) | `"auto"` | Auto-detect plus ~77 languages (ISO 639-1 codes including English, Chinese, German, Spanish, Russian, Korean, French, Japanese, Portuguese, and many others) | Selects the input language for transcription. "Auto-detect" enables automatic language detection for multilingual input. Specific language codes improve accuracy when the input language is known. |
 All settings are stored in `~/.config/transcriber/config.json`. The application auto-creates this file with defaults if it does not exist. File permissions: `600` (rw-------).
 
 ### 3.1 User-Configurable Settings
@@ -172,13 +188,16 @@ All settings are stored in `~/.config/transcriber/config.json`. The application 
 | 2 | `model_path` | Whisper Model Path | Text input + Browse button | `"ggml-large-v3-turbo-q8_0.bin"` | Any valid file path or bare filename (searched in default directories) | Path to the local GGML/GGUF Whisper model file. A "Browse..." button opens a file chooser filtered to `.bin` and `.gguf` files, defaulting to `~/.cache/whisper/`. Model metadata is displayed upon selection. |
 | 3 | `max_duration` | Max Recording Duration (seconds) | Numeric input with spin buttons | `30` | 5 – 30 seconds, integer step | Maximum speech segment duration. If no silence is detected within this time, the current segment is flushed for transcription and a new one begins. |
 | 4 | `vad_mode` | Sensitivity | Drop-down (combo box) | `"Moderate"` (mode 1) | Least sensitive (0), Moderate (recommended) (1), Aggressive (2), Most aggressive (only clear speech) (3) | Controls how aggressively the Voice Activity Detector distinguishes speech from background noise. Higher values reduce false positives but may miss quiet speech. |
-| 5 | `scanner_silence_ms` | Auto-stop after silence | Numeric input with spin buttons | `2000` ms (displayed as 2.0 seconds) | 1000 – 10000 ms (UI: 1.0 – 10.0 s, step 0.1) | Duration of consecutive silence before the scanner triggers a segment flush and restarts recording in continuous dictation mode. |
-| 6 | `gpu_mode` | GPU Acceleration | Drop-down (combo box) | `"auto"` | Auto, CPU Only, GPU N (dynamically populated with available devices) | Select the GPU acceleration mode. **Auto** selects the GPU with most free memory (minimum 2 GB threshold). **CPU Only** forces all processing to CPU. **GPU N** uses a specific NVIDIA GPU by index. Falls back to CPU if selected GPU is unavailable. Application must be restarted for GPU changes to take effect. |
-| 7 | `language` | Language | Drop-down (combo box) | `"auto"` | Auto-detect plus ~90 languages (ISO 639-1 codes including English, Chinese, German, Spanish, Russian, Korean, French, Japanese, Portuguese, and many others) | Selects the input language for transcription. "Auto-detect" enables automatic language detection for multilingual input. Specific language codes improve accuracy when the input language is known. |
+| 5 | `scanner_silence_sec` | Auto-stop after silence | Drop-down (combo box) | `1.0` second | UI options: 0.5, 1.0, 1.5, 2.0 s (raw `config.json` value clamped to 1.0 – 10.0 s) | Duration of consecutive silence before the scanner triggers a segment flush and restarts recording in continuous dictation mode. |
+| 6 | `gpu_mode` | GPU Acceleration | Drop-down (combo box) | `"auto"` | Auto, CPU Only, GPU N (dynamically populated with available devices) | Select the GPU acceleration mode. **Auto** selects the GPU with most free memory (minimum free VRAM = max(512 MiB, model size + 500 MiB)). **CPU Only** forces all processing to CPU. **GPU N** uses a specific NVIDIA GPU by index. Falls back to CPU if the selected GPU lacks sufficient free VRAM. Application must be restarted for GPU changes to take effect. |
+| 7 | `language` | Language | Drop-down (combo box) | `"auto"` | Auto-detect plus ~77 languages (ISO 639-1 codes including English, Chinese, German, Spanish, Russian, Korean, French, Japanese, Portuguese, and many others) | Selects the input language for transcription. "Auto-detect" enables automatic language detection for multilingual input. Specific language codes improve accuracy when the input language is known. |
 | 8 | `append_transcription_text` | Append Transcription Text | Check box | `true` | true / false | When enabled, new transcription results are appended to existing text in the TextWindow. When disabled (overwrite mode), the TextWindow is cleared at the start of each new recording session. |
 | 9 | `continuous_dictation` | Continuous dictation (silence-triggered loop) | Check box | `true` | true / false | When enabled, silence triggers transcription and recording automatically restarts for the next segment. When disabled, recording runs until max_duration expires or you click the mic icon to stop. |
-| 10 | — | Reset Window Position | Button labeled "Reset Window Position" | — | — | Resets the main window position to screen center (100, 100) on next launch. Stored internally as `window_position`. |
-| 11 | — | D-Bus Hotkey Command | Read-only selectable text box + Copy button | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | — | Displays the D-Bus command for global hotkey activation. Not stored in config; shown for user reference only. Clicking "Copy" copies to clipboard (button briefly shows "Copied!"). Text is also selectable for manual copying. |
+| 10 | `flash_attention` | Flash Attention | Check box | `true` | true / false | When enabled, whisper.cpp uses flash attention to reduce GPU VRAM usage (no effect in CPU-only mode). The checkbox is disabled when GPU mode is CPU Only. |
+| 11 | `noise_suppression` | Noise Suppression | Check box | `false` | true / false | When enabled, applies RNNoise-based noise reduction to the captured audio stream before transcription. Disabled by default because RNNoise resampling can introduce artifacts; enable only if background noise is a problem. |
+| 12 | `debug_logs` | Debug Logs | Check box | `false` | true / false | When enabled, writes verbose DEBUG-level messages to the log in addition to the always-logged MESSAGE/INFO/WARNING/ERROR/CRITICAL levels. |
+| 13 | — | Reset Window Position | Button labeled "Reset Window Position" | — | — | Resets the main window position to screen center (100, 100) on next launch. Stored internally as `window_position`. |
+| 14 | — | D-Bus Hotkey Command | Read-only selectable text box + Copy button | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | — | Displays the D-Bus command for global hotkey activation. Not stored in config; shown for user reference only. Clicking "Copy" copies to clipboard (button briefly shows "Copied!"). Text is also selectable for manual copying. |
 
 ### 3.2 Fixed (Non-Configurable) Settings
 
@@ -194,8 +213,7 @@ All settings are stored in `~/.config/transcriber/config.json`. The application 
 | Parameter | Description |
 |-----------|-------------|
 | `window_position` | JSON object `{"x": <int>, "y": <int>}` storing the last window position. Auto-saved on move; reset via "Reset Window Position" button in the dialog. |
-| `audio_device_display_name` | Human-readable display name for the configured audio device, stored alongside `audio_device` for reference and display purposes. Not used for device selection. |
-| `scanner_min_segment_ms` | Minimum segment duration (ms) before transcribing. The scanner will not send segments shorter than this to Whisper. Range: 1000-30000 ms, default: 5000. Not exposed in the Configuration Dialog. |
+| `scanner_min_segment_sec` | Minimum segment duration (seconds) before transcribing. The scanner will not send segments shorter than this to Whisper. Range: 1–30 s, default: 5.0. Exposed in the Configuration Dialog as a spin button (1.0–30.0 s, step 0.5). Legacy `scanner_min_segment_ms` values are still read and converted. |
 
 ---
 
@@ -302,10 +320,10 @@ The D-Bus bus name ownership (`org.xvoice.Controller`) enforces single-instance 
   "window_position": { "x": 100, "y": 100 },
   "model_path": "~/.cache/whisper/ggml-base.bin",
   "audio_device": "default",
-  "max_duration": 60,
+  "max_duration": 30,
   "gpu_mode": "auto",
   "vad_mode": 1,
-  "vad_silence_ms": 1000,
+  "scanner_silence_sec": 1.0,
   "append_transcription_text": true
 }
 ```

@@ -412,6 +412,48 @@ void app_window_set_config_changed_callback(MainWindow *win,
                                             void (*callback)(void *user_data),
                                             void *user_data);
 
+/* app_window_set_upload_callback — Register a callback for the Upload button.
+ *
+ * When the user clicks the "Upload" button in the status bar, the provided
+ * callback is invoked with the user_data argument. The main application uses
+ * this to start (or cancel, if a job is running) a file transcription.
+ *
+ * Parameters:
+ *   win       — The MainWindow handle.
+ *   callback  — Function to call on Upload button click.
+ *   user_data — Opaque pointer passed to the callback.
+ */
+void app_window_set_upload_callback(MainWindow *win,
+                                    void (*callback)(void *user_data),
+                                    void *user_data);
+
+/* app_window_set_file_progress — Update the file-transcription progress UI.
+ *
+ * Shows the progress bar and status label in the status bar, sets the bar
+ * fraction (0.0-1.0) and the status text. Must be called on the GTK main
+ * thread (marshal from the pipeline thread via g_idle_add).
+ *
+ * Parameters:
+ *   win    — The MainWindow handle.
+ *   percent — Progress fraction in [0.0, 1.0].
+ *   status  — Human-readable status text (e.g. "Transcribing…", "Cancelled").
+ */
+void app_window_set_file_progress(MainWindow *win, double percent,
+                                  const char *status);
+
+/* app_window_set_upload_active — Toggle the status bar into upload mode.
+ *
+ * When active (a file transcription is running): the Upload button label
+ * changes to "Cancel", and the countdown/volume widgets are hidden to make
+ * room for the progress bar. When inactive: the button reverts to "Upload"
+ * and the progress widgets are hidden.
+ *
+ * Parameters:
+ *   win    — The MainWindow handle.
+ *   active — true to enter upload mode, false to leave it.
+ */
+void app_window_set_upload_active(MainWindow *win, bool active);
+
 /******************************************************************************
  * Public API — TextWindow Lifecycle
  *****************************************************************************/

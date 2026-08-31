@@ -95,7 +95,7 @@ typedef struct _AppConfig {
     bool flash_attention;        ///< Enable flash attention for reduced VRAM usage
                                     ///< When true, whisper.cpp uses flash attention which can
                                     ///< significantly reduce GPU memory consumption during inference
-                                    ///< while maintaining transcription accuracy. Default: false.
+                                    ///< while maintaining transcription accuracy. Default: true.
                                     ///< @see CFG-GPU-002: Flash Attention
 
     /* Transcription Text Mode */
@@ -123,7 +123,7 @@ typedef struct _AppConfig {
     float scanner_silence_sec;       ///< Silence duration (seconds) before scanner checks segment
                                           ///< When the scanner detects continuous silence for this
                                           ///< duration, it checks if the audio segment meets the
-                                          ///< minimum duration. Range: 1-10 sec. Default: 2.
+                                          ///< minimum duration. Range: 1-10 sec. Default: 1.
 
     float scanner_min_segment_sec;   ///< Minimum segment duration (sec) before transcribing
                                           ///< The scanner will never send a segment shorter than
@@ -149,7 +149,26 @@ typedef struct _AppConfig {
                                        ///< Removes stationary noise (fans, AC hum) before passing
                                        ///< audio to Whisper. Works at 16kHz via internal resampling
                                        ///< to/from RNNoise's native 48kHz processing rate.
-                                       ///< Default: true.
+                                       ///< Default: false (disabled — RNNoise resampling can
+                                       ///< introduce artifacts; enable only if background noise
+                                       ///< is a problem and test with your setup).
+
+    /* ASR Backend Settings */
+    char asr_backend[16];           ///< Active transcription backend:
+                                        ///< "whisper" = in-process whisper.cpp (default),
+                                        ///< "llama" = llama-server HTTP backend (e.g. Gemma 4 12B).
+                                        ///< @see CFG-ASR-001: ASR Backend Selection
+
+    char llama_server_url[256];     ///< Base URL of the llama-server,
+                                        ///< e.g. "http://127.0.0.1:8005".
+                                        ///< Trailing slashes are normalized away.
+                                        ///< Only used when asr_backend is "llama".
+                                        ///< @see CFG-ASR-002: llama-server URL
+
+    char llama_model[128];          ///< Model alias as exposed by the llama-server
+                                        ///< (--alias), e.g. "gemma-4-12b".
+                                        ///< Only used when asr_backend is "llama".
+                                        ///< @see CFG-ASR-003: llama-server Model
 
 } AppConfig;
 
@@ -613,6 +632,58 @@ void config_set_noise_suppression(AppConfig* config, bool enabled);
  * @return true if noise suppression is enabled, false otherwise.
  */
 bool config_get_noise_suppression(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6.9: ASR Backend Configuration Accessors
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Set the active ASR backend.
+ * @param config  Pointer to AppConfig. Must not be NULL.
+ * @param backend "whisper" or "llama". Any other value is rejected.
+ * @return true if accepted, false if invalid or config is NULL.
+ */
+bool config_set_asr_backend(AppConfig* config, const char* backend);
+
+/**
+ * Get the active ASR backend.
+ * @param config Pointer to AppConfig. May be NULL.
+ * @return "whisper" or "llama" ("whisper" if config is NULL).
+ */
+const char* config_get_asr_backend(const AppConfig* config);
+
+/**
+ * Set the llama-server base URL.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @param url    URL starting with "http://" or "https://",
+ *               e.g. "http://127.0.0.1:8005". Copied internally; trailing
+ *               slashes are stripped.
+ * @return true if accepted, false if invalid, empty, or too long.
+ */
+bool config_set_llama_server_url(AppConfig* config, const char* url);
+
+/**
+ * Get the llama-server base URL.
+ * @param config Pointer to AppConfig. May be NULL.
+ * @return The URL string (internal, must NOT be freed or modified).
+ */
+const char* config_get_llama_server_url(const AppConfig* config);
+
+/**
+ * Set the llama-server model alias.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @param model  Model alias as exposed by the server (--alias),
+ *               e.g. "gemma-4-12b". Must be non-empty. Copied internally.
+ * @return true if accepted, false if empty or too long.
+ */
+bool config_set_llama_model(AppConfig* config, const char* model);
+
+/**
+ * Get the llama-server model alias.
+ * @param config Pointer to AppConfig. May be NULL.
+ * @return The model alias string (internal, must NOT be freed or modified).
+ */
+const char* config_get_llama_model(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

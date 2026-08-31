@@ -150,8 +150,12 @@ struct _MainWindow {
     GtkDrawingArea *animation_area;
     GtkBox *status_bar;
     GtkButton *gear_button;
+    GtkButton *upload_button;
+    GtkLabel *upload_label;
     GtkLabel *countdown_label;
     GtkLevelBar *volume_level_bar;
+    GtkProgressBar *progress_bar;
+    GtkLabel *progress_label;
     GtkDrawingArea *indicator_area;
     GtkLabel *version_label;
     AppConfig *config;
@@ -184,6 +188,9 @@ struct _MainWindow {
     /* Config changed callback — invoked when config dialog saves */
     void (*on_config_changed)(void *user_data);
     void *config_changed_user_data;
+    /* File callback — invoked when the File button is clicked */
+    void (*on_upload)(void *user_data);
+    void *upload_user_data;
     /* Spinning arrows animation — "transcribing" indicator. Started when the
      * user clicks the green mic to end recording; runs throughout
      * STATE_TRANSCRIBING; stopped when returning to STATE_IDLE (red mic). */
@@ -216,6 +223,7 @@ static GdkPixbuf *load_xpm(MainWindow *win, const char *filename);
 static void render_icon(MainWindow *win, const char *icon_name);
 static gboolean on_icon_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
 static void on_gear_button_clicked(GtkButton *button, gpointer user_data);
+static void on_upload_button_clicked(GtkButton *button, gpointer user_data);
 static gboolean on_indicator_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
 static gboolean on_window_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data);
 static void on_icon_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data);
@@ -750,6 +758,18 @@ static void on_gear_button_clicked(GtkButton *button, gpointer user_data) {
 }
 
 /**
+ * Handle File button click.
+ * Invokes the registered upload callback (start or cancel file transcription).
+ */
+static void on_upload_button_clicked(GtkButton *button, gpointer user_data) {
+    UNUSED(button);
+    MainWindow *win = (MainWindow *)user_data;
+    if (win->on_upload) {
+        win->on_upload(win->upload_user_data);
+    }
+}
+
+/**
  * Handle button press on the microphone indicator area.
  * Toggles the recording state: IDLE → LISTENING → TRANSCRIBING → IDLE.
  */
@@ -1014,6 +1034,24 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     g_signal_connect(win->gear_button, "clicked", G_CALLBACK(on_gear_button_clicked), win);
     gtk_box_pack_start(win->status_bar, GTK_WIDGET(win->gear_button), FALSE, FALSE, 4);
 
+    /* File button — starts (or cancels) a file transcription.
+     * Bordered button with a folder-open icon so it is clearly clickable. */
+    win->upload_button = GTK_BUTTON(gtk_button_new());
+    {
+        GtkWidget *upload_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        GtkImage *upload_icon = GTK_IMAGE(
+            gtk_image_new_from_icon_name("document-open", GTK_ICON_SIZE_BUTTON));
+        gtk_box_pack_start(GTK_BOX(upload_box), GTK_WIDGET(upload_icon), FALSE, FALSE, 0);
+        win->upload_label = GTK_LABEL(gtk_label_new("File"));
+        gtk_box_pack_start(GTK_BOX(upload_box), GTK_WIDGET(win->upload_label), FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(win->upload_button), upload_box);
+    }
+    gtk_widget_set_tooltip_text(GTK_WIDGET(win->upload_button),
+                                "Transcribe a file");
+    g_signal_connect(win->upload_button, "clicked",
+                     G_CALLBACK(on_upload_button_clicked), win);
+    gtk_box_pack_start(win->status_bar, GTK_WIDGET(win->upload_button), FALSE, FALSE, 0);
+
     /* Expander to push countdown to center */
     GtkLabel *spacer_left = GTK_LABEL(gtk_label_new(""));
     gtk_box_pack_start(win->status_bar, GTK_WIDGET(spacer_left), TRUE, TRUE, 0);
@@ -1036,6 +1074,19 @@ MainWindow *app_window_create(AppConfig *config, AppStateController *controller,
     gtk_widget_set_size_request(GTK_WIDGET(win->volume_level_bar), 60, 6);
     gtk_widget_hide(GTK_WIDGET(win->volume_level_bar));
     gtk_box_pack_start(win->status_bar, GTK_WIDGET(win->volume_level_bar), FALSE, FALSE, 2);
+
+    /* File-transcription progress bar + status label (hidden until a job runs) */
+    win->progress_bar = GTK_PROGRESS_BAR(gtk_progress_bar_new());
+    gtk_progress_bar_set_fraction(win->progress_bar, 0.0);
+    gtk_widget_set_size_request(GTK_WIDGET(win->progress_bar), 60, 6);
+    gtk_widget_hide(GTK_WIDGET(win->progress_bar));
+    gtk_box_pack_start(win->status_bar, GTK_WIDGET(win->progress_bar), FALSE, FALSE, 2);
+
+    win->progress_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_ellipsize(win->progress_label, PANGO_ELLIPSIZE_END);
+    gtk_widget_set_size_request(GTK_WIDGET(win->progress_label), 40, -1);
+    gtk_widget_hide(GTK_WIDGET(win->progress_label));
+    gtk_box_pack_start(win->status_bar, GTK_WIDGET(win->progress_label), FALSE, FALSE, 2);
 
     /* Expander to push indicator to the right */
     GtkLabel *spacer_right = GTK_LABEL(gtk_label_new(""));
@@ -1278,6 +1329,44 @@ void app_window_set_config_changed_callback(MainWindow *win,
     if (!win) return;
     win->on_config_changed = callback;
     win->config_changed_user_data = user_data;
+}
+
+void app_window_set_upload_callback(MainWindow *win,
+                                    void (*callback)(void *user_data),
+                                    void *user_data) {
+    if (!win) return;
+    win->on_upload = callback;
+    win->upload_user_data = user_data;
+}
+
+void app_window_set_file_progress(MainWindow *win, double percent,
+                                  const char *status) {
+    if (!win) return;
+    if (percent < 0.0) percent = 0.0;
+    if (percent > 1.0) percent = 1.0;
+    gtk_progress_bar_set_fraction(win->progress_bar, percent);
+    if (status) {
+        gtk_label_set_text(win->progress_label, status);
+    }
+    gtk_widget_show(GTK_WIDGET(win->progress_bar));
+    gtk_widget_show(GTK_WIDGET(win->progress_label));
+}
+
+void app_window_set_upload_active(MainWindow *win, bool active) {
+    if (!win) return;
+    if (active) {
+        gtk_label_set_text(win->upload_label, "Cancel");
+        gtk_widget_set_tooltip_text(GTK_WIDGET(win->upload_button),
+                                    "Cancel the file transcription");
+        gtk_widget_hide(GTK_WIDGET(win->countdown_label));
+        gtk_widget_hide(GTK_WIDGET(win->volume_level_bar));
+    } else {
+        gtk_label_set_text(win->upload_label, "File");
+        gtk_widget_set_tooltip_text(GTK_WIDGET(win->upload_button),
+                                    "Transcribe a file");
+        gtk_widget_hide(GTK_WIDGET(win->progress_bar));
+        gtk_widget_hide(GTK_WIDGET(win->progress_label));
+    }
 }
 
 /* ------------------------------------------------------------------ */

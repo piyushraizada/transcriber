@@ -7,12 +7,13 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
 *   **Clear Transcription:** Right-click the microphone icon (when idle) to clear all transcribed text from the text window, clipboard, and internal buffer. Also available as "Clear Transcription" in the system tray context menu.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
-*   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard. Text is automatically cleared from the clipboard on application exit to prevent stale data persisting after shutdown.
+*   **File Upload Transcription:** Transcribe existing audio files offline. Click the **File** button in the main window's status bar, pick any audio file (any container/codec FFmpeg can decode), and the app decodes it, segments the speech with VAD, transcribes each segment, and writes the result to a `.txt` file you choose. See [File Upload Transcription](#file-upload-transcription) for details.
+*   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard. In continuous dictation mode the clipboard always holds the **full accumulated transcript** (capped at 512 KiB), not just the last segment. Text is automatically cleared from the clipboard on application exit to prevent stale data persisting after shutdown.
 *   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
 
 ### Technical Highlights
-*   **Tech Stack:** Written in C using GTK3 for the GUI and ALSA (`libasound`) for audio capture.
-*   **Performance:** Supports NVIDIA GPU (CUDA) acceleration for faster transcription, with an automatic fallback to CPU.
+*   **Tech Stack:** Written in C using GTK3 for the GUI, ALSA (`libasound`) for microphone capture, and FFmpeg for decoding uploaded audio files.
+*   **Performance:** Supports NVIDIA GPU (CUDA) acceleration for faster transcription, with an automatic fallback to CPU. When multiple GPUs are present, you can pick a specific one (or let Transcriber choose the one with the most free VRAM) in the settings dialog.
 *   **Architecture:** Multi-threaded design (Presentation, Audio, and Transcription threads) to ensure a responsive user interface.
 *   **User Experience:** Features a real-time volume level bar, sine wave animation during recording, and a model availability status indicator.
 
@@ -32,6 +33,7 @@ These packages **must** be installed before building. The build will fail withou
 | **GTK3** (≥3.20) | UI framework (includes GLib, GDK, GIO/GDBus) |
 | **ALSA** (≥1.1.0) | Audio capture from microphone |
 | **cJSON** (≥1.7.14) | JSON configuration file parsing |
+| **FFmpeg** (`libavformat`, `libavcodec`, `libavutil`, `libswresample`) | Audio format detection, decoding, and resampling for file upload transcription |
 | **OpenBLAS** | CPU matrix operation acceleration for whisper.cpp inference |
 | **libayatana-appindicator3** or **libappindicator3** | System tray icon support |
 | **Git** | Downloads whisper.cpp and RNNoise sources during build |
@@ -42,7 +44,8 @@ These packages **must** be installed before building. The build will fail withou
 ```bash
 sudo apt-get install build-essential cmake pkg-config \
     libgtk-3-dev libasound2-dev \
-    libcjson-dev libopenblas-dev libayatana-appindicator3-dev \
+    libcjson-dev libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+    libopenblas-dev libayatana-appindicator3-dev \
     git
 ```
 
@@ -50,14 +53,16 @@ sudo apt-get install build-essential cmake pkg-config \
 ```bash
 sudo dnf install gcc gcc-c++ cmake pkgconf-pkg-config \
     gtk3-devel alsa-lib-devel \
-    cjson-devel openblas-devel libayatana-appindicator3-devel \
+    cjson-devel ffmpeg-devel \
+    openblas-devel libayatana-appindicator3-devel \
     git
 ```
 
 **Arch Linux:**
 ```bash
 sudo pacman -S base-devel cmake pkgconf \
-    gtk3 alsa-lib cjson openblas libayatana-appindicator \
+    gtk3 alsa-lib cjson ffmpeg \
+    openblas libayatana-appindicator \
     git
 ```
 
@@ -218,36 +223,70 @@ The application will appear as a microphone icon in your system tray and as a sm
 ### Visual Indicators
 
 - **Red mic** — Idle (ready to record)
-- **Green mic + sine wave animation** — Actively recording
-- **Green mic (static)** — Transcribing audio to text
+- **Green mic + sine wave animation** — Actively recording (the sine wave also animates on the system tray icon)
+- **Green mic + spinning-arrows animation** — Transcribing audio to text
 - **"WAIT" overlay on red mic** — Model loading in background on first use. Clicks are ignored until the model finishes loading.
+- **Volume level bar** — real-time input level (0–1.0) with a warning marker at 0.8 and a clipping ("alert") marker at 0.95
+- **Connection indicator** — small circle in the status bar showing model availability (green = ready, red = unavailable, blinking yellow = checking, amber = loading). Click it to re-check.
 
 ### Interactions
 
 - **Left-click** the mic icon (main window or system tray) — start/stop recording
 - **Right-click** the mic icon (main window, when idle / red) — clear all transcribed text from the text window and clipboard
 - **System tray context menu** — right-click for "Toggle Recording", "Clear Transcription" (idle only), "Show Window", and "Quit"
+- **Recording completion beep** — a system beep sounds when recording stops and transcription begins, so you get audio feedback even when the window is not focused
 
 A Voice Activity Detector (VAD) monitors the audio stream in real-time and automatically segments speech at natural silence boundaries, transcribing each segment asynchronously while recording continues. Click the icon again or use the global hotkey to stop recording and trigger the final transcription of any remaining audio.
+
+## File Upload Transcription
+
+In addition to live microphone dictation, Transcriber can transcribe existing audio files entirely offline. This is useful for converting recorded meetings, voice memos, or any other audio into editable text.
+
+### How to Use
+
+1. Click the **File** button in the main window's status bar (bottom row, next to the gear button).
+2. In the file chooser, select an audio file. **Any container or codec that FFmpeg can decode is accepted** — there is no extension allowlist. If the file cannot be decoded, FFmpeg's error is shown to you.
+3. Choose where to save the result in the "Save Transcription As" dialog. The default filename is `<original-name>_transcription.txt`.
+4. The app decodes the file, segments the speech with VAD, and transcribes each segment. A progress bar and status label in the status bar show the job's progress. When finished, the full transcript is written to the chosen `.txt` file.
+
+### Constraints
+
+- **Maximum file size:** 1 GB
+- **Duration:** 2–600 seconds (enforced after decoding, since container duration metadata is not always present)
+- **Audio is resampled** to 16 kHz mono 16-bit PCM before transcription (whisper.cpp's required input format)
+
+### Behavior
+
+- The **File** button becomes a **Cancel** button while a job is running. Clicking it requests cancellation; the partial output file is deleted and no transcript is written.
+- File transcription and live microphone transcription share the same transcription lock, so they never run at the same time. Mic clicks are ignored while a file job is in progress.
+- If the Whisper model is still loading when you pick a file, the job is queued and starts automatically once the model finishes loading.
+- Segmentation reuses the same VAD logic as live dictation: audio is processed in 30-second windows and split at natural silence boundaries.
 
 ## Configuration
 
 Configuration is stored in `~/.config/transcriber/config.json`. You can adjust settings such as:
 
-- **Model path** — path to a GGML/GGUF Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`)
+- **Model path** — path to a GGML/GGUF Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`). A bare filename (e.g. `ggml-base.bin`) is searched in `~/.cache/whisper/` and the system model directory (`/usr/share/transcriber/models/`); `~` is expanded.
 - **Audio device** — ALSA capture device (default: system default)
-- **Max duration** — maximum segment duration in seconds before forcing transcription during continuous speech (default: 30, range: 5–30)
+- **Max duration** — maximum length of a single recording session in seconds before recording is automatically stopped and the buffered audio is transcribed (default: 30, range: 5–30)
 - **Continuous dictation** — enable or disable the silence-triggered recording/transcription loop (default: `true`)
 - **VAD mode** — aggressiveness level as an integer from 0 to 3, where 0 is least aggressive (most sensitive) and 3 is most aggressive (most restrictive; default: 1, moderate)
 - **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription. The config dialog offers 0.5, 1.0, 1.5, and 2.0 sec (default: 1.0 sec); the raw `config.json` value is clamped to the range 1.0–10.0 sec, so hand-edited values outside the dialog choices are accepted but snapped to the nearest option when the dialog is opened.
 - **Scanner min segment** — minimum audio segment length in seconds before sending to Whisper (default: 5 sec, range: 1–30 sec)
 - **Append transcription text** — when `true`, new transcriptions are appended to existing text; when `false`, the text window is cleared at the start of each session (default: `true`)
-- **Language** — transcription language as `"auto"` (auto-detect) or a 2-letter ISO 639-1 code (e.g., `"en"`, `"fr"`); default: `auto`
-- **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection
+- **Language** — transcription language as `"auto"` (auto-detect) or a 2-letter ISO 639-1 code (e.g., `"en"`, `"fr"`); default: `auto`. The settings dialog offers a dropdown of ~77 languages.
+- **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection. The settings dialog lists each detected NVIDIA GPU by name, plus "Auto (select best GPU by free memory)" and "CPU Only". In `auto` mode the GPU with the most free VRAM is chosen; if the selected GPU does not have enough free VRAM for the model, Transcriber automatically falls back to CPU and reports which device was used. GPU changes require an application restart.
 - **Flash attention** — when `true`, enables whisper.cpp flash attention to reduce GPU VRAM usage (no effect in CPU-only mode; default: `true`)
-- **Noise suppression** — when `true`, applies RNNoise-based automatic noise reduction to the audio stream during capture for cleaner transcription (default: `true`)
+- **Noise suppression** — when `true`, applies RNNoise-based automatic noise reduction to the audio stream during capture for cleaner transcription (default: `false`)
 
-A configuration dialog is available from the system tray context menu ("Show Window" → gear icon) or directly via the gear button in the main window's status bar (bottom-left corner).
+### Settings Dialog
+
+The settings dialog is opened via the **gear button** in the main window's status bar (bottom-left corner). The system tray context menu's "Show Window" item brings the main window to the front so you can reach it. In addition to the options above, the dialog provides:
+
+- **Model info** — once a model path is set, the dialog asynchronously loads the model's metadata and displays its name, quantization, and whether it is multilingual or English-only (e.g. `large-v3-turbo - Q8_0 - Multilingual`). An invalid or missing model shows a red "No valid whisper ggml file found" notice.
+- **Audio device** — a dropdown populated from the ALSA device list.
+- **D-Bus hotkey command** — a read-only field showing the `dbus-send` command with a **Copy** button, so you can bind it to a global shortcut.
+- **Reset Window Position** — recenters the main window on screen. The main window's position is otherwise remembered between runs and restored on next launch.
 
 ## Global Hotkey
 
@@ -291,7 +330,7 @@ Voice activity detection is provided by the **WebRTC VAD** library, packaged and
 
 ### RNNoise (Noise Suppression)
 
-Automatic noise reduction is provided by the **[RNNoise](https://github.com/xiph/rnnoise)** library from Xiph.org. RNNoise uses a deep neural network to suppress background noise in real-time, improving transcription quality in noisy environments. The library is fetched via CMake FetchContent (pinned to tag `v0.2`) and is distributed under the **BSD-3-Clause** license.
+Automatic noise reduction is provided by the **[RNNoise](https://github.com/xiph/rnnoise)** library from Xiph.org. RNNoise uses a deep neural network to suppress background noise in real-time, improving transcription quality in noisy environments. The library is fetched via CMake FetchContent (pinned to commit `6cbfd53eb348` on the master branch, because the `v0.2` release tag is missing the pre-generated `rnnoise_data.h`/`.c` files that require Python/autotools to build) and is distributed under the **BSD-3-Clause** license.
 
 ## License
 

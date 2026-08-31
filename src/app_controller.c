@@ -68,6 +68,7 @@ int app_state_controller_init(AppStateController *controller,
      * the zero-initialized state or the fully-populated state. */
     pthread_mutex_lock(&controller->state_mutex);
     controller->state = STATE_IDLE;
+    controller->file_upload_state = FILE_UPLOAD_STATE_IDLE;
     controller->model_status = MODEL_UNAVAILABLE;
     controller->config = config;
     controller->on_transcription_result = on_transcription_result;
@@ -147,6 +148,70 @@ bool app_transition_to(AppStateController *controller, AppState target) {
     if (allowed && controller->on_state_change) {
         controller->on_state_change(current, target, controller->callback_user_data);
     }
+
+    return allowed;
+}
+
+FileUploadState app_get_file_upload_state(AppStateController *controller) {
+    if (!controller) return FILE_UPLOAD_STATE_IDLE;
+
+    FileUploadState state;
+    pthread_mutex_lock(&controller->state_mutex);
+    state = controller->file_upload_state;
+    pthread_mutex_unlock(&controller->state_mutex);
+
+    return state;
+}
+
+bool app_file_upload_transition_to(AppStateController *controller,
+                                   FileUploadState target) {
+    if (!controller) return false;
+
+    pthread_mutex_lock(&controller->state_mutex);
+
+    FileUploadState current = controller->file_upload_state;
+    bool allowed = false;
+
+    /* Check valid transitions for the file upload workflow.
+     *
+     *   IDLE → FILE_SELECTED
+     *   FILE_SELECTED → FILE_VALIDATED
+     *   FILE_VALIDATED → SEGMENTING
+     *   SEGMENTING → TRANSCRIBING
+     *   TRANSCRIBING → COMPLETE | ERROR
+     *   COMPLETE → IDLE
+     *   ERROR → IDLE */
+    switch (current) {
+        case FILE_UPLOAD_STATE_IDLE:
+            allowed = (target == FILE_UPLOAD_STATE_FILE_SELECTED);
+            break;
+        case FILE_UPLOAD_STATE_FILE_SELECTED:
+            allowed = (target == FILE_UPLOAD_STATE_FILE_VALIDATED);
+            break;
+        case FILE_UPLOAD_STATE_FILE_VALIDATED:
+            allowed = (target == FILE_UPLOAD_STATE_SEGMENTING);
+            break;
+        case FILE_UPLOAD_STATE_SEGMENTING:
+            allowed = (target == FILE_UPLOAD_STATE_TRANSCRIBING);
+            break;
+        case FILE_UPLOAD_STATE_TRANSCRIBING:
+            allowed = (target == FILE_UPLOAD_STATE_COMPLETE ||
+                       target == FILE_UPLOAD_STATE_ERROR);
+            break;
+        case FILE_UPLOAD_STATE_COMPLETE:
+            allowed = (target == FILE_UPLOAD_STATE_IDLE);
+            break;
+        case FILE_UPLOAD_STATE_ERROR:
+            allowed = (target == FILE_UPLOAD_STATE_IDLE);
+            break;
+    }
+
+    if (allowed) {
+        controller->file_upload_state = target;
+        controller->sequence_counter++;
+    }
+
+    pthread_mutex_unlock(&controller->state_mutex);
 
     return allowed;
 }

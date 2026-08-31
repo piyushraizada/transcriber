@@ -17,6 +17,9 @@
  * and FR-019 of the SRS. The dialog is a modal GTK3 window that allows the
  * user to modify all configurable application settings:
  *
+ *   - Transcription backend selection (combo box): local Whisper or a
+ *     llama-server HTTP backend, with server URL / model alias entries
+ *     and an asynchronous "Test Connection" check
  *   - Whisper model path (text entry)
  *   - Audio device selection (combo box dropdown)
  *   - Maximum recording duration (spin button — 5 to 30 seconds)

@@ -39,7 +39,7 @@
  *   • IDLE:           Mic icon is red. Audio thread suspended. Transcription idle.
  *   • LISTENING:      Mic icon is green with sine wave animation. Audio thread
  *                     actively capturing PCM into a temporary WAV file and ring
- *                     buffer. A configurable watchdog timer (default: 60s) auto-
+ *                     buffer. A configurable watchdog timer (default: 30s) auto-
  *                     transitions to TRANSCRIBING. VAD-based silence detection
  *                     can also trigger auto-stop when enabled.
  *   • TRANSCRIBING:   Sine wave stops. Audio file closed. Transcription thread
@@ -104,6 +104,23 @@ typedef enum {
     STATE_TRANSCRIBING    /* Running local whisper.cpp model — green icon, no animation */
 } AppState;
 
+/*
+ * FileUploadState — States for the file upload & transcription workflow
+ *
+ * Used by AppStateController to manage the lifecycle of file-based
+ * transcription operations.
+ */
+typedef enum {
+    FILE_UPLOAD_STATE_IDLE,              /* No file selected */
+    FILE_UPLOAD_STATE_FILE_SELECTED,     /* User selected a file via dialog */
+    FILE_UPLOAD_STATE_FILE_VALIDATED,    /* File passed validation checks */
+    FILE_UPLOAD_STATE_SEGMENTING,        /* VAD-based segmentation in progress */
+    FILE_UPLOAD_STATE_TRANSCRIBING,      /* whisper.cpp processing uploaded file */
+    FILE_UPLOAD_STATE_COMPLETE,          /* Transcription saved to history */
+    FILE_UPLOAD_STATE_ERROR              /* Error occurred during upload/transcription */
+} FileUploadState;
+
+
 /******************************************************************************
  * ModelStatus — Local Whisper Model Availability Indicator
  *
@@ -144,8 +161,8 @@ typedef enum {
  *                     Default: "default"
  *                     SRS: CFG-006, CFG-010, AUD-002
  *
- *   max_duration   — Maximum recording duration in seconds (5–120).
- *                     Default: 60
+ *   max_duration   — Maximum recording duration in seconds (5–30).
+ *                     Default: 30
  *                     SRS: CFG-014, FR-024
  *
  *   window_x, window_y — Persisted MainWindow position.
@@ -260,6 +277,11 @@ typedef void (*state_change_callback)(AppState previous_state,
 typedef struct {
     /* Current application state, protected by state_mutex. */
     AppState state;
+
+    /* Current file upload workflow state, protected by state_mutex.
+     * Independent of the microphone AppState machine — tracks the
+     * lifecycle of file-based transcription operations. */
+    FileUploadState file_upload_state;
 
     /* Current model availability status, protected by state_mutex. */
     ModelStatus model_status;
@@ -380,6 +402,39 @@ ModelStatus app_get_model_status(AppStateController *controller);
  *
  * SRS: Section 2.3, NR-019 */
 bool app_transition_to(AppStateController *controller, AppState target);
+
+/* app_get_file_upload_state — Thread-safe read of the file upload state.
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *
+ * Returns: The current FileUploadState (FILE_UPLOAD_STATE_IDLE if
+ *          controller is NULL). */
+FileUploadState app_get_file_upload_state(AppStateController *controller);
+
+/* app_file_upload_transition_to — Request a file upload state transition.
+ *
+ * Attempts to transition the file upload state machine to the target
+ * state. The transition is only allowed if the target is a valid next
+ * state from the current state.
+ *
+ * Valid transitions:
+ *   IDLE → FILE_SELECTED
+ *   FILE_SELECTED → FILE_VALIDATED
+ *   FILE_VALIDATED → SEGMENTING
+ *   SEGMENTING → TRANSCRIBING
+ *   TRANSCRIBING → COMPLETE | ERROR
+ *   COMPLETE → IDLE
+ *   ERROR → IDLE
+ *
+ * Parameters:
+ *   controller — Pointer to the initialized AppStateController.
+ *   target     — The desired target FileUploadState.
+ *
+ * Returns: true if the transition was accepted, false if rejected
+ *          (invalid transition or NULL controller). */
+bool app_file_upload_transition_to(AppStateController *controller,
+                                   FileUploadState target);
 
 /* app_set_model_status — Thread-safe update of connection status.
  *

@@ -73,6 +73,13 @@ typedef enum {
  * along with metadata about the result status. The text field is
  * dynamically allocated and must be freed using whisper_response_free()
  * when no longer needed.
+ *
+ * NOTE: This is the shared ASR result type for the application. The
+ * llama-server HTTP backend (app_llama.h) also returns WhisperResponse
+ * values, so all downstream result handling works identically for both
+ * transcription backends. On the llama backend, a successful response
+ * with an EMPTY text string is a valid result (silent segment), not an
+ * error.
  */
 typedef struct {
     char* text;              ///< Transcription text (dynamically allocated, NULL on error)

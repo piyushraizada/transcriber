@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(transcriber VERSION 2.1.5 LANGUAGES C CXX)
+project(transcriber VERSION 2.2.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,6 +14,17 @@ pkg_check_modules(ALSA REQUIRED alsa>=1.1.0)
 
 # JSON Library (still needed for config file parsing)
 pkg_check_modules(CJSON REQUIRED libcjson>=1.7.14)
+
+# FFmpeg — Audio format detection and PCM extraction for file upload
+# transcription. Used by src/app_file_upload.c to probe container metadata
+# (duration, stream info), validate supported audio formats, and decode +
+# resample arbitrary audio to 16kHz mono 16-bit PCM (libswresample).
+pkg_check_modules(FFMPEG REQUIRED
+    libavformat
+    libavcodec
+    libavutil
+    libswresample
+)
 
 # Local Whisper via whisper.cpp (ggml-org/whisper.cpp)
 # Uses FetchContent to download and build whisper.cpp as a static library.
@@ -122,6 +133,7 @@ set(SOURCES
     src/app_audio.c
     src/app_whisper.c
     src/app_whisper_safe.cpp
+    src/app_llama.c
     src/app_model_info.c
     src/app_gpu.c
     src/app_config.c
@@ -131,6 +143,8 @@ set(SOURCES
     src/app_ring_buffer.c
     src/app_silence_scanner.c
     src/app_noisereduction.c
+    src/app_file_upload.c
+    src/app_file_segmenter.c
 )
 
 # Append RNNoise library sources (inline, not as separate target — avoids CMake conflicts).
@@ -183,6 +197,7 @@ target_include_directories(transcriber PRIVATE
     ${CJSON_INCLUDE_DIRS}
     ${OPENBLAS_INCLUDE_DIRS}
     ${APPINDICATOR_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
     # whisper.cpp headers via FetchContent
     ${whisper_SOURCE_DIR}/include
     ${whisper_SOURCE_DIR}/examples
@@ -199,6 +214,7 @@ target_link_libraries(transcriber PRIVATE
     ${ALSA_LIBRARIES}
     ${CJSON_LIBRARIES}
     ${APPINDICATOR_LIBRARIES}
+    ${FFMPEG_LIBRARIES}
     whisper
     ${OPENBLAS_LIBRARIES}
     pthread
@@ -227,6 +243,7 @@ target_compile_options(transcriber PRIVATE
     ${ALSA_CFLAGS_OTHER}
     ${OPENBLAS_CFLAGS_OTHER}
     ${APPINDICATOR_CFLAGS_OTHER}
+    ${FFMPEG_CFLAGS_OTHER}
 )
 
 # Add WHISPER_CPP definition so app_whisper.c knows it's using local whisper

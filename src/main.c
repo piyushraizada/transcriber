@@ -78,11 +78,13 @@
 #include "app_silence_scanner.h"
 #include "app_vad.h"
 #include "app_whisper.h"
+#include "app_llama.h"
 #include "whisper.h"
 #include "app_config.h"
 #include "app_config_dialog.h"
 #include "app_clipboard.h"
 #include "app_dbus.h"
+#include "app_file_upload.h"
 #include "app_tray.h"
 #include "app_window.h"
 
@@ -115,7 +117,8 @@ static bool g_debug_logs_enabled = false;
  */
 static const char *LOG_DOMAINS[] = {
     NULL, "main", "app-audio", "app-scanner", "app-whisper",
-    "app-config", "app-gpu", "app-tray", "app_window", "app-ringbuffer"
+    "app-config", "app-gpu", "app-tray", "app_window", "app-ringbuffer",
+    "app-file", "app-file-seg"
 };
 #define LOG_DOMAINS_COUNT (sizeof(LOG_DOMAINS) / sizeof(LOG_DOMAINS[0]))
 
@@ -250,6 +253,9 @@ typedef struct TranscriberApp {
     DBusService *dbus_service;
     AudioRecorder *audio_recorder;
     WhisperClient *whisper_client;
+    LlamaClient *llama_client;       /* Second ASR backend (llama-server HTTP,
+                                        e.g. Gemma 4 12B). Stateless — no model
+                                        preload. Selected via config asr_backend. */
     SystemTray *tray;
     SilenceScanner *silence_scanner;
 
@@ -291,6 +297,22 @@ typedef struct TranscriberApp {
      * by continuous_clipboard_mutex. */
     char *continuous_clipboard_text;
     pthread_mutex_t continuous_clipboard_mutex;
+
+    /* File upload transcription (see app_file_upload.h).
+     * file_job is non-NULL while a file transcription pipeline is running.
+     * It is created and destroyed only on the GTK main thread; the pipeline
+     * thread (file_transcribe_thread) consumes it. file_job_mutex guards the
+     * pointer against the pipeline thread's final progress callback. */
+    FileUploadJob *file_job;
+    pthread_mutex_t file_job_mutex;
+    GThread *file_transcribe_thread;
+
+    /* Deferred file upload — set when the user picks a file while the model
+     * is not yet loaded; the job starts once on_model_loaded_idle fires. */
+    atomic_bool pending_file_upload;
+    char *pending_file_path;
+    char *pending_output_path;
+    double pending_duration;
 } TranscriberApp;
 
 /* ------------------------------------------------------------------ */
@@ -325,6 +347,12 @@ static void stop_volume_poll(TranscriberApp *app);
 static void perform_initial_model_load(TranscriberApp *app);
 static int get_transcription_timeout_seconds(TranscriberApp *app);
 static void on_tray_clear(TranscriberApp *app);
+static void on_upload_clicked(void *user_data);
+static bool start_file_upload_job(TranscriberApp *app, const char *input_path,
+                                  const char *output_path, double duration);
+static void file_upload_progress_cb(double percent, const char *status, void *user_data);
+static gboolean on_file_upload_progress_idle(gpointer data);
+static void on_file_upload_finished(TranscriberApp *app, const char *status);
 static TranscriberApp *app_create(void);
 static void app_destroy(TranscriberApp *app);
 
@@ -691,6 +719,75 @@ static void on_config_changed(void *user_data) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* ASR Backend Dispatch                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Sync the llama client's server URL and model alias from the current
+ * config so that configuration changes take effect from the next segment
+ * onward (no restart needed). Cheap: two short string copies under the
+ * client's mutex.
+ */
+static void sync_llama_client_from_config(TranscriberApp *app) {
+    if (!app || !app->llama_client || !app->controller.config) return;
+    llama_client_set_url(app->llama_client,
+                         config_get_llama_server_url(app->controller.config));
+    llama_client_set_model(app->llama_client,
+                           config_get_llama_model(app->controller.config));
+}
+
+/**
+ * True when the llama-server backend is the active ASR backend.
+ */
+static bool active_backend_is_llama(const TranscriberApp *app) {
+    return app && app->controller.config &&
+           strcmp(config_get_asr_backend(app->controller.config), "llama") == 0;
+}
+
+/**
+ * Dispatch an in-memory PCM transcription to the active ASR backend.
+ *
+ * whisper: in-process whisper.cpp (existing behavior, unchanged).
+ * llama:   llama-server HTTP; on any hard failure the same input is
+ *          automatically re-sent through the local Whisper client, which
+ *          lazy-loads its model on first use (see app_llama.h for the
+ *          full fallback semantics — a cancellation is not retried).
+ *
+ * The caller owns the returned WhisperResponse (free with
+ * whisper_response_free). Returns NULL only on critical allocation
+ * failure.
+ */
+static WhisperResponse *transcribe_active_backend(TranscriberApp *app,
+                                                  const int16_t *samples,
+                                                  int n_samples) {
+    if (active_backend_is_llama(app) && app->llama_client) {
+        sync_llama_client_from_config(app);
+        return llama_transcribe_samples_fallback(app->llama_client,
+                                                 app->whisper_client,
+                                                 samples, n_samples,
+                                                 config_get_language(app->controller.config));
+    }
+    return whisper_transcribe_samples(app->whisper_client, samples, n_samples);
+}
+
+/**
+ * Dispatch a WAV-file transcription to the active ASR backend.
+ * Same backend/fallback semantics as transcribe_active_backend().
+ */
+static WhisperResponse *transcribe_active_backend_file(TranscriberApp *app,
+                                                       const char *wav_path) {
+    if (active_backend_is_llama(app) && app->llama_client) {
+        sync_llama_client_from_config(app);
+        return llama_transcribe_wav_fallback(app->llama_client,
+                                             app->whisper_client,
+                                             wav_path,
+                                             config_get_language(app->controller.config));
+    }
+    return whisper_transcribe_with_retry(app->whisper_client, wav_path,
+                                         WHISPER_MAX_RETRIES);
+}
+
 /**
  * Callback invoked by the silence scanner when a segment is ready for transcription.
  * This runs on the scanner thread, so we marshal to GTK main thread via g_idle_add.
@@ -717,7 +814,7 @@ static void on_scanner_segment(int16_t *samples, size_t count, void *user_data)
      * but we minimize post-transcription work under the lock by extracting
      * the result data and freeing the response before unlocking. */
     pthread_mutex_lock(&app->scanner_transcribe_mutex);
-    WhisperResponse *response = whisper_transcribe_samples(app->whisper_client, samples, (int)count);
+    WhisperResponse *response = transcribe_active_backend(app, samples, (int)count);
     pthread_mutex_unlock(&app->scanner_transcribe_mutex);
 
     g_free(samples);  /* Free scanner-allocated samples outside mutex */
@@ -998,6 +1095,9 @@ static void handle_enter_transcribing(TranscriberApp *app, const char *wav_path)
          * while waiting for that thread to respond. */
         if (old_thread) {
             whisper_client_cancel(app->whisper_client);
+            if (app->llama_client) {
+                llama_client_cancel(app->llama_client);
+            }
             g_thread_join(old_thread);
         }
 
@@ -1202,8 +1302,8 @@ static gpointer transcribe_thread_func(gpointer data) {
     WhisperResponse *response = NULL;
 
     if (samples && n_samples > 0) {
-        /* In-memory transcription from ring buffer */
-        response = whisper_transcribe_samples(app->whisper_client, samples, (int)n_samples);
+        /* In-memory transcription from ring buffer (active backend) */
+        response = transcribe_active_backend(app, samples, (int)n_samples);
         g_free(samples);
     } else {
         /* Fallback: try WAV file path if ring buffer is empty */
@@ -1213,7 +1313,7 @@ static gpointer transcribe_thread_func(gpointer data) {
         pthread_mutex_unlock(&app->wav_path_mutex);
 
         if (wav_path[0] != '\0') {
-            response = whisper_transcribe_with_retry(app->whisper_client, wav_path, WHISPER_MAX_RETRIES);
+            response = transcribe_active_backend_file(app, wav_path);
         }
     }
 
@@ -1577,6 +1677,22 @@ static gboolean on_model_loaded_idle(gpointer data) {
         tray_set_model_status(app->tray, MODEL_AVAILABLE);
     }
 
+    /* If loading was triggered by a file upload click, start the deferred
+     * file transcription job now that the model is ready. */
+    if (atomic_exchange(&app->pending_file_upload, false)) {
+        char *input = app->pending_file_path;
+        char *output = app->pending_output_path;
+        double duration = app->pending_duration;
+        app->pending_file_path = NULL;
+        app->pending_output_path = NULL;
+        if (input && output) {
+            start_file_upload_job(app, input, output, duration);
+        }
+        g_free(input);
+        g_free(output);
+        return FALSE;
+    }
+
     /* If loading was triggered by user click, auto-transition to LISTENING */
     if (from_toggle) {
         app_toggle_state(&app->controller);
@@ -1656,6 +1772,21 @@ static gboolean on_model_load_failed_idle(gpointer data) {
 static void on_microphone_toggle(void *user_data) {
     TranscriberApp *app = (TranscriberApp *)user_data;
 
+    /* Reject mic clicks while a file transcription is running — the two
+     * pipelines share the whisper client and must not interleave. */
+    {
+        pthread_mutex_lock(&app->file_job_mutex);
+        bool file_job_active = (app->file_job != NULL);
+        pthread_mutex_unlock(&app->file_job_mutex);
+        if (file_job_active) {
+            show_auto_close_dialog(app, "File Transcription In Progress",
+                                   GTK_MESSAGE_INFO,
+                                   "A file transcription is running.\n\n"
+                                   "Click the Cancel button to stop it first.");
+            return;
+        }
+    }
+
     /* Only check local model when starting recording (IDLE -> LISTENING) */
     AppState current = app_get_state(&app->controller);
     const char *state_name[] = {"IDLE", "LISTENING", "TRANSCRIBING"};
@@ -1664,8 +1795,10 @@ static void on_microphone_toggle(void *user_data) {
     if (current == STATE_IDLE) {
         /* STARTUP-LOADING: If model is still loading from startup,
          * reject the click. The "WAIT" overlay on the icon should
-         * have made this clear to the user. */
-        if (app->main_window && app_window_get_model_loading(app->main_window)) {
+         * have made this clear to the user. (Whisper backend only —
+         * the llama backend has no in-process model loading state.) */
+        if (!active_backend_is_llama(app) &&
+            app->main_window && app_window_get_model_loading(app->main_window)) {
             return;  /* Model still loading — ignore click */
         }
         /* CFG-015: Validate that the configured audio device is available */
@@ -1700,6 +1833,15 @@ static void on_microphone_toggle(void *user_data) {
                 return; /* Abort — do not start recording */
             }
         }
+
+        /* llama backend: no in-process model to validate, load, or wait
+         * for — skip the Whisper model gates below entirely. Server
+         * reachability is handled per segment (with automatic fallback
+         * to local Whisper). Sync the client so config changes take
+         * effect from this recording onward. */
+        if (active_backend_is_llama(app)) {
+            sync_llama_client_from_config(app);
+        } else {
 
         /* Check that a valid GGUF model file is configured and accessible */
         const char *model_path = config_get_model_path(app->controller.config);
@@ -1789,6 +1931,8 @@ static void on_microphone_toggle(void *user_data) {
         if (app->whisper_client && whisper_client_is_loading(app->whisper_client)) {
             return;
         }
+
+        }  /* end Whisper-backend model gates (skipped for the llama backend) */
     }
 
     /* When user clicks during LISTENING or TRANSCRIBING in continuous mode, set the stop flag
@@ -1817,6 +1961,395 @@ static void on_microphone_toggle(void *user_data) {
       * 2. User is stopping recording (LISTENING -> TRANSCRIBING)
       * 3. User is in TRANSCRIBING state (no-op) */
     app_toggle_state(&app->controller);
+}
+
+/* ------------------------------------------------------------------ */
+/* File Upload Transcription                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Start a file transcription job.
+ *
+ * Called on the GTK main thread with the model already loaded. Opens the
+ * output file, creates the job, and spawns the pipeline thread.
+ *
+ * @return true if the job started, false on failure (dialog shown).
+ */
+static bool start_file_upload_job(TranscriberApp *app,
+                                  const char *input_path,
+                                  const char *output_path,
+                                  double duration) {
+    FileUploadJobConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.whisper_client = app->whisper_client;
+    cfg.llama_client = app->llama_client;
+    cfg.whisper_mutex = &app->scanner_transcribe_mutex;
+    cfg.input_path = input_path;
+    cfg.output_path = output_path;
+    cfg.total_duration = duration;
+    cfg.on_progress = file_upload_progress_cb;
+    cfg.user_data = app;
+
+    /* Snapshot the active backend and language for the job. The config
+     * may change while the job runs; each job keeps its snapshot. */
+    if (app->controller.config) {
+        const char *backend = config_get_asr_backend(app->controller.config);
+        if (backend) {
+            strncpy(cfg.asr_backend, backend, sizeof(cfg.asr_backend) - 1);
+            cfg.asr_backend[sizeof(cfg.asr_backend) - 1] = '\0';
+        }
+        const char *lang = config_get_language(app->controller.config);
+        if (lang) {
+            strncpy(cfg.language, lang, sizeof(cfg.language) - 1);
+            cfg.language[sizeof(cfg.language) - 1] = '\0';
+        }
+    }
+
+    FileUploadJob *job = file_upload_job_create(&cfg);
+    if (!job) {
+        show_auto_close_dialog(app, "Save Failed", GTK_MESSAGE_ERROR,
+            "Could not open the output file for writing.\n\n"
+            "Please check the path and permissions, then try again.");
+        return false;
+    }
+
+    GThread *thread = g_thread_new("file-transcribe", file_upload_run_pipeline, job);
+    if (!thread) {
+        g_log("main", G_LOG_LEVEL_ERROR,
+              "[file] Failed to create file transcription thread\n");
+        file_upload_job_destroy(job);
+        show_auto_close_dialog(app, "Error", GTK_MESSAGE_ERROR,
+            "Failed to start the transcription thread.\n\n"
+            "Please check system resources and try again.");
+        return false;
+    }
+
+    pthread_mutex_lock(&app->file_job_mutex);
+    app->file_job = job;
+    app->file_transcribe_thread = thread;
+    pthread_mutex_unlock(&app->file_job_mutex);
+
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_FILE_SELECTED);
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_FILE_VALIDATED);
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_SEGMENTING);
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_TRANSCRIBING);
+
+    if (app->main_window) {
+        app_window_set_upload_active(app->main_window, true);
+        app_window_set_file_progress(app->main_window, 0.0, "Starting…");
+    }
+    g_log("main", G_LOG_LEVEL_INFO,
+          "[file] File transcription started: %s -> %s\n", input_path, output_path);
+    return true;
+}
+
+/* Heap-allocated payload marshaled from the pipeline thread to the GTK
+ * main thread for each progress update. */
+typedef struct {
+    TranscriberApp *app;
+    double percent;
+    char *status;
+} FileProgressData;
+
+/**
+ * Pipeline progress callback — runs on the file-transcribe thread.
+ * Marshals the progress update to the GTK main thread via g_idle_add.
+ */
+static void file_upload_progress_cb(double percent, const char *status, void *user_data) {
+    TranscriberApp *app = (TranscriberApp *)user_data;
+    if (!app) return;
+
+    FileProgressData *fpd = g_new0(FileProgressData, 1);
+    if (!fpd) return;
+    fpd->app = app;
+    fpd->percent = percent;
+    fpd->status = g_strdup(status ? status : "");
+    if (!fpd->status) {
+        g_free(fpd);
+        return;
+    }
+    g_idle_add(on_file_upload_progress_idle, fpd);
+}
+
+/**
+ * GTK idle callback: apply a file-transcription progress update.
+ */
+static gboolean on_file_upload_progress_idle(gpointer data) {
+    FileProgressData *fpd = (FileProgressData *)data;
+    TranscriberApp *app = fpd->app;
+
+    if (app->main_window) {
+        app_window_set_file_progress(app->main_window, fpd->percent, fpd->status);
+    }
+
+    /* Terminal states: finish the job */
+    if (g_strcmp0(fpd->status, "Transcription Complete") == 0 ||
+        g_strcmp0(fpd->status, "Cancelled") == 0 ||
+        (fpd->status && g_str_has_prefix(fpd->status, "Error"))) {
+        on_file_upload_finished(app, fpd->status);
+    }
+
+    g_free(fpd->status);
+    g_free(fpd);
+    return G_SOURCE_REMOVE;
+}
+
+/**
+ * Finish a file transcription job (GTK main thread).
+ * Joins the pipeline thread, cleans up the job, and resets the UI.
+ */
+static void on_file_upload_finished(TranscriberApp *app, const char *status) {
+    pthread_mutex_lock(&app->file_job_mutex);
+    GThread *thread = app->file_transcribe_thread;
+    FileUploadJob *job = app->file_job;
+    app->file_job = NULL;
+    app->file_transcribe_thread = NULL;
+    pthread_mutex_unlock(&app->file_job_mutex);
+
+    if (thread) {
+        g_thread_join(thread);
+    }
+    if (job) {
+        file_upload_job_destroy(job);
+    }
+
+    bool cancelled = (status && g_strcmp0(status, "Cancelled") == 0);
+    bool error = (status && g_str_has_prefix(status, "Error"));
+
+    if (cancelled) {
+        app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_ERROR);
+    } else if (error) {
+        app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_ERROR);
+    } else {
+        app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_COMPLETE);
+    }
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_IDLE);
+
+    if (app->main_window) {
+        app_window_set_upload_active(app->main_window, false);
+    }
+
+    if (error) {
+        show_auto_close_dialog(app, "Transcription Error", GTK_MESSAGE_ERROR,
+            "%s\n\nThe operation was cancelled and no output file was written.",
+            status);
+    } else if (!cancelled) {
+        g_log("main", G_LOG_LEVEL_INFO, "[file] File transcription complete\n");
+    }
+}
+
+/**
+ * File button click handler (GTK main thread).
+ *
+ * - If a job is running: request cancellation.
+ * - If the mic is recording/transcribing: reject.
+ * - Otherwise: file chooser → validate → save dialog → start job (or defer
+ *   until the model finishes loading).
+ */
+static void on_upload_clicked(void *user_data) {
+    TranscriberApp *app = (TranscriberApp *)user_data;
+    if (!app) return;
+
+    /* Cancellation path */
+    pthread_mutex_lock(&app->file_job_mutex);
+    FileUploadJob *running_job = app->file_job;
+    pthread_mutex_unlock(&app->file_job_mutex);
+    if (running_job) {
+        g_log("main", G_LOG_LEVEL_INFO, "[file] Cancellation requested\n");
+        file_upload_job_request_cancel(running_job);
+        /* Abort any in-flight whisper or llama inference promptly */
+        if (app->whisper_client) {
+            whisper_client_cancel(app->whisper_client);
+        }
+        if (app->llama_client) {
+            llama_client_cancel(app->llama_client);
+        }
+        if (app->main_window) {
+            app_window_set_file_progress(app->main_window, 0.0, "Cancelling…");
+        }
+        return;
+    }
+
+    /* Reject while live recording is active */
+    AppState current = app_get_state(&app->controller);
+    if (current == STATE_LISTENING || current == STATE_TRANSCRIBING) {
+        show_auto_close_dialog(app, "Recording In Progress", GTK_MESSAGE_INFO,
+            "Stop the current recording before transcribing a file.");
+        return;
+    }
+
+    /* STARTUP-LOADING: model still loading from startup */
+    if (app->main_window && app_window_get_model_loading(app->main_window)) {
+        show_auto_close_dialog(app, "Model Loading", GTK_MESSAGE_INFO,
+            "Please wait for the model to finish loading.");
+        return;
+    }
+
+    /* ---- Step 1: File chooser ----
+     * No format filter: any file can be selected. FFmpeg is the sole
+     * arbiter of what is decodable, and its error is shown to the user. */
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Select File",
+        GTK_WINDOW(app_window_get_gtk_window(app->main_window)),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Open", GTK_RESPONSE_ACCEPT,
+        NULL);
+    GtkFileFilter *all_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(all_filter, "All files");
+    gtk_file_filter_add_pattern(all_filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(chooser), all_filter);
+
+    char *input_path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        input_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    }
+    gtk_widget_destroy(chooser);
+    if (!input_path) {
+        return;  /* User cancelled */
+    }
+
+    /* ---- Step 2: Validate (synchronous; local-file probes are fast) ---- */
+    FileUploadContext vctx;
+    if (file_upload_init(&vctx, input_path, NULL, NULL) != 0 ||
+        file_upload_validate(&vctx) != 0) {
+        FileUploadResult res = file_upload_get_result(&vctx);
+        show_auto_close_dialog(app, "Invalid Audio File", GTK_MESSAGE_ERROR,
+            "%s\n\nDuration must be between 2 and 600 seconds.",
+            res.error_message ? res.error_message : "Unknown error");
+        file_upload_cleanup(&vctx);
+        g_free(input_path);
+        return;
+    }
+    /* May be 0.0 when the container has no duration metadata; the pipeline
+     * recomputes the true duration from the decoded sample count. */
+    double duration = vctx.duration;
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_FILE_SELECTED);
+    app_file_upload_transition_to(&app->controller, FILE_UPLOAD_STATE_FILE_VALIDATED);
+
+    /* ---- Step 3: Save Transcription As dialog ---- */
+    GtkWidget *save_chooser = gtk_file_chooser_dialog_new(
+        "Save Transcription As",
+        GTK_WINDOW(app_window_get_gtk_window(app->main_window)),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Save", GTK_RESPONSE_ACCEPT,
+        NULL);
+    GtkFileFilter *text_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(text_filter, "Text files");
+    gtk_file_filter_add_pattern(text_filter, "*.txt");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(save_chooser), text_filter);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(save_chooser), TRUE);
+
+    /* Default filename: <basename>_transcription.txt */
+    {
+        char *base = g_path_get_basename(input_path);
+        char *dot = base ? strrchr(base, '.') : NULL;
+        if (dot) *dot = '\0';
+        char *default_name = g_strdup_printf("%s_transcription.txt", base ? base : "transcription");
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(save_chooser), default_name);
+        g_free(default_name);
+        g_free(base);
+    }
+
+    char *output_path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(save_chooser)) == GTK_RESPONSE_ACCEPT) {
+        output_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(save_chooser));
+    }
+    gtk_widget_destroy(save_chooser);
+    if (!output_path) {
+        file_upload_cleanup(&vctx);
+        g_free(input_path);
+        return;  /* User cancelled */
+    }
+
+    /* ---- Step 4: Model gate (Whisper backend only) ----
+     * The llama backend has no in-process model: every segment is sent
+     * to the server with automatic fallback to local Whisper, so no
+     * model validation, loading, or deferral is required here. */
+    if (!active_backend_is_llama(app)) {
+    const char *model_path = config_get_model_path(app->controller.config);
+    if (!model_path || model_path[0] == '\0' ||
+        !config_dialog_validate_model(model_path)) {
+        show_auto_close_dialog(app, "Model Not Found", GTK_MESSAGE_ERROR,
+            APP_ERROR_NO_VALID_MODEL ".\n\n"
+            "Please configure a valid Whisper model file in Settings.");
+        file_upload_cleanup(&vctx);
+        g_free(input_path);
+        g_free(output_path);
+        return;
+    }
+
+    if (app->whisper_client && !whisper_client_is_model_loaded(app->whisper_client) &&
+        !whisper_client_is_loading(app->whisper_client)) {
+        /* Model not loaded yet — defer the job until loading completes.
+         * Reuse the lazy-load path from on_microphone_toggle. */
+        atomic_store(&app->pending_file_upload, true);
+        g_free(app->pending_file_path);
+        g_free(app->pending_output_path);
+        app->pending_file_path = input_path;
+        app->pending_output_path = output_path;
+        app->pending_duration = duration;
+        input_path = NULL;
+        output_path = NULL;
+
+        atomic_store(&app->model_loading_from_toggle, 1);
+        whisper_client_set_model_path(app->whisper_client, model_path);
+        const char *lang = config_get_language(app->controller.config);
+        whisper_client_set_language(app->whisper_client, lang);
+
+        app_set_model_status(&app->controller, MODEL_LOADING);
+        if (app->main_window) {
+            app_window_set_model_status(app->main_window, MODEL_LOADING);
+            app_window_set_model_loading(app->main_window, TRUE);
+        }
+        if (app->tray) {
+            tray_set_model_status(app->tray, MODEL_LOADING);
+        }
+
+        pthread_mutex_lock(&app->model_load_thread_mutex);
+        if (app->model_load_thread) {
+            g_thread_join(app->model_load_thread);
+            app->model_load_thread = NULL;
+        }
+        app->model_load_thread = g_thread_new("model_loading",
+                               model_loading_thread_func, app);
+        pthread_mutex_unlock(&app->model_load_thread_mutex);
+
+        if (!app->model_load_thread) {
+            atomic_store(&app->pending_file_upload, false);
+            g_free(app->pending_file_path);
+            g_free(app->pending_output_path);
+            app->pending_file_path = NULL;
+            app->pending_output_path = NULL;
+            app_set_model_status(&app->controller, MODEL_UNAVAILABLE);
+            if (app->main_window) {
+                app_window_set_model_loading(app->main_window, FALSE);
+                app_window_set_model_status(app->main_window, MODEL_UNAVAILABLE);
+            }
+            show_auto_close_dialog(app, "Model Load Error", GTK_MESSAGE_ERROR,
+                "Failed to start model loading thread.\n\n"
+                "Please check system resources and try again.");
+        }
+        file_upload_cleanup(&vctx);
+        return;  /* Job starts from on_model_loaded_idle */
+    }
+
+    if (app->whisper_client && whisper_client_is_loading(app->whisper_client)) {
+        show_auto_close_dialog(app, "Model Loading", GTK_MESSAGE_INFO,
+            "Please wait for the model to finish loading.");
+        file_upload_cleanup(&vctx);
+        g_free(input_path);
+        g_free(output_path);
+        return;
+    }
+    }  /* end Whisper-backend model gate (skipped for the llama backend) */
+
+    /* ---- Step 5: Start the job ---- */
+    start_file_upload_job(app, input_path, output_path, duration);
+    file_upload_cleanup(&vctx);
+    g_free(input_path);
+    g_free(output_path);
 }
 
 /**
@@ -1856,6 +2389,33 @@ static void on_dbus_activate(void *user_data) {
  */
 static void perform_initial_model_load(TranscriberApp *app) {
     if (!app->whisper_client) return;
+
+    /* llama backend (D7): do NOT preload the local Whisper model — it
+     * lazy-loads on the first automatic fallback. Instead, sync the
+     * llama client from config and use the server's health for the
+     * status indicator. An unreachable server is informational only:
+     * recording stays possible (transcription falls back to local
+     * Whisper, and errors surface at that point). */
+    if (active_backend_is_llama(app)) {
+        if (app->llama_client) {
+            sync_llama_client_from_config(app);
+        }
+        bool healthy = app->llama_client && llama_check_connection(app->llama_client);
+        ModelStatus status = healthy ? MODEL_AVAILABLE : MODEL_UNAVAILABLE;
+        app_set_model_status(&app->controller, status);
+        if (app->main_window) {
+            app_window_set_model_loading(app->main_window, FALSE);
+            app_window_set_model_status(app->main_window, status);
+        }
+        if (app->tray) {
+            tray_set_model_status(app->tray, status);
+        }
+        g_log("main", G_LOG_LEVEL_MESSAGE,
+              "[flow] llama backend active — Whisper preload skipped, "
+              "server %s\n",
+              healthy ? "healthy" : "unreachable (local Whisper fallback available)");
+        return;
+    }
 
     /* Validate model path before attempting load */
     const char *model_path = config_get_model_path(app->controller.config);
@@ -2130,6 +2690,17 @@ static TranscriberApp *app_create(void) {
         return NULL;
     }
 
+    /* Create the llama-server ASR client (second backend, selected via
+     * config asr_backend). Stateless — nothing to preload. If creation
+     * fails the app continues with the Whisper backend only. */
+    app->llama_client = llama_client_create(
+        config_get_llama_server_url(&app->config),
+        config_get_llama_model(&app->config));
+    if (!app->llama_client) {
+        g_log("main", G_LOG_LEVEL_WARNING,
+              "[llama] Failed to create llama client — llama backend unavailable\n");
+    }
+
     /* Silence scanner will be created lazily when entering continuous mode
      * (ring buffer only exists after audio_recorder_start()). */
     app->silence_scanner = NULL;
@@ -2138,6 +2709,7 @@ static TranscriberApp *app_create(void) {
     app->main_window = app_window_create(&app->config, &app->controller, app->whisper_client);
     if (!app->main_window) {
         whisper_client_destroy(app->whisper_client);
+        llama_client_destroy(app->llama_client);
         audio_recorder_destroy(app->audio_recorder);
         app_state_controller_cleanup(&app->controller);
         g_free(app);
@@ -2148,6 +2720,7 @@ static TranscriberApp *app_create(void) {
     app_window_set_toggle_callback(app->main_window, on_microphone_toggle, app);
     app_window_set_clear_callback(app->main_window, (void (*)(void *))on_tray_clear, app);
     app_window_set_config_changed_callback(app->main_window, on_config_changed, app);
+    app_window_set_upload_callback(app->main_window, on_upload_clicked, app);
 
     /* Create TextWindow */
     GtkWindow *gtk_win = app_window_get_gtk_window(app->main_window);
@@ -2176,13 +2749,15 @@ static TranscriberApp *app_create(void) {
         pthread_mutex_init(&app->transcribe_thread_mutex, NULL) != 0 ||
         pthread_mutex_init(&app->model_load_thread_mutex, NULL) != 0 ||
         pthread_mutex_init(&app->scanner_transcribe_mutex, NULL) != 0 ||
-        pthread_mutex_init(&app->continuous_clipboard_mutex, NULL) != 0) {
+        pthread_mutex_init(&app->continuous_clipboard_mutex, NULL) != 0 ||
+        pthread_mutex_init(&app->file_job_mutex, NULL) != 0) {
         app_destroy(app);
         return NULL;
     }
 
     /* Initialize atomic flags */
     atomic_store(&app->model_loading_from_toggle, 0);
+    atomic_store(&app->pending_file_upload, false);
 
     /* Initialize shutdown flag */
     app->shutting_down = false;
@@ -2242,6 +2817,9 @@ static void app_destroy(TranscriberApp *app) {
     if (app->whisper_client) {
         whisper_client_cancel(app->whisper_client);
     }
+    if (app->llama_client) {
+        llama_client_cancel(app->llama_client);
+    }
 
     /* Join the transcription thread */
     pthread_mutex_lock(&app->transcribe_thread_mutex);
@@ -2270,10 +2848,36 @@ static void app_destroy(TranscriberApp *app) {
         app->silence_scanner = NULL;
     }
 
-    /* Destroy Whisper client (after scanner is stopped to prevent use-after-free) */
+    /* Cancel and join any in-flight file transcription pipeline BEFORE
+     * destroying the whisper client (same use-after-free rule as the scanner).
+     * The pipeline thread holds a reference to app->whisper_client. */
+    pthread_mutex_lock(&app->file_job_mutex);
+    FileUploadJob *shutdown_file_job = app->file_job;
+    GThread *shutdown_file_thread = app->file_transcribe_thread;
+    app->file_job = NULL;
+    app->file_transcribe_thread = NULL;
+    pthread_mutex_unlock(&app->file_job_mutex);
+    if (shutdown_file_job) {
+        file_upload_job_request_cancel(shutdown_file_job);
+    }
+    if (shutdown_file_thread) {
+        g_thread_join(shutdown_file_thread);
+    }
+    if (shutdown_file_job) {
+        file_upload_job_destroy(shutdown_file_job);
+    }
+
+    /* Destroy Whisper client (after scanner and file pipeline are stopped) */
     if (app->whisper_client) {
         whisper_client_destroy(app->whisper_client);
         app->whisper_client = NULL;
+    }
+
+    /* Destroy the llama client (same use-after-free rule: only after the
+     * scanner and file pipeline threads have been joined). */
+    if (app->llama_client) {
+        llama_client_destroy(app->llama_client);
+        app->llama_client = NULL;
     }
 
     /* Destroy audio recorder */
@@ -2291,12 +2895,17 @@ static void app_destroy(TranscriberApp *app) {
     /* Free accumulated continuous-mode clipboard text */
     g_free(app->continuous_clipboard_text);
 
+    /* Free deferred file-upload paths */
+    g_free(app->pending_file_path);
+    g_free(app->pending_output_path);
+
     /* Destroy mutexes */
     pthread_mutex_destroy(&app->wav_path_mutex);
     pthread_mutex_destroy(&app->transcribe_thread_mutex);
     pthread_mutex_destroy(&app->model_load_thread_mutex);
     pthread_mutex_destroy(&app->scanner_transcribe_mutex);
     pthread_mutex_destroy(&app->continuous_clipboard_mutex);
+    pthread_mutex_destroy(&app->file_job_mutex);
 
     /* Drain any pending GTK idle callbacks that may reference 'app' before
      * freeing it. Worker threads (scanner, transcription) queue idle callbacks
