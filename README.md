@@ -7,6 +7,7 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
 *   **Clear Transcription:** Right-click the microphone icon (when idle) to clear all transcribed text from the text window, clipboard, and internal buffer. Also available as "Clear Transcription" in the system tray context menu.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
+*   **Optional LLM ASR Backend:** Route transcription to a local [llama-server](https://github.com/ggml-org/llama.cpp) instance (OpenAI-compatible API, e.g. Gemma 4 12B) instead of the built-in Whisper. If the server is unavailable, each segment automatically falls back to local Whisper. See [LLM ASR Backend](#llm-asr-backend-llama-server) for details.
 *   **File Upload Transcription:** Transcribe existing audio files offline. Click the **File** button in the main window's status bar, pick any audio file (any container/codec FFmpeg can decode), and the app decodes it, segments the speech with VAD, transcribes each segment, and writes the result to a `.txt` file you choose. See [File Upload Transcription](#file-upload-transcription) for details.
 *   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard. In continuous dictation mode the clipboard always holds the **full accumulated transcript** (capped at 512 KiB), not just the last segment. Text is automatically cleared from the clipboard on application exit to prevent stale data persisting after shutdown.
 *   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
@@ -262,10 +263,39 @@ In addition to live microphone dictation, Transcriber can transcribe existing au
 - If the Whisper model is still loading when you pick a file, the job is queued and starts automatically once the model finishes loading.
 - Segmentation reuses the same VAD logic as live dictation: audio is processed in 30-second windows and split at natural silence boundaries.
 
+## LLM ASR Backend (llama-server)
+
+By default, Transcriber transcribes with the built-in Whisper model. As an alternative, you can route audio to a local [llama-server](https://github.com/ggml-org/llama.cpp) instance (llama.cpp's OpenAI-compatible API server) running an audio-capable LLM — for example Gemma 4 12B — and use it as the transcription engine. Everything still stays on your own machine: the app talks to a local URL and no cloud service is involved.
+
+### Setup
+
+1. Start llama-server with your audio model and give it an **alias**:
+
+   ```bash
+   llama-server -m /path/to/model.gguf --alias gemma-4-12b --port 8005
+   ```
+
+2. Open Transcriber **Settings** (gear button) and select **Gemma 4 12B (llama-server HTTP)** in the **Transcription Backend** dropdown.
+3. Set the **llama-server URL** (default: `http://127.0.0.1:8005`) and the **Model alias** (default: `gemma-4-12b` — the name the server advertises, from its `--alias` flag).
+4. Click **Test Connection**. A reachable server shows a green status, and — when the server advertises exactly one model — the alias field is filled in automatically from the server's `/v1/models` endpoint (with several advertised, they are listed and you pick one). The field is only updated in the dialog; nothing is saved until you click **Save**.
+5. Click **Save**. The change applies from the next transcription — no restart required.
+
+### Behavior
+
+- Audio is sent to the server's `/v1/chat/completions` endpoint as 16 kHz mono WAV with temperature 0; the request's `model` field is your configured alias.
+- The configured **Language** is respected: unless it is Auto-detect, the request prompt becomes "Transcribe this audio in \<language\>."
+- **Automatic fallback:** if a request fails for any reason (server down, connection refused, HTTP error, timeout, invalid response), that segment is transcribed by the local Whisper model instead — no restart or re-configuration needed. While the llama backend is active the Whisper model is not preloaded; it loads on demand the first time a fallback is needed.
+- Cancellation (Cancel during a file job, or the app's transcription watchdog) never triggers the fallback — cancelled work simply stops.
+- Both live dictation and **File Upload Transcription** use the active backend.
+- The Whisper Model Path setting still applies in this mode — it is the fallback engine and must remain valid.
+
 ## Configuration
 
 Configuration is stored in `~/.config/transcriber/config.json`. You can adjust settings such as:
 
+- **ASR backend** — `whisper` (built-in whisper.cpp, default) or `llama` (llama-server HTTP). See [LLM ASR Backend](#llm-asr-backend-llama-server).
+- **llama-server URL** — base URL of the llama-server instance (default: `http://127.0.0.1:8005`); used only when the backend is `llama`
+- **Model alias** — the model name the llama-server advertises (its `--alias`), sent as the `model` field of each request (default: `gemma-4-12b`); used only when the backend is `llama`
 - **Model path** — path to a GGML/GGUF Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`). A bare filename (e.g. `ggml-base.bin`) is searched in `~/.cache/whisper/` and the system model directory (`/usr/share/transcriber/models/`); `~` is expanded.
 - **Audio device** — ALSA capture device (default: system default)
 - **Max duration** — maximum length of a single recording session in seconds before recording is automatically stopped and the buffered audio is transcribed (default: 30, range: 5–30)
@@ -283,6 +313,7 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 
 The settings dialog is opened via the **gear button** in the main window's status bar (bottom-left corner). The system tray context menu's "Show Window" item brings the main window to the front so you can reach it. In addition to the options above, the dialog provides:
 
+- **Transcription backend** — a dropdown selecting the engine: **Whisper (local, offline)** or **Gemma 4 12B (llama-server HTTP)**. In llama mode the URL and Model alias fields are active, along with a **Test Connection** button that verifies the server's health and, when it advertises exactly one model, fills the alias field with that name automatically (see [LLM ASR Backend](#llm-asr-backend-llama-server)).
 - **Model info** — once a model path is set, the dialog asynchronously loads the model's metadata and displays its name, quantization, and whether it is multilingual or English-only (e.g. `large-v3-turbo - Q8_0 - Multilingual`). An invalid or missing model shows a red "No valid whisper ggml file found" notice.
 - **Audio device** — a dropdown populated from the ALSA device list.
 - **D-Bus hotkey command** — a read-only field showing the `dbus-send` command with a **Copy** button, so you can bind it to a global shortcut.

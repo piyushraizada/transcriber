@@ -10,6 +10,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.3 | 2026-08-31 | Added the LLM ASR Backend (llama-server) capability (§2.9) and its scope entry. Added `asr_backend` (default whisper), `llama_server_url` (default http://127.0.0.1:8005), and `llama_model` (default gemma-4-12b) to §3.1, and the llama-server fixed constants (connect timeout 5 s, read deadline 120 s, 10-minute per-request audio cap, temperature 0) to §3.2. Added the LLM Backend Unavailable automatic-fallback behavior (§5.7). Updated the §2.3 transcription bullets, the §2.4 Configuration Dialog section list, and the §7 configuration example. |
 | 3.2 | 2026-08-24 | Added the File Upload Transcription capability (§2.8) and its scope entry. Added missing configuration settings to §3.1: `flash_attention` (default true), `noise_suppression` (default false), `debug_logs` (default false). Corrected §3.3: the minimum-segment key is `scanner_min_segment_sec` (seconds, range 1–30, default 5.0) and it IS exposed in the Configuration Dialog; removed `audio_device_display_name` (no longer stored by the application). Corrected the GPU auto-select threshold in §3.1 to max(512 MiB, model size + 500 MiB) and the language count to ~77. |
 | 3.1 | 2026-08-24 | Corrected configuration constants to match the implementation: max_duration default 30s, range 5–30 (the v2.5 note of 60s / 5–120 was never reflected in code). Fixed the Appendix config example to use the real `scanner_silence_sec` key (the `vad_silence_ms` key shown previously is not read by the application) and the correct max_duration default. |
 | 3.0 | 2026-07-06 | Major rewrite: stripped implementation and architectural design details. Retained user-facing capabilities, configuration settings reference, and behavioral requirements only. Removed threading model, API call sequences, widget internals, code snippets, test plan, and deployment procedures. |
@@ -47,6 +48,7 @@ The Transcriber application provides:
 - System clipboard integration for copying transcribed text to other applications
 - Configurable model path, audio device, transcription language, GPU mode, VAD sensitivity, silence timeout, max segment duration, text append/overwrite mode, and continuous dictation toggle
 - Offline transcription of existing audio files (any format FFmpeg can decode) via the File button
+- Selectable transcription backend: the built-in Whisper model (default) or a local llama-server instance running an audio-capable LLM, with automatic per-segment fallback to Whisper when the server is unavailable
 - GPU (CUDA) acceleration support with automatic CPU fallback
 - System tray icon with state-aware display and context menu
 - Global hotkey support via D-Bus for toggling recording without clicking the window
@@ -91,6 +93,7 @@ The application operates in three states:
 ### 2.3 Transcription
 
 - Local Whisper model inference via whisper.cpp — fully offline, no network required
+- The transcription engine is user-selectable: the built-in Whisper model (default) or a local llama-server HTTP backend running an audio-capable LLM (see §2.9). In llama mode the Whisper model serves as an automatic per-segment fallback and is not preloaded
 - Model loads lazily on first transcription request in a background thread (does not block the UI)
 - GPU (CUDA) acceleration supported with automatic CPU fallback when GPU is unavailable or has insufficient memory
 - User-selectable GPU mode: Auto (best free memory), CPU Only, or specific GPU device
@@ -130,7 +133,7 @@ The application operates in three states:
 #### Configuration Dialog
 - Modal dialog titled "Transcriber Settings" opened by clicking the gear icon on the status bar
 - Positioned adjacent to the main window (right side with screen-edge awareness)
-- Contains all configurable settings organized in sections: Whisper Model Path, Audio Device, Language, Max Duration, GPU Acceleration, Transcription Text Mode, Voice Activity Detection (VAD), D-Bus Hotkey Command, and Reset Window Position
+- Contains all configurable settings organized in sections: Transcription Backend (engine selection, llama-server URL, Model alias, and a Test Connection button in llama mode), Whisper Model Path, Audio Device, Language, Max Duration, GPU Acceleration, Transcription Text Mode, Voice Activity Detection (VAD), D-Bus Hotkey Command, and Reset Window Position
 - Action buttons: Save, Cancel
 - "Save" validates inputs, writes to `~/.config/transcriber/config.json`, closes dialog. "Cancel" discards changes.
 - Unsaved changes are discarded if closed via X button or Escape key
@@ -173,6 +176,18 @@ The application operates in three states:
 - File transcription and live microphone transcription share a single transcription lock and never run concurrently; mic clicks are ignored while a file job is in progress
 - If the model is still loading when a file is selected, the job is queued and starts automatically once loading completes
 
+### 2.9 LLM ASR Backend (llama-server)
+
+- The user may select, in the Configuration Dialog, between the built-in Whisper backend (default) and a llama-server HTTP backend — llama.cpp's OpenAI-compatible API server — running an audio-capable LLM
+- The user configures the server base URL (default: `http://127.0.0.1:8005`) and the model alias the server exposes (default: `gemma-4-12b`)
+- A backend change takes effect from the next transcription; no application restart is required
+- In llama mode the Whisper model is not preloaded; it is loaded on demand the first time the fallback is needed
+- Audio is sent to the server's `/v1/chat/completions` endpoint as 16 kHz mono 16-bit PCM WAV; the request's `model` field is the configured alias; generation temperature is 0
+- The configured language is honored: when a specific language is selected (not Auto-detect), the request prompt includes it
+- **Automatic fallback:** any llama-backend transcription failure (server down, connection failure, HTTP error, timeout, invalid response) causes the affected segment to be transparently transcribed by the local Whisper model. Cancellation is the sole exception — cancelled work is not re-run on the fallback backend
+- The active backend applies to both live dictation segments and File Upload Transcription segments
+- The Configuration Dialog provides a **Test Connection** button: it verifies server reachability (`/health`) and queries the advertised model list (`/v1/models`). When exactly one model is advertised, the model-alias field is auto-filled with that name (in the dialog only — not saved until the user saves); when several are advertised, they are listed so the user can pick one
+- The Whisper model path must remain valid in llama mode because it is the fallback engine
 
 ---
 
@@ -198,6 +213,9 @@ All settings are stored in `~/.config/transcriber/config.json`. The application 
 | 12 | `debug_logs` | Debug Logs | Check box | `false` | true / false | When enabled, writes verbose DEBUG-level messages to the log in addition to the always-logged MESSAGE/INFO/WARNING/ERROR/CRITICAL levels. |
 | 13 | — | Reset Window Position | Button labeled "Reset Window Position" | — | — | Resets the main window position to screen center (100, 100) on next launch. Stored internally as `window_position`. |
 | 14 | — | D-Bus Hotkey Command | Read-only selectable text box + Copy button | `dbus-send --session --type=method_call --dest=org.xvoice.Controller /org/xvoice/App org.xvoice.Actions.Toggle` | — | Displays the D-Bus command for global hotkey activation. Not stored in config; shown for user reference only. Clicking "Copy" copies to clipboard (button briefly shows "Copied!"). Text is also selectable for manual copying. |
+| 15 | `asr_backend` | Transcription Backend | Drop-down (combo box) | `"whisper"` | `"whisper"` (Whisper, local, offline), `"llama"` (Gemma 4 12B, llama-server HTTP) | Selects the transcription engine. `whisper` uses the built-in whisper.cpp model; `llama` routes audio to a llama-server instance (URL and model alias configured below). A change takes effect from the next transcription, without a restart. In llama mode the Whisper model remains the automatic per-segment fallback. An invalid value falls back to `whisper`. |
+| 16 | `llama_server_url` | llama-server URL | Text input | `"http://127.0.0.1:8005"` | Any `http://host:port` base URL | Base URL of the llama-server instance. Used only when `asr_backend` is `llama`. |
+| 17 | `llama_model` | Model alias | Text input | `"gemma-4-12b"` | Model name/alias as exposed by the server | The model name the server advertises (its `--alias`), sent as the `model` field of each transcription request. Used only when `asr_backend` is `llama`. The Test Connection button auto-fills this field when the server advertises exactly one model. |
 
 ### 3.2 Fixed (Non-Configurable) Settings
 
@@ -207,6 +225,10 @@ All settings are stored in `~/.config/transcriber/config.json`. The application 
 | Transcription watchdog timeout | max_duration × 1.5, clamped to [30, 120] seconds | Scales with recording length; prevents indefinite hangs |
 | Retry count | 3 (with progressive backoff) | Retries transient whisper.cpp errors only |
 | Minimum segment duration | 5000 ms (internal) | Scanner ignores audio segments shorter than this threshold |
+| llama-server connect timeout | 5 seconds | Per-request TCP connect deadline; a server that does not answer in time is treated as unavailable and the segment falls back to Whisper |
+| llama-server read deadline | 120 seconds | Covers a busy single-slot server's queue wait plus generation of a full 30 s segment |
+| llama-server audio per request | 10 minutes of 16 kHz samples | Sanity cap on the PCM count sent per request; real segments are far shorter |
+| llama-server generation temperature | 0 | Deterministic transcription output |
 
 ### 3.3 Additional Configuration Parameters (Internal)
 
@@ -284,6 +306,15 @@ If the D-Bus session bus is unavailable at startup:
 - Warning logged; application continues without hotkey support
 - No fallback IPC mechanism is attempted
 
+### 5.7 LLM Backend Unavailable
+
+When `asr_backend` is `llama` and the server cannot be reached, or returns an error for a transcription request:
+- The application starts and operates normally; server health is probed at startup and the result is logged
+- Each affected transcription segment is transparently transcribed by the local Whisper model (automatic fallback); the Whisper model is loaded on demand on first use
+- If the local Whisper fallback is also unavailable (e.g. invalid model path), the error is displayed as in §5.4
+- A user-initiated cancellation never triggers the fallback
+- The user is not interrupted by the fallback: results appear in the TextWindow as usual and fallback events are logged
+
 ---
 
 ## 6. Hotkey Integration
@@ -319,6 +350,9 @@ The D-Bus bus name ownership (`org.xvoice.Controller`) enforces single-instance 
 {
   "window_position": { "x": 100, "y": 100 },
   "model_path": "~/.cache/whisper/ggml-base.bin",
+  "asr_backend": "whisper",
+  "llama_server_url": "http://127.0.0.1:8005",
+  "llama_model": "gemma-4-12b",
   "audio_device": "default",
   "max_duration": 30,
   "gpu_mode": "auto",
