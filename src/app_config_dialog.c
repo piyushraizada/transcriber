@@ -59,6 +59,9 @@ typedef struct {
     ConfigDialog *dlg;
     LlamaClient *client;      /* throwaway client; destroyed by the worker */
     bool ok;
+    bool models_queried;      /* model-list request completed (may still be 0) */
+    int model_count;          /* advertised models; 0 if none/unknown */
+    char model_names[LLAMA_MAX_MODELS][LLAMA_MAX_MODEL_NAME];
     char error[256];
     guint idle_id;            /* written by the worker, read after join */
 } BackendTestCtx;
@@ -737,8 +740,50 @@ static gboolean backend_test_idle(gpointer user_data) {
     gtk_button_set_label(dlg->backend_test_button, "Test Connection");
 
     if (ctx->ok) {
-        gtk_label_set_markup(dlg->backend_test_status,
-            "<span foreground='green'>Server reachable</span>");
+        if (ctx->models_queried && ctx->model_count == 1) {
+            /* Exactly one advertised model: auto-fill the alias field
+             * (replaces whatever was typed — the user's chosen behavior).
+             * The value is NOT saved until the user clicks Save. */
+            gtk_entry_set_text(dlg->llama_model_entry, ctx->model_names[0]);
+            gchar *escaped = g_markup_escape_text(ctx->model_names[0], -1);
+            gchar *markup = g_strdup_printf(
+                "<span foreground='green'>Server reachable — model alias set to '%s'</span>",
+                escaped);
+            gtk_label_set_markup(dlg->backend_test_status, markup);
+            g_free(escaped);
+            g_free(markup);
+        } else if (ctx->models_queried && ctx->model_count > 1) {
+            /* Multiple advertised models: list them (up to a readable
+             * prefix) and let the user pick one for the alias field. */
+            GString *names = g_string_new(NULL);
+            for (int i = 0; i < ctx->model_count; i++) {
+                if (i >= 4) {
+                    g_string_append_printf(names, ", … (+%d more)",
+                                           ctx->model_count - 4);
+                    break;
+                }
+                if (i > 0) {
+                    g_string_append(names, ", ");
+                }
+                g_string_append(names, ctx->model_names[i]);
+            }
+            gchar *escaped = g_markup_escape_text(names->str, -1);
+            gchar *markup = g_strdup_printf(
+                "<span foreground='green'>Server reachable — models: %s (set the alias to one of them)</span>",
+                escaped);
+            gtk_label_set_markup(dlg->backend_test_status, markup);
+            g_free(escaped);
+            g_free(markup);
+            g_string_free(names, TRUE);
+        } else if (ctx->models_queried) {
+            gtk_label_set_markup(dlg->backend_test_status,
+                "<span foreground='green'>Server reachable (no models advertised)</span>");
+        } else {
+            /* Model-list request failed — not fatal for a reachable
+             * server (single-model servers are lenient about names). */
+            gtk_label_set_markup(dlg->backend_test_status,
+                "<span foreground='green'>Server reachable</span>");
+        }
     } else {
         /* The error text comes from an external source — escape it. */
         gchar *escaped = g_markup_escape_text(ctx->error[0] ? ctx->error
@@ -759,6 +804,17 @@ static gpointer backend_test_thread_func(gpointer user_data) {
     BackendTestCtx *ctx = (BackendTestCtx *)user_data;
 
     ctx->ok = llama_check_connection(ctx->client);
+    if (ctx->ok) {
+        /* The server is healthy — ask which models it advertises. With
+         * exactly one, the idle callback auto-fills the alias field. A
+         * failure here is NOT fatal: a reachable server still counts as a
+         * success (single-model servers are lenient about the model name),
+         * so the "Server reachable" status stands either way. */
+        ctx->model_count = llama_list_models(ctx->client,
+                                             ctx->model_names,
+                                             LLAMA_MAX_MODELS);
+        ctx->models_queried = (ctx->model_count >= 0);
+    }
     if (!ctx->ok) {
         const char *err = llama_client_get_error(ctx->client);
         if (err && err[0] != '\0') {

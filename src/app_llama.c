@@ -973,6 +973,102 @@ bool llama_check_connection(LlamaClient *client)
     return ok;
 }
 
+int llama_list_models(LlamaClient *client,
+                      char (*names_out)[LLAMA_MAX_MODEL_NAME],
+                      int max_names)
+{
+    if (!client || !names_out || max_names < 1 ||
+        max_names > LLAMA_MAX_MODELS) {
+        if (client) {
+            set_client_error(client, LLAMA_ERR_INVALID_PARAM,
+                             "invalid arguments");
+        }
+        return -1;
+    }
+
+    char url[LLAMA_MAX_URL_LEN];
+    pthread_mutex_lock(&client->mutex);
+    snprintf(url, sizeof(url), "%s", client->server_url);
+    pthread_mutex_unlock(&client->mutex);
+
+    if (url[0] == '\0') {
+        set_client_error(client, LLAMA_ERR_INVALID_PARAM, "server URL not configured");
+        return -1;
+    }
+
+    LlamaHttpResult http;
+    http.status_code = 0;
+    http.body = NULL;
+    http.error = LLAMA_ERR_OK;
+    http.timed_out = false;
+
+    llama_http_request(client, url, "GET", "/v1/models", NULL, 0, &http);
+
+    if (http.error != LLAMA_ERR_OK || http.status_code != 200 ||
+        http.body == NULL) {
+        char detail[LLAMA_MAX_ERROR_LEN];
+        if (http.error == LLAMA_ERR_CONNECT) {
+            snprintf(detail, sizeof(detail),
+                     "cannot connect to llama-server at %.190s (is it running?)", url);
+        } else if (http.error == LLAMA_ERR_READ_TIMEOUT) {
+            snprintf(detail, sizeof(detail),
+                     "timed out while reading the model list from %.190s", url);
+        } else if (http.status_code != 0 && http.status_code != 200) {
+            snprintf(detail, sizeof(detail),
+                     "llama-server %.190s returned HTTP %d on /v1/models",
+                     url, http.status_code);
+        } else {
+            snprintf(detail, sizeof(detail),
+                     "llama-server %.200s returned an empty /v1/models response", url);
+        }
+        set_client_error(client,
+                         http.error != LLAMA_ERR_OK ? http.error : LLAMA_ERR_HTTP,
+                         detail);
+        llama_http_result_free(&http);
+        return -1;
+    }
+
+    /* Parse: llama.cpp answers {"models": [...]}; OpenAI-compatible
+     * gateways answer {"data": [...]}. Each entry carries the name under
+     * "name" (llama.cpp also mirrors it in "model"). */
+    cJSON *root = cJSON_Parse(http.body);
+    llama_http_result_free(&http);
+    if (!root) {
+        set_client_error(client, LLAMA_ERR_RESPONSE_PARSE,
+                         "invalid JSON in /v1/models response");
+        return -1;
+    }
+
+    int count = 0;
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "models");
+    if (!cJSON_IsArray(arr)) {
+        arr = cJSON_GetObjectItemCaseSensitive(root, "data");
+    }
+    if (cJSON_IsArray(arr)) {
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, arr) {
+            if (count >= max_names) break;  /* Caller buffer full — drop the rest. */
+            cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+            if (!cJSON_IsString(name) || name->valuestring == NULL ||
+                name->valuestring[0] == '\0') {
+                name = cJSON_GetObjectItemCaseSensitive(item, "model");
+            }
+            if (!cJSON_IsString(name) || name->valuestring == NULL ||
+                name->valuestring[0] == '\0') {
+                continue;  /* Entry without a usable name — skip. */
+            }
+            g_strlcpy(names_out[count], name->valuestring,
+                      LLAMA_MAX_MODEL_NAME);
+            count++;
+        }
+    }
+    cJSON_Delete(root);
+
+    g_log("app-llama", G_LOG_LEVEL_MESSAGE,
+          "[llama] server at %s advertises %d model(s)\n", url, count);
+    return count;
+}
+
 /*---------------------------------------------------------------------------
  * Public API: core transcription
  *---------------------------------------------------------------------------*/

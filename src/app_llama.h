@@ -91,6 +91,15 @@ extern "C" {
  *  against corrupt counts, not a real limit. */
 #define LLAMA_MAX_SAMPLES (LLAMA_SAMPLE_RATE * 600)
 
+/** Caller buffer capacity for llama_list_models(): how many advertised
+ *  model names the caller can receive. llama-server advertises one model
+ *  in single-model mode and a handful in router mode — 8 is far above any
+ *  realistic server; extra entries are dropped. */
+#define LLAMA_MAX_MODELS 8
+
+/** Max length (including NUL) of one advertised model name. */
+#define LLAMA_MAX_MODEL_NAME 128
+
 /*---------------------------------------------------------------------------
  * Section 1: Error Codes
  *---------------------------------------------------------------------------
@@ -183,6 +192,32 @@ void llama_client_set_model(LlamaClient* client, const char* model);
  * @return true if the server reported healthy, false otherwise.
  */
 bool llama_check_connection(LlamaClient* client);
+
+/**
+ * Query the models the server advertises (`GET {server}/v1/models`).
+ *
+ * llama-server advertises exactly one entry in single-model mode (the
+ * first `--alias`, or the model name) and one entry per hosted model in
+ * router (multi-model) mode. Both response shapes are accepted: the
+ * llama.cpp `{"models": [...]}` key and the OpenAI-compatible
+ * `{"data": [...]}` key used by gateways.
+ *
+ * Safe to call from any thread; on failure the error is logged and
+ * retrievable via llama_client_get_error().
+ *
+ * @param client    Pointer to a valid LlamaClient. Must not be NULL.
+ * @param names_out Caller buffer for the names, at most LLAMA_MAX_MODELS
+ *                  rows of LLAMA_MAX_MODEL_NAME bytes. Must not be NULL.
+ *                  Names longer than LLAMA_MAX_MODEL_NAME - 1 are
+ *                  truncated.
+ * @param max_names Number of rows in names_out (1..LLAMA_MAX_MODELS).
+ * @return Number of advertised models on a successful HTTP 200 response
+ *         (may be 0 for a valid empty list), or -1 on transport, HTTP,
+ *         or JSON failure.
+ */
+int llama_list_models(LlamaClient* client,
+                      char (*names_out)[LLAMA_MAX_MODEL_NAME],
+                      int max_names);
 
 /*---------------------------------------------------------------------------
  * Section 6: Core Transcription API
