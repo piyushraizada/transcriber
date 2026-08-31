@@ -696,6 +696,26 @@ bool audio_recorder_start(AudioRecorder *recorder) {
 
     pthread_mutex_lock(&recorder->mutex);
 
+    /* Clean up the previous session's WAV file before starting a new one.
+     * This is the single cleanup point for temporary files: the
+     * transcription pipeline no longer deletes the session file after use
+     * (in continuous mode the recorder still owns it across cycles), so
+     * start() removes any file left from the previous session — a
+     * finalized one, or a stale one if the app died mid-session. At most
+     * one temp file exists per recorder at any time. */
+    if (recorder->wav_path[0] != '\0') {
+        if (recorder->wav_file) {
+            fclose(recorder->wav_file);
+            recorder->wav_file = NULL;
+        }
+        if (recorder->wav_fd >= 0) {
+            close(recorder->wav_fd);
+            recorder->wav_fd = -1;
+        }
+        unlink(recorder->wav_path);
+        recorder->wav_path[0] = '\0';
+    }
+
     GError *tmp_error = NULL;
     char *tmp_path = NULL;
 
@@ -946,20 +966,6 @@ void audio_recorder_reset_error(void) {
     pthread_mutex_lock(&g_audio_error_mutex);
     g_audio_error[0] = '\0';
     pthread_mutex_unlock(&g_audio_error_mutex);
-}
-
-/**
- * Delete the WAV file from disk. Call this AFTER transcription is done.
- */
-bool audio_recorder_delete_wav(AudioRecorder *recorder) {
-    if (!recorder) return false;
-
-    if (recorder->wav_path[0]) {
-        unlink(recorder->wav_path);
-        recorder->wav_path[0] = '\0';
-        return true;
-    }
-    return false;
 }
 
 /* ===================================================================

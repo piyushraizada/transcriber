@@ -771,21 +771,113 @@ static WhisperResponse *transcribe_active_backend(TranscriberApp *app,
     return whisper_transcribe_samples(app->whisper_client, samples, n_samples);
 }
 
+/* Session WAV files are always 16 kHz mono 16-bit PCM (the recorder format). */
+#define SESSION_WAV_SAMPLE_RATE 16000
+
 /**
- * Dispatch a WAV-file transcription to the active ASR backend.
- * Same backend/fallback semantics as transcribe_active_backend().
+ * Load a session WAV file (16 kHz mono 16-bit PCM — the recorder format)
+ * into a newly allocated int16 buffer.
+ *
+ * The transcribe thread's WAV-file fallback uses this so the transcription
+ * does not depend on the file's lifetime on disk: in continuous mode the
+ * recorder replaces the session file on its next session start, which can
+ * happen while a transcription is still in flight.
+ *
+ * @param path          Path to the WAV file.
+ * @param samples_out   Receives the allocated PCM buffer (caller g_free()s).
+ * @param n_samples_out Receives the sample count.
+ * @return true on success; on failure both outputs are left zeroed.
  */
-static WhisperResponse *transcribe_active_backend_file(TranscriberApp *app,
-                                                       const char *wav_path) {
-    if (active_backend_is_llama(app) && app->llama_client) {
-        sync_llama_client_from_config(app);
-        return llama_transcribe_wav_fallback(app->llama_client,
-                                             app->whisper_client,
-                                             wav_path,
-                                             config_get_language(app->controller.config));
+static bool read_session_wav_samples(const char *path,
+                                     int16_t **samples_out,
+                                     size_t *n_samples_out) {
+    *samples_out = NULL;
+    *n_samples_out = 0;
+
+    if (!path || path[0] == '\0') {
+        return false;
     }
-    return whisper_transcribe_with_retry(app->whisper_client, wav_path,
-                                         WHISPER_MAX_RETRIES);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    char riff[4], wave[4];
+    if (fread(riff, 1, 4, f) != 4 || memcmp(riff, "RIFF", 4) != 0 ||
+        fread(wave, 1, 4, f) != 4 || memcmp(wave, "WAVE", 4) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    uint16_t fmt_tag = 0;
+    uint16_t channels = 0;
+    uint16_t bits = 0;
+    uint32_t sample_rate = 0;
+    bool have_fmt = false;
+    long data_offset = -1;
+    uint32_t data_size = 0;
+
+    char id[4];
+    uint32_t sub_size;
+    while (fread(id, 1, 4, f) == 4 && fread(&sub_size, 1, 4, f) == 4) {
+        if (memcmp(id, "fmt ", 4) == 0) {
+            if (sub_size < 16) {
+                break;
+            }
+            if (fread(&fmt_tag, 1, 2, f) != 2 ||
+                fread(&channels, 1, 2, f) != 2 ||
+                fread(&sample_rate, 1, 4, f) != 4) {
+                break;
+            }
+            /* Skip byte rate (4 bytes) and block align (2 bytes). */
+            if (fseek(f, 6, SEEK_CUR) != 0 || fread(&bits, 1, 2, f) != 2) {
+                break;
+            }
+            if (sub_size > 16) {
+                fseek(f, (long)(sub_size - 16), SEEK_CUR);
+            }
+            have_fmt = true;
+        } else if (memcmp(id, "data", 4) == 0) {
+            data_offset = ftell(f);
+            data_size = sub_size;
+            break;  /* The data chunk is the last one we need. */
+        } else {
+            fseek(f, (long)sub_size, SEEK_CUR);
+        }
+    }
+
+    /* Session files are always 16 kHz mono 16-bit PCM (the recorder format). */
+    if (!have_fmt || fmt_tag != 1 || channels != 1 || bits != 16 ||
+        sample_rate != SESSION_WAV_SAMPLE_RATE || data_offset < 0 ||
+        data_size == 0) {
+        fclose(f);
+        return false;
+    }
+
+    size_t n_samples = data_size / sizeof(int16_t);
+    if (n_samples == 0) {
+        fclose(f);
+        return false;
+    }
+
+    int16_t *samples = g_malloc(n_samples * sizeof(int16_t));
+    if (!samples) {
+        fclose(f);
+        return false;
+    }
+
+    if (fseek(f, data_offset, SEEK_SET) != 0 ||
+        fread(samples, sizeof(int16_t), n_samples, f) != n_samples) {
+        g_free(samples);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    *samples_out = samples;
+    *n_samples_out = n_samples;
+    return true;
 }
 
 /**
@@ -1305,15 +1397,33 @@ static gpointer transcribe_thread_func(gpointer data) {
         /* In-memory transcription from ring buffer (active backend) */
         response = transcribe_active_backend(app, samples, (int)n_samples);
         g_free(samples);
-    } else {
-        /* Fallback: try WAV file path if ring buffer is empty */
+    } else if (!is_continuous_snapshot) {
+        /* Fallback (one-shot mode only): transcribe the session WAV file if
+         * the ring buffer is empty. The file is loaded into memory up front
+         * so the transcription never depends on the file's lifetime on disk
+         * — the file is replaced on the next session start, which can
+         * happen while a transcription is in flight.
+         *
+         * In continuous mode this fallback is deliberately skipped: the
+         * silence scanner has already transcribed everything up to its
+         * offset, the ring buffer always holds the newest (untranscribed)
+         * audio, and the session WAV file contains the whole session —
+         * transcribing it would re-emit the entire transcript. When there
+         * is no new audio, the code below treats this as an empty success. */
         pthread_mutex_lock(&app->wav_path_mutex);
         char wav_path[PATH_MAX];
         g_strlcpy(wav_path, app->current_wav_path, sizeof(wav_path));
         pthread_mutex_unlock(&app->wav_path_mutex);
 
         if (wav_path[0] != '\0') {
-            response = transcribe_active_backend_file(app, wav_path);
+            int16_t *file_samples = NULL;
+            size_t file_sample_count = 0;
+            if (read_session_wav_samples(wav_path, &file_samples,
+                                         &file_sample_count)) {
+                response = transcribe_active_backend(app, file_samples,
+                                                     (int)file_sample_count);
+                g_free(file_samples);
+            }
         }
     }
 
@@ -1505,10 +1615,12 @@ static void on_transcription_result(TranscriberApp *app, const char *text_or_err
             }
         }
 
-        /* Delete the temporary WAV file after transcription */
-        if (app->audio_recorder) {
-            audio_recorder_delete_wav(app->audio_recorder);
-        }
+        /* The session WAV file is deliberately NOT deleted here. In
+         * continuous mode the recorder is still alive and owns the file —
+         * it is finalized and replaced on the next audio_recorder_start()
+         * (the single temp-file cleanup point) or on shutdown. Deleting it
+         * from this shared result callback used to unlink the active
+         * session's file from under in-flight transcriptions. */
     } else if (!success && text_or_error) {
         /* 'text_or_error' parameter holds the error message on failure */
         if (app->text_window) {

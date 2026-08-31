@@ -235,11 +235,6 @@ AudioDeviceList *audio_recorder_get_device_list(const AudioRecorder *recorder, b
  */
 void audio_device_list_free(AudioDeviceList *list);
 
-/**
- * Delete the WAV file from disk. Call this AFTER transcription is done.
- */
-bool audio_recorder_delete_wav(AudioRecorder *recorder);
-
 /*---------------------------------------------------------------------------
  * Section 11: Ring Buffer Access
  *---------------------------------------------------------------------------
