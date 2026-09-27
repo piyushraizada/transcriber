@@ -7,7 +7,7 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 *   **Voice Capture:** Start and stop recording audio via a microphone icon in the main window or a system tray icon.
 *   **Clear Transcription:** Right-click the microphone icon (when idle) to clear all transcribed text from the text window, clipboard, and internal buffer. Also available as "Clear Transcription" in the system tray context menu.
 *   **Local Transcription:** Uses OpenAI's Whisper model via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) to perform speech-to-text processing entirely offline.
-*   **Optional LLM ASR Backend:** Route transcription to a local [llama-server](https://github.com/ggml-org/llama.cpp) instance (OpenAI-compatible API, e.g. Gemma 4 12B) instead of the built-in Whisper. If the server is unavailable, each segment automatically falls back to local Whisper. See [LLM ASR Backend](#llm-asr-backend-llama-server) for details.
+*   **Optional LLM ASR Backend:** Route transcription to a local [llama-server](https://github.com/ggml-org/llama.cpp) instance (OpenAI-compatible API, e.g. Gemma 4 12B) instead of the built-in Whisper. The backend is decided once at startup: if the server is healthy it is used for the whole session; if it is unreachable, the built-in Whisper model is loaded immediately and used instead. See [LLM ASR Backend](#llm-asr-backend-llama-server) for details.
 *   **File Upload Transcription:** Transcribe existing audio files offline. Click the **File** button in the main window's status bar, pick any audio file (any container/codec FFmpeg can decode), and the app decodes it, segments the speech with VAD, transcribes each segment, and writes the result to a `.txt` file you choose. See [File Upload Transcription](#file-upload-transcription) for details.
 *   **Text Management:** Transcribed text is displayed in a persistent, editable text area and can be copied to the system clipboard. In continuous dictation mode the clipboard always holds the **full accumulated transcript** (capped at 512 KiB), not just the last segment. Text is automatically cleared from the clipboard on application exit to prevent stale data persisting after shutdown.
 *   **Global Control:** Supports global hotkeys via D-Bus, allowing users to toggle recording without needing the application window in focus.
@@ -284,10 +284,10 @@ By default, Transcriber transcribes with the built-in Whisper model. As an alter
 
 - Audio is sent to the server's `/v1/chat/completions` endpoint as 16 kHz mono WAV with temperature 0; the request's `model` field is your configured alias.
 - The configured **Language** is respected: unless it is Auto-detect, the request prompt becomes "Transcribe this audio in \<language\>."
-- **Automatic fallback:** if a request fails for any reason (server down, connection refused, HTTP error, timeout, invalid response), that segment is transcribed by the local Whisper model instead — no restart or re-configuration needed. While the llama backend is active the Whisper model is not preloaded; it loads on demand the first time a fallback is needed.
-- Cancellation (Cancel during a file job, or the app's transcription watchdog) never triggers the fallback — cancelled work simply stops.
-- Both live dictation and **File Upload Transcription** use the active backend.
-- The Whisper Model Path setting still applies in this mode — it is the fallback engine and must remain valid.
+- **Backend decided once per session:** at startup, Transcriber probes the server's `/health` endpoint with a short (5 second) deadline. If the server is healthy, the external API is used for the entire session and the status indicator turns green. If the server is unreachable or unresponsive, the built-in Whisper model is loaded immediately at startup and used for the entire session instead — the indicator turns green once the model is ready. The server is not re-checked during the session; to switch back, restart the app (or change the backend in Settings).
+- **Mid-session safety net:** if a request fails after the session has started (server dies, HTTP error, timeout, invalid response), that segment falls back to local Whisper for the remainder of the job. Cancellation (Cancel during a file job, or the app's transcription watchdog) never triggers this fallback — cancelled work simply stops.
+- Both live dictation and **File Upload Transcription** use the backend decided at startup.
+- The Whisper Model Path setting still applies in this mode — it is the engine used when the server is unavailable at startup (and for mid-session fallbacks) and must remain valid.
 
 ## Configuration
 

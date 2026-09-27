@@ -44,6 +44,12 @@
 #define LLAMA_MAX_ERROR_LEN 256
 #define LLAMA_WAV_HEADER_SIZE 44
 
+/* Read deadline (seconds) for the /health probe. The health check runs on
+ * the GTK main thread before gtk_main() starts, so it must fail fast: a
+ * server that accepts TCP but never answers /health must not delay startup
+ * (and the immediate local-Whisper load that follows) by minutes. */
+#define LLAMA_HEALTH_TIMEOUT_SEC 5
+
 struct _LlamaClient {
     pthread_mutex_t mutex;        ///< Protects server_url, model, inflight, error state
     char server_url[LLAMA_MAX_URL_LEN];  ///< Base URL, no trailing slash
@@ -121,6 +127,7 @@ static uint32_t le32dec(const uint8_t *p)
 typedef struct {
     GCancellable *cancellable;
     atomic_int timed_out;         ///< Set by the canceller thread on deadline expiry
+    gint64 deadline_us;           ///< Monotonic deadline (set in init)
     pthread_mutex_t lock;         ///< Protects done
     pthread_cond_t cond;          ///< Signaled when the request finishes
     int done;
@@ -129,8 +136,7 @@ typedef struct {
 static gpointer llama_timeout_thread(gpointer user_data)
 {
     LlamaTimeoutCtx *ctx = (LlamaTimeoutCtx *)user_data;
-    gint64 deadline = g_get_monotonic_time()
-                     + (gint64)LLAMA_READ_TIMEOUT_SEC * G_TIME_SPAN_SECOND;
+    gint64 deadline = ctx->deadline_us;
 
     pthread_mutex_lock(&ctx->lock);
     while (!ctx->done) {
@@ -153,10 +159,14 @@ static gpointer llama_timeout_thread(gpointer user_data)
 
 static bool llama_timeout_ctx_init(LlamaTimeoutCtx *ctx,
                                    GCancellable *cancellable,
+                                   int read_timeout_sec,
                                    GThread **thread_out)
 {
     ctx->cancellable = cancellable;
     atomic_store(&ctx->timed_out, 0);
+    ctx->deadline_us = g_get_monotonic_time()
+                      + (gint64)(read_timeout_sec > 0 ? read_timeout_sec : LLAMA_READ_TIMEOUT_SEC)
+                        * G_TIME_SPAN_SECOND;
     ctx->done = 0;
     if (pthread_mutex_init(&ctx->lock, NULL) != 0) return false;
     if (pthread_cond_init(&ctx->cond, NULL) != 0) {
@@ -218,6 +228,7 @@ static void llama_http_request(LlamaClient *client,
                                const char *path,
                                const char *body,
                                gsize body_len,
+                               int read_timeout_sec,
                                LlamaHttpResult *out)
 {
     out->status_code = 0;
@@ -233,7 +244,7 @@ static void llama_http_request(LlamaClient *client,
 
     LlamaTimeoutCtx tctx;
     GThread *timer_thread = NULL;
-    if (!llama_timeout_ctx_init(&tctx, cancellable, &timer_thread)) {
+    if (!llama_timeout_ctx_init(&tctx, cancellable, read_timeout_sec, &timer_thread)) {
         g_object_unref(cancellable);
         out->error = LLAMA_ERR_ALLOC;
         return;
@@ -279,14 +290,14 @@ static void llama_http_request(LlamaClient *client,
         g_socket_client_connect_to_uri(sc, uri, (guint16)dport, cancellable, &gerr);
 
     /* The GSocketClient timeout (the connect budget) is inherited by the
-     * connected socket as its I/O timeout. Raise it to the read deadline:
-     * a long transcription response can legitimately take far longer than
-     * the connect budget to arrive, and the canceller thread above still
-     * enforces LLAMA_READ_TIMEOUT_SEC independently. */
+     * connected socket as its I/O timeout. Raise it to this request's read
+     * deadline: a long transcription response can legitimately take far
+     * longer than the connect budget to arrive, and the canceller thread
+     * above still enforces the same deadline independently. */
     if (conn) {
         GSocket *sock = g_socket_connection_get_socket(conn);
         if (sock) {
-            g_socket_set_timeout(sock, LLAMA_READ_TIMEOUT_SEC);
+            g_socket_set_timeout(sock, read_timeout_sec > 0 ? read_timeout_sec : LLAMA_READ_TIMEOUT_SEC);
         }
     }
 
@@ -698,7 +709,7 @@ static WhisperResponse *transcribe_wav_bytes(LlamaClient *client,
 
     /* Send the request. */
     llama_http_request(client, url, "POST", "/v1/chat/completions",
-                       body, strlen(body), &http);
+                       body, strlen(body), LLAMA_READ_TIMEOUT_SEC, &http);
 
     if (http.error != LLAMA_ERR_OK) {
         char detail[LLAMA_MAX_ERROR_LEN];
@@ -933,7 +944,10 @@ bool llama_check_connection(LlamaClient *client)
     http.error = LLAMA_ERR_OK;
     http.timed_out = false;
 
-    llama_http_request(client, url, "GET", "/health", NULL, 0, &http);
+    /* Bounded deadline: this probe runs on the GTK main thread before
+     * gtk_main() starts, so it must fail fast (see LLAMA_HEALTH_TIMEOUT_SEC). */
+    llama_http_request(client, url, "GET", "/health", NULL, 0,
+                       LLAMA_HEALTH_TIMEOUT_SEC, &http);
 
     bool ok = (http.error == LLAMA_ERR_OK &&
                http.status_code == 200 &&
@@ -1002,7 +1016,8 @@ int llama_list_models(LlamaClient *client,
     http.error = LLAMA_ERR_OK;
     http.timed_out = false;
 
-    llama_http_request(client, url, "GET", "/v1/models", NULL, 0, &http);
+    llama_http_request(client, url, "GET", "/v1/models", NULL, 0,
+                       LLAMA_READ_TIMEOUT_SEC, &http);
 
     if (http.error != LLAMA_ERR_OK || http.status_code != 200 ||
         http.body == NULL) {

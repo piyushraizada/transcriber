@@ -185,8 +185,11 @@ void llama_client_set_model(LlamaClient* client, const char* model);
  *
  * Issues a `GET {server}/health` request. Returns true only on HTTP 200
  * with a body containing "ok" (llama-server's health response).
- * Safe to call from any thread; on failure the error is logged and
- * retrievable via llama_client_get_error().
+ * The probe uses a short bounded deadline (a few seconds, not the full
+ * transcription read deadline) so it fails fast even against a server that
+ * accepts TCP but never answers — safe to call from the GTK main thread at
+ * startup. On failure the error is logged and retrievable via
+ * llama_client_get_error().
  *
  * @param client Pointer to a valid LlamaClient. Must not be NULL.
  * @return true if the server reported healthy, false otherwise.

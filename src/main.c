@@ -257,6 +257,17 @@ typedef struct TranscriberApp {
     LlamaClient *llama_client;       /* Second ASR backend (llama-server HTTP,
                                         e.g. Gemma 4 12B). Stateless — no model
                                         preload. Selected via config asr_backend. */
+
+    /* Session ASR backend decision (one-time, set at startup).
+     * When the configured backend is "llama", perform_initial_model_load()
+     * checks the server ONCE: if healthy, session_backend stays "llama" and
+     * every transcription goes to the server for the whole session; if
+     * unreachable, it immediately loads the local Whisper model and sets
+     * session_backend to "whisper". From then on the external API is never
+     * re-checked in this session — all transcription uses the decided
+     * backend. Empty string means "not yet decided" (treated as whisper). */
+    char session_backend[16];
+
     SystemTray *tray;
     SilenceScanner *silence_scanner;
 
@@ -769,9 +780,8 @@ static void on_config_changed(void *user_data) {
 
 /**
  * Sync the llama client's server URL and model alias from the current
- * config so that configuration changes take effect from the next segment
- * onward (no restart needed). Cheap: two short string copies under the
- * client's mutex.
+ * config. Called once at startup when the session backend is decided;
+ * cheap: two short string copies under the client's mutex.
  */
 static void sync_llama_client_from_config(TranscriberApp *app) {
     if (!app || !app->llama_client || !app->controller.config) return;
@@ -782,21 +792,29 @@ static void sync_llama_client_from_config(TranscriberApp *app) {
 }
 
 /**
- * True when the llama-server backend is the active ASR backend.
+ * True when the llama-server backend was selected for this session.
+ *
+ * The decision is made ONCE at startup (see perform_initial_model_load):
+ * if the configured backend is "llama" and the server passed its health
+ * check, session_backend stays "llama"; otherwise it is set to "whisper".
+ * After that the external API is never re-checked in this session — all
+ * transcription goes through the decided backend. An empty session_backend
+ * (not yet decided) is treated as whisper.
  */
-static bool active_backend_is_llama(const TranscriberApp *app) {
-    return app && app->controller.config &&
-           strcmp(config_get_asr_backend(app->controller.config), "llama") == 0;
+static bool session_backend_is_llama(const TranscriberApp *app) {
+    return app && strcmp(app->session_backend, "llama") == 0;
 }
 
 /**
- * Dispatch an in-memory PCM transcription to the active ASR backend.
+ * Dispatch an in-memory PCM transcription to the session's ASR backend.
  *
  * whisper: in-process whisper.cpp (existing behavior, unchanged).
  * llama:   llama-server HTTP; on any hard failure the same input is
- *          automatically re-sent through the local Whisper client, which
- *          lazy-loads its model on first use (see app_llama.h for the
- *          full fallback semantics — a cancellation is not retried).
+ *          automatically re-sent through the local Whisper client (see
+ *          app_llama.h for the full fallback semantics — a cancellation
+ *          is not retried). This per-request safety net only matters if
+ *          the server dies mid-session; the session decision itself is
+ *          never revisited.
  *
  * The caller owns the returned WhisperResponse (free with
  * whisper_response_free). Returns NULL only on critical allocation
@@ -805,8 +823,7 @@ static bool active_backend_is_llama(const TranscriberApp *app) {
 static WhisperResponse *transcribe_active_backend(TranscriberApp *app,
                                                   const int16_t *samples,
                                                   int n_samples) {
-    if (active_backend_is_llama(app) && app->llama_client) {
-        sync_llama_client_from_config(app);
+    if (session_backend_is_llama(app) && app->llama_client) {
         return llama_transcribe_samples_fallback(app->llama_client,
                                                  app->whisper_client,
                                                  samples, n_samples,
@@ -1952,8 +1969,9 @@ static void on_microphone_toggle(void *user_data) {
         /* STARTUP-LOADING: If model is still loading from startup,
          * reject the click. The "WAIT" overlay on the icon should
          * have made this clear to the user. (Whisper backend only —
-         * the llama backend has no in-process model loading state.) */
-        if (!active_backend_is_llama(app) &&
+         * a session decided on the external API has no in-process
+         * model loading state.) */
+        if (!session_backend_is_llama(app) &&
             app->main_window && app_window_get_model_loading(app->main_window)) {
             return;  /* Model still loading — ignore click */
         }
@@ -1990,13 +2008,12 @@ static void on_microphone_toggle(void *user_data) {
             }
         }
 
-        /* llama backend: no in-process model to validate, load, or wait
-         * for — skip the Whisper model gates below entirely. Server
-         * reachability is handled per segment (with automatic fallback
-         * to local Whisper). Sync the client so config changes take
-         * effect from this recording onward. */
-        if (active_backend_is_llama(app)) {
-            sync_llama_client_from_config(app);
+        /* Session decided on the external API: no in-process model to
+         * validate, load, or wait for — skip the Whisper model gates
+         * below entirely. The server was verified healthy at startup and
+         * is used for the whole session (a per-request fallback to local
+         * Whisper still guards against a mid-session server death). */
+        if (session_backend_is_llama(app)) {
         } else {
 
         /* Check that a valid GGUF model file is configured and accessible */
@@ -2088,7 +2105,7 @@ static void on_microphone_toggle(void *user_data) {
             return;
         }
 
-        }  /* end Whisper-backend model gates (skipped for the llama backend) */
+        }  /* end Whisper-backend model gates (skipped when the session uses the external API) */
     }
 
     /* When user clicks during LISTENING or TRANSCRIBING in continuous mode, set the stop flag
@@ -2146,14 +2163,15 @@ static bool start_file_upload_job(TranscriberApp *app,
     cfg.on_progress = file_upload_progress_cb;
     cfg.user_data = app;
 
-    /* Snapshot the active backend and language for the job. The config
-     * may change while the job runs; each job keeps its snapshot. */
+    /* Snapshot the session's decided backend and language for the job. The
+     * config may change while the job runs; each job keeps its snapshot.
+     * The session decision (not the raw config) is authoritative: a "llama"
+     * config whose server was down at startup has already been committed to
+     * local Whisper for this session. */
     if (app->controller.config) {
-        const char *backend = config_get_asr_backend(app->controller.config);
-        if (backend) {
-            strncpy(cfg.asr_backend, backend, sizeof(cfg.asr_backend) - 1);
-            cfg.asr_backend[sizeof(cfg.asr_backend) - 1] = '\0';
-        }
+        const char *backend = session_backend_is_llama(app) ? "llama" : "whisper";
+        strncpy(cfg.asr_backend, backend, sizeof(cfg.asr_backend) - 1);
+        cfg.asr_backend[sizeof(cfg.asr_backend) - 1] = '\0';
         const char *lang = config_get_language(app->controller.config);
         if (lang) {
             strncpy(cfg.language, lang, sizeof(cfg.language) - 1);
@@ -2420,10 +2438,10 @@ static void on_upload_clicked(void *user_data) {
     }
 
     /* ---- Step 4: Model gate (Whisper backend only) ----
-     * The llama backend has no in-process model: every segment is sent
-     * to the server with automatic fallback to local Whisper, so no
-     * model validation, loading, or deferral is required here. */
-    if (!active_backend_is_llama(app)) {
+     * A session decided on the external API has no in-process model:
+     * every segment is sent to the server, so no model validation,
+     * loading, or deferral is required here. */
+    if (!session_backend_is_llama(app)) {
     const char *model_path = config_get_model_path(app->controller.config);
     if (!model_path || model_path[0] == '\0' ||
         !config_dialog_validate_model(model_path)) {
@@ -2499,7 +2517,7 @@ static void on_upload_clicked(void *user_data) {
         g_free(output_path);
         return;
     }
-    }  /* end Whisper-backend model gate (skipped for the llama backend) */
+    }  /* end Whisper-backend model gate (skipped when the session uses the external API) */
 
     /* ---- Step 5: Start the job ---- */
     start_file_upload_job(app, input_path, output_path, duration);
@@ -2546,31 +2564,44 @@ static void on_dbus_activate(void *user_data) {
 static void perform_initial_model_load(TranscriberApp *app) {
     if (!app->whisper_client) return;
 
-    /* llama backend (D7): do NOT preload the local Whisper model — it
-     * lazy-loads on the first automatic fallback. Instead, sync the
-     * llama client from config and use the server's health for the
-     * status indicator. An unreachable server is informational only:
-     * recording stays possible (transcription falls back to local
-     * Whisper, and errors surface at that point). */
-    if (active_backend_is_llama(app)) {
+    /* llama backend: make the ONE-TIME session decision here. Check the
+     * server's health exactly once:
+     *   - healthy  -> use the external API for the whole session (green).
+     *   - down     -> load the built-in Whisper model NOW and use it for
+     *                 the whole session (green once loaded).
+     * After this point the external API is never re-checked in this session
+     * and all transcription goes through the decided backend. This runs on
+     * the GTK main thread before gtk_main(), so the (bounded) health check
+     * only delays startup, not the UI. */
+    if (app->controller.config &&
+        strcmp(config_get_asr_backend(app->controller.config), "llama") == 0) {
         if (app->llama_client) {
             sync_llama_client_from_config(app);
         }
         bool healthy = app->llama_client && llama_check_connection(app->llama_client);
-        ModelStatus status = healthy ? MODEL_AVAILABLE : MODEL_UNAVAILABLE;
-        app_set_model_status(&app->controller, status);
-        if (app->main_window) {
-            app_window_set_model_loading(app->main_window, FALSE);
-            app_window_set_model_status(app->main_window, status);
+        if (healthy) {
+            /* External API is up — use it for the entire session. */
+            snprintf(app->session_backend, sizeof(app->session_backend), "llama");
+            app_set_model_status(&app->controller, MODEL_AVAILABLE);
+            if (app->main_window) {
+                app_window_set_model_loading(app->main_window, FALSE);
+                app_window_set_model_status(app->main_window, MODEL_AVAILABLE);
+            }
+            if (app->tray) {
+                tray_set_model_status(app->tray, MODEL_AVAILABLE);
+            }
+            g_log("main", G_LOG_LEVEL_MESSAGE,
+                  "[flow] llama backend healthy — using external API for this session\n");
+            return;
         }
-        if (app->tray) {
-            tray_set_model_status(app->tray, status);
-        }
+
+        /* External API unavailable — commit to the built-in engine for the
+         * whole session and load its model now (falls through to the shared
+         * Whisper load path below, which shows LOADING then turns green). */
+        snprintf(app->session_backend, sizeof(app->session_backend), "whisper");
         g_log("main", G_LOG_LEVEL_MESSAGE,
-              "[flow] llama backend active — Whisper preload skipped, "
-              "server %s\n",
-              healthy ? "healthy" : "unreachable (local Whisper fallback available)");
-        return;
+              "[flow] llama backend unavailable — loading local Whisper and "
+              "using it for this session\n");
     }
 
     /* Validate model path before attempting load */
