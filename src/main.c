@@ -98,6 +98,7 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <limits.h>
+#include <math.h>
 #include <sys/stat.h>
 
 /* ------------------------------------------------------------------ */
@@ -430,8 +431,20 @@ static gboolean on_transcription_error_idle(gpointer data) {
 /* Maximum transcription retries on failure */
 #define WHISPER_MAX_RETRIES 3
 
-/* Volume level change threshold */
-#define VOLUME_DELTA 0.05
+/* Gauge repaint deadband, in mapped display units (see volume_level_to_display).
+ * Speech fluctuation on the dB scale is much finer than the old 0.05 linear
+ * threshold could ever catch, so it freezes the bar; 0.02 tracks it visibly
+ * while still suppressing sub-pixel jitter at the 10 fps poll rate. */
+#define VOLUME_DELTA 0.02
+
+/* Linear pre-gain applied to the RMS before dB mapping. This is the
+ * "sensitivity a tad bit higher" knob: 2.0 = +6 dB, 4.0 = +12 dB, 1.0 = none.
+ * Only affects the gauge — recorded audio and VAD are untouched. */
+#define VOLUME_METER_GAIN 2.0
+
+/* Gauge noise floor in dBFS: RMS at or below this level reads as empty;
+ * full-scale (1.0) reads as full. More negative widens the visible range. */
+#define VOLUME_METER_FLOOR_DB (-54.0)
 
 /* ------------------------------------------------------------------ */
 /* Dialog helpers                                                      */
@@ -629,6 +642,37 @@ static gboolean restart_watchdog_idle(gpointer user_data)
 /* ------------------------------------------------------------------ */
 
 /**
+ * Map the recorder's linear RMS amplitude to a perceptual (dBFS) scale for
+ * the UI gauge.
+ *
+ * Linear RMS (full-scale = 32768 counts) compresses normal speech
+ * (about -40..-25 dBFS, i.e. 0.01..0.06) into a few pixels of the bar, so
+ * the gauge appears dead at typical microphone levels. This helper applies
+ * an optional linear pre-gain, then maps logarithmically between
+ * VOLUME_METER_FLOOR_DB (reads as empty) and full scale (reads as full),
+ * so every halving of amplitude moves the bar by a constant, visible step.
+ *
+ * Display-only transform: the recorder API keeps reporting true linear RMS.
+ *
+ * @param rms Linear RMS level in [0.0, 1.0] from audio_recorder_get_volume_level().
+ * @return Mapped display level clamped to [0.0, 1.0].
+ */
+static double volume_level_to_display(double rms) {
+    if (rms <= 0.0) {
+        return 0.0;
+    }
+    rms *= VOLUME_METER_GAIN;
+    if (rms >= 1.0) {
+        return 1.0; /* Clip at full scale after pre-gain */
+    }
+    double disp = (20.0 * log10(rms) - VOLUME_METER_FLOOR_DB) / -VOLUME_METER_FLOOR_DB;
+    if (disp < 0.0) {
+        return 0.0; /* Below the meter noise floor */
+    }
+    return disp; /* rms < 1.0 implies dBFS < 0, so disp < 1.0 here */
+}
+
+/**
  * Volume level poll callback.
  * Reads the current RMS volume from the audio recorder and updates the UI.
  * Runs at ~10fps during STATE_LISTENING.
@@ -637,10 +681,10 @@ static gboolean volume_poll_callback(gpointer data) {
     TranscriberApp *app = (TranscriberApp *)data;
 
     if (app->audio_recorder && app->main_window) {
-        double level = audio_recorder_get_volume_level(app->audio_recorder);
+        /* Map linear RMS to the perceptual dB scale used by the gauge */
+        double level = volume_level_to_display(
+            audio_recorder_get_volume_level(app->audio_recorder));
         /* Only update GTK widget if level changed significantly */
-        if (level < 0.0) level = 0.0;
-        if (level > 1.0) level = 1.0;
         double last_level = app_window_get_last_volume_level(app->main_window);
         if (level - last_level > VOLUME_DELTA ||
             last_level - level > VOLUME_DELTA ||
