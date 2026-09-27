@@ -123,7 +123,7 @@ typedef struct _AppConfig {
     float scanner_silence_sec;       ///< Silence duration (seconds) before scanner checks segment
                                           ///< When the scanner detects continuous silence for this
                                           ///< duration, it checks if the audio segment meets the
-                                          ///< minimum duration. Range: 1-10 sec. Default: 1.
+                                          ///< minimum duration. Range: 0.5-10 sec. Default: 1.
 
     float scanner_min_segment_sec;   ///< Minimum segment duration (sec) before transcribing
                                           ///< The scanner will never send a segment shorter than

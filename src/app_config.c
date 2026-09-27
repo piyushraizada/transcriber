@@ -474,7 +474,7 @@ bool config_load_from_path(AppConfig* config, const char* path)
             float sec = is_legacy_silence
                 ? (float)(int)silence_item->valueint / 1000.0f
                 : (float)silence_item->valuedouble;
-            if (sec < 1.0f) sec = 1.0f;
+            if (sec < 0.5f) sec = 0.5f;
             else if (sec > 10.0f) sec = 10.0f;
             config->scanner_silence_sec = sec;
         }
@@ -779,9 +779,9 @@ bool config_validate(const AppConfig* config)
         return false;
     }
 
-    /* Validate scanner_silence_sec — must be in [1.0, 10.0] */
-    if (config->scanner_silence_sec < 1.0f || config->scanner_silence_sec > 10.0f) {
-        set_error("scanner_silence_sec must be between 1.0 and 10.0");
+    /* Validate scanner_silence_sec — must be in [0.5, 10.0] */
+    if (config->scanner_silence_sec < 0.5f || config->scanner_silence_sec > 10.0f) {
+        set_error("scanner_silence_sec must be between 0.5 and 10.0");
         return false;
     }
 
