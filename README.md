@@ -116,8 +116,8 @@ Look for these lines in the CMake output:
 
 - `"CUDA found (v...) - GPU acceleration enabled"` — CUDA/cuBLAS active ✅
 - `"Including BLAS backend"` — OpenBLAS/BLAS active ✅
-- `"OpenMP ... found"` — Multi-threaded CPU support ✅
-- `"NCCL: ...libnccl.so"` — Multi-GPU support ✅
+- No `"OpenMP not found"` warning — multi-threaded CPU support active ✅
+- No `"Warning: NCCL not found..."` message — multi-GPU support active (CUDA builds only) ✅
 
 If a library you installed is not detected, verify the `-dev` package was installed (not just the runtime) and re-run `cmake` in a clean build directory.
 
@@ -221,6 +221,12 @@ transcriber
 
 The application will appear as a microphone icon in your system tray and as a small floating window with a red/green mic drawing.
 
+To print the version and exit without starting the app (useful for verifying an install):
+
+```bash
+transcriber --version
+```
+
 ### Visual Indicators
 
 - **Red mic** — Idle (ready to record)
@@ -291,7 +297,7 @@ By default, Transcriber transcribes with the built-in Whisper model. As an alter
 
 ## Configuration
 
-Configuration is stored in `~/.config/transcriber/config.json`. You can adjust settings such as:
+Configuration is stored in `~/.config/transcriber/config.json`. The location can be overridden with the `TRANSCRIBER_CONFIG` environment variable (mainly useful for testing). You can adjust settings such as:
 
 - **ASR backend** — `whisper` (built-in whisper.cpp, default) or `llama` (llama-server HTTP). See [LLM ASR Backend](#llm-asr-backend-llama-server).
 - **llama-server URL** — base URL of the llama-server instance (default: `http://127.0.0.1:8005`); used only when the backend is `llama`
@@ -301,7 +307,7 @@ Configuration is stored in `~/.config/transcriber/config.json`. You can adjust s
 - **Max duration** — maximum length of a single recording session in seconds before recording is automatically stopped and the buffered audio is transcribed (default: 30, range: 5–30)
 - **Continuous dictation** — enable or disable the silence-triggered recording/transcription loop (default: `true`)
 - **VAD mode** — aggressiveness level as an integer from 0 to 3, where 0 is least aggressive (most sensitive) and 3 is most aggressive (most restrictive; default: 1, moderate)
-- **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription. The config dialog offers 0.5, 1.0, 1.5, and 2.0 sec (default: 1.0 sec); the raw `config.json` value is clamped to the range 1.0–10.0 sec, so hand-edited values outside the dialog choices are accepted but snapped to the nearest option when the dialog is opened.
+- **Silence threshold** — silence duration in seconds before the scanner segments audio for transcription. The config dialog offers 0.5, 1.0, 1.5, and 2.0 sec (default: 1.0 sec); the raw `config.json` value is clamped to the range 0.5–10.0 sec, so hand-edited values outside the dialog choices are accepted but snapped to the nearest option when the dialog is opened.
 - **Scanner min segment** — minimum audio segment length in seconds before sending to Whisper (default: 5 sec, range: 1–30 sec)
 - **Append transcription text** — when `true`, new transcriptions are appended to existing text; when `false`, the text window is cleared at the start of each session (default: `true`)
 - **Language** — transcription language as `"auto"` (auto-detect) or a 2-letter ISO 639-1 code (e.g., `"en"`, `"fr"`); default: `auto`. The settings dialog offers a dropdown of ~77 languages.
