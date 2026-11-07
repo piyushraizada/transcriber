@@ -356,6 +356,7 @@ grep ERROR /tmp/transcriber.log
 - **Model not found** — Ensure a valid GGML/GGUF model file exists at the configured path. Download one using `./packaging/download-model.sh`.
 - **GPU out of memory** — Enable flash attention in settings (reduces VRAM usage), or switch GPU mode to `cpu` for CPU-only inference.
 - **No audio captured** — Verify the configured ALSA device is available with `arecord -L`. Select a valid device in the settings dialog.
+- **Copied text missing on Wayland** — Wayland compositors (GNOME) only accept clipboard writes from the focused window, which breaks auto-copy when dictation is triggered via the global hotkey while another app has focus. On Wayland sessions Transcriber routes the copy through an internal Xwayland helper process, which the desktop bridges to the system clipboard. Requires a session with XWayland available (`$DISPLAY` set).
 
 ## Third-Party Software
 

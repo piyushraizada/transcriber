@@ -27,6 +27,13 @@
  * selection is available (PRIMARY selection is not supported by the
  * Wayland protocol).
  *
+ * Wayland focus policy: the compositor only accepts clipboard ownership
+ * changes from the window with keyboard focus. Copies triggered while
+ * Transcriber is unfocused (e.g. via the global hotkey) are therefore
+ * routed through a momentary X11 helper child process (this binary with
+ * --clipboard-x11-helper), which writes via Xwayland where the policy
+ * does not apply; the desktop then bridges and persists the text.
+ *
  * The clipboard module is minimal and focused — it provides a single
  * function to copy text to the clipboard, and optional functions for
  * checking clipboard availability and clearing the clipboard.
@@ -102,6 +109,21 @@ bool clipboard_copy_text(GdkDisplay* display, const char* text);
  * @see SRS Section 2.4.3: Clipboard Integration (PRIMARY and CLIPBOARD)
  */
 bool clipboard_copy_text_both(GdkDisplay* display, const char* text);
+
+/**
+ * Run the clipboard helper child mode: read text from stdin (until EOF)
+ * and copy it to the CLIPBOARD and PRIMARY selections through X11/Xwayland.
+ *
+ * Invoked by clipboard_copy_text_both() on Wayland sessions as the main
+ * argument --clipboard-x11-helper. Must be dispatched in main() before any
+ * logging, configuration, or single-instance initialization so the child
+ * stays invisible and side-effect free. The child exits after briefly
+ * letting the X11 clipboard agent fetch the contents.
+ *
+ * @return Process exit code: 0 on success, 1 if the text could not be
+ *         copied (no X11 display, clipboard unavailable).
+ */
+int clipboard_run_x11_helper(void);
 
 /**
  * Clear the application's owned content from both CLIPBOARD and PRIMARY selections.

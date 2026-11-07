@@ -3124,12 +3124,16 @@ static void app_destroy(TranscriberApp *app) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
-    /* Handle --version flag before any subsystem initialization or debug
-     * logging is enabled, so the output is clean (no GLib-GIO-DEBUG noise). */
+    /* Handle --version and --clipboard-x11-helper flags before any subsystem
+     * initialization or debug logging is enabled, so the outputs are clean
+     * and the helper child never touches the log file or D-Bus. */
     for (int i = 1; i < argc; i++) {
         if (g_strcmp0(argv[i], "--version") == 0) {
             g_print("transcriber %s\n", APP_VERSION);
             return 0;
+        }
+        if (g_strcmp0(argv[i], "--clipboard-x11-helper") == 0) {
+            return clipboard_run_x11_helper();
         }
     }
 
