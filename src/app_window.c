@@ -835,8 +835,39 @@ static gboolean on_text_window_delete_event(GtkWidget *widget, GdkEvent *event, 
  * window is hidden (tray mode), falls back to the saved config position so
  * the text window doesn't appear at (0, 0).
  */
+/**
+ * text_window_match_main_width — Match the TextWindow width to the MainWindow.
+ *
+ * Uses client-area sizes from gtk_window_get_size() for both windows so the
+ * matching is correct regardless of window-manager decorations (both windows
+ * receive identical server-side decorations). Height is left untouched.
+ * Applies gtk_window_resize() for realized (shown) windows and
+ * gtk_window_set_default_size() for not-yet-realized windows.
+ */
+static void text_window_match_main_width(TextWindow *tw, GtkWindow *main_window_gtk) {
+    if (!tw || !tw->window || !main_window_gtk) return;
+    if (!gtk_widget_get_visible(GTK_WIDGET(main_window_gtk))) return;
+
+    int mw = 0, mh = 0;
+    gtk_window_get_size(main_window_gtk, &mw, &mh);
+    if (mw <= 0) return;
+
+    int tw_w = 0, tw_h = 0;
+    gtk_window_get_size(tw->window, &tw_w, &tw_h);
+    if (tw_w == mw) return;
+
+    if (gtk_widget_get_realized(GTK_WIDGET(tw->window))) {
+        gtk_window_resize(tw->window, mw, tw_h);
+    } else {
+        gtk_window_set_default_size(tw->window, mw, tw_h);
+    }
+}
+
 static void position_text_window(TextWindow *tw, GtkWindow *main_window_gtk) {
     if (!tw || !tw->window || !tw->auto_position) return;
+
+    /* Match the transcription window width to the main window */
+    text_window_match_main_width(tw, main_window_gtk);
 
     int tx, ty;
     gboolean positioned = FALSE;
@@ -853,6 +884,11 @@ static void position_text_window(TextWindow *tw, GtkWindow *main_window_gtk) {
 
             tx = frame_rect.x;
             ty = frame_rect.y + frame_rect.height + TEXT_WINDOW_OFFSET_Y;
+
+            g_log("app_window", G_LOG_LEVEL_DEBUG,
+                  "[pos] position_text_window: main_frame=(%d,%d,%d,%d) tw=%dx%d -> move(%d,%d)",
+                  frame_rect.x, frame_rect.y, frame_rect.width, frame_rect.height,
+                  tw_w, tw_h, tx, ty);
 
             /* Screen boundary check */
             GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(tw->window));
@@ -878,6 +914,23 @@ static void position_text_window(TextWindow *tw, GtkWindow *main_window_gtk) {
     gtk_window_move(tw->window, tx, ty);
 }
 
+/* Diagnostic: report where the TextWindow actually ended up after mapping/moves */
+static gboolean on_text_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
+    UNUSED(user_data);
+    GdkWindow *gw = gtk_widget_get_window(widget);
+    GdkRectangle fe = {0, 0, 0, 0};
+    GdkPoint org = {0, 0};
+    if (gw) {
+        gdk_window_get_frame_extents(gw, &fe);
+        gdk_window_get_root_origin(gw, &org.x, &org.y);
+    }
+    g_log("app_window", G_LOG_LEVEL_DEBUG,
+          "[pos] text conf: ev=(%d,%d,%dx%d) root_org=(%d,%d) frame=(%d,%d,%d,%d)",
+          event->x, event->y, event->width, event->height,
+          org.x, org.y, fe.x, fe.y, fe.width, fe.height);
+    return FALSE;
+}
+
 /* Reposition TextWindow when MainWindow moves */
 static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
     TextWindow *tw = (TextWindow *)user_data;
@@ -885,6 +938,9 @@ static gboolean on_main_window_configure_event(GtkWidget *widget, GdkEventConfig
         return FALSE;
     }
     UNUSED(event);
+
+    /* Keep the TextWindow width matched to the MainWindow while auto-placing */
+    text_window_match_main_width(tw, GTK_WINDOW(widget));
 
     /* Use gdk_window_get_frame_extents to get the outer frame rectangle
      * (including title bar and borders). gtk_window_get_position() returns
@@ -1422,6 +1478,10 @@ TextWindow *app_text_window_create(GtkWindow *main_window_gtk) {
     /* Connect delete event to hide (not destroy) */
     g_signal_connect(tw->window, "delete-event",
                       G_CALLBACK(on_text_window_delete_event), tw);
+
+    /* Diagnostic: log actual placement after each configure */
+    g_signal_connect(tw->window, "configure-event",
+                      G_CALLBACK(on_text_window_configure_event), NULL);
 
     /* Listen for MainWindow position changes */
     if (main_window_gtk) {

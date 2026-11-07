@@ -3257,6 +3257,21 @@ int main(int argc, char *argv[]) {
      * This also opens the static FILE* inside the handler on first use. */
     g_log("main", G_LOG_LEVEL_INFO, "[startup] Log handlers installed — /tmp/transcriber.log active\n");
 
+    /* Force the X11 GDK backend on Wayland sessions. Placement of the
+     * TextWindow relative to the MainWindow relies on gtk_window_move() and
+     * gdk_window_get_frame_extents(), which are no-ops under the Wayland
+     * backend (the compositor ignores client positioning requests). Forcing
+     * x11 makes GTK use XWayland, where both APIs work and Mutter honors
+     * the requested frame position. The override is unconditional when an
+     * X server is reachable because GNOME's session launcher injects
+     * GDK_BACKEND=wayland into every spawned app's environment. */
+    if (g_getenv("DISPLAY") != NULL &&
+        g_strcmp0(g_getenv("GDK_BACKEND"), "x11") != 0) {
+        setenv("GDK_BACKEND", "x11", 1);
+        g_log("main", G_LOG_LEVEL_INFO,
+              "[startup] Forcing GDK_BACKEND=x11 for window positioning support\n");
+    }
+
     /* Initialize GTK early so GIO/GDBus domains are registered before we set up
      * the catch-all default log handler below. If we set the default handler
      * before gtk_init(), some GLib internal messages may have already been
