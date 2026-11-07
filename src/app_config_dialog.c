@@ -24,6 +24,8 @@
 #include <gtk/gtk.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -87,6 +89,7 @@ struct _ConfigDialog {
     GtkComboBox *gpu_mode_combo;
     GtkCheckButton *flash_attention_checkbox;
     bool flash_attention_was_enabled;  /* Preserved state when CPU mode forces checkbox off */
+    GtkComboBox *idle_unload_combo;    /* Whisper idle-unload timeout (VRAM) */
     GtkSpinButton *duration_spin;
     GtkCheckButton *append_text_checkbox;
     /* VAD controls */
@@ -422,6 +425,15 @@ static void on_save_clicked(GtkButton *button, ConfigDialog *dlg) {
     /* Set flash attention from checkbox */
     config_set_flash_attention(dlg->config,
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(dlg->flash_attention_checkbox)));
+
+    /* Set idle model unload timeout from combo */
+    if (dlg->idle_unload_combo) {
+        int idle_idx = gtk_combo_box_get_active(dlg->idle_unload_combo);
+        static const int kIdleUnloadValues[] = {0, 60, 300, 900, 1800, 3600};
+        if (idle_idx >= 0 && (unsigned)idle_idx < G_N_ELEMENTS(kIdleUnloadValues)) {
+            config_set_model_idle_unload_sec(dlg->config, kIdleUnloadValues[idle_idx]);
+        }
+    }
 
     /* Set append transcription text mode from checkbox */
     config_set_append_transcription_text(dlg->config,
@@ -1427,6 +1439,44 @@ bool config_dialog_show(GtkWindow *parent_window, struct _AppConfig *config) {
 
         /* Set initial sensitivity based on current GPU mode */
         update_flash_attention_sensitivity(dlg);
+
+        /* Idle model unload — releases Whisper's VRAM while the app is idle.
+         * Applies without restart; the main-loop watchdog re-reads the
+         * config value every cycle. */
+        GtkWidget *idle_unload_label = gtk_label_new("Unload idle model (frees VRAM):");
+        gtk_label_set_xalign(GTK_LABEL(idle_unload_label), 0);
+        gtk_box_pack_start(GTK_BOX(vbox), idle_unload_label, FALSE, FALSE, 0);
+
+        dlg->idle_unload_combo = GTK_COMBO_BOX(gtk_combo_box_text_new());
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "Never (model stays loaded)");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "After 1 minute idle");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "After 5 minutes idle");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "After 15 minutes idle");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "After 30 minutes idle");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dlg->idle_unload_combo), NULL, "After 1 hour idle");
+        {
+            int idle_sec = config_get_model_idle_unload_sec(config);
+            static const int kIdleUnloadValues[] = {0, 60, 300, 900, 1800, 3600};
+            int idx = 0;
+            int best_diff = INT_MAX;
+            for (size_t i = 0; i < G_N_ELEMENTS(kIdleUnloadValues); i++) {
+                int diff = abs(idle_sec - kIdleUnloadValues[i]);
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    idx = (int)i;
+                }
+            }
+            gtk_combo_box_set_active(dlg->idle_unload_combo, idx);
+        }
+        gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(dlg->idle_unload_combo), FALSE, FALSE, 0);
+
+        GtkWidget *idle_unload_help = gtk_label_new(
+            "Unloads the Whisper model and frees its GPU memory after\n"
+            "the given idle time. The model reloads automatically on the\n"
+            "next recording (a few seconds of added latency).");
+        gtk_label_set_xalign(GTK_LABEL(idle_unload_help), 0);
+        gtk_widget_set_opacity(idle_unload_help, 0.6);
+        gtk_box_pack_start(GTK_BOX(vbox), idle_unload_help, FALSE, FALSE, 0);
 
         gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 6);
     }

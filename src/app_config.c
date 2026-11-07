@@ -278,6 +278,11 @@ void config_set_defaults(AppConfig* config)
     strncpy(config->llama_model, "gemma-4-12b", sizeof(config->llama_model) - 1);
     config->llama_model[sizeof(config->llama_model) - 1] = '\0';
 
+    /* Idle model unload — disabled by default (model stays resident).
+     * When >0, the Whisper backend unloads after this many idle seconds
+     * and cudaDeviceReset() releases VRAM; next use reloads lazily. */
+    config->model_idle_unload_sec = 0;
+
     set_error(NULL);
 }
 
@@ -582,6 +587,15 @@ bool config_load_from_path(AppConfig* config, const char* path)
         }
     }
 
+    /* Idle model unload timeout — clamp to [0, 3600] */
+    item = cJSON_GetObjectItemCaseSensitive(root, "model_idle_unload_sec");
+    if (item && cJSON_IsNumber(item)) {
+        int sec = (int)item->valueint;
+        if (sec < 0) sec = 0;
+        else if (sec > 3600) sec = 3600;
+        config->model_idle_unload_sec = sec;
+    }
+
     cJSON_Delete(root);
     set_error(NULL);
     return true;
@@ -678,6 +692,9 @@ bool config_save_to_path(const AppConfig* config, const char* path)
     cJSON_AddStringToObject(root, "asr_backend", config->asr_backend);
     cJSON_AddStringToObject(root, "llama_server_url", config->llama_server_url);
     cJSON_AddStringToObject(root, "llama_model", config->llama_model);
+
+    /* VRAM management — idle model unload */
+    cJSON_AddNumberToObject(root, "model_idle_unload_sec", config->model_idle_unload_sec);
 
     /* Print to string with indentation */
     char* json_str = cJSON_Print(root);
@@ -788,6 +805,12 @@ bool config_validate(const AppConfig* config)
     /* Validate scanner_min_segment_sec — must be in [1.0, 30.0] */
     if (config->scanner_min_segment_sec < 1.0f || config->scanner_min_segment_sec > 30.0f) {
         set_error("scanner_min_segment_sec must be between 1.0 and 30.0");
+        return false;
+    }
+
+    /* Validate model_idle_unload_sec — must be in [0, 3600] */
+    if (config->model_idle_unload_sec < 0 || config->model_idle_unload_sec > 3600) {
+        set_error("model_idle_unload_sec must be between 0 and 3600");
         return false;
     }
 
@@ -1038,6 +1061,24 @@ float config_get_scanner_min_segment_sec(const AppConfig* config)
 {
     if (!config) return 5.0f;
     return config->scanner_min_segment_sec;
+}
+
+/* ----------------------------------------------------------------
+ * VRAM management — idle model unload accessors
+ * ---------------------------------------------------------------- */
+
+void config_set_model_idle_unload_sec(AppConfig* config, int sec)
+{
+    if (!config) return;
+    if (sec < 0) sec = 0;
+    else if (sec > 3600) sec = 3600;
+    config->model_idle_unload_sec = sec;
+}
+
+int config_get_model_idle_unload_sec(const AppConfig* config)
+{
+    if (!config) return 0;
+    return config->model_idle_unload_sec;
 }
 
 /* ----------------------------------------------------------------

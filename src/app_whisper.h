@@ -396,6 +396,40 @@ bool whisper_client_is_loading(const WhisperClient *client);
  */
 bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool flash_attention);
 
+/**
+ * Unload the whisper model and release its GPU memory.
+ *
+ * Frees the whisper.cpp context and (when CUDA was in use) resets the CUDA
+ * device context of the active GPU, so the process's VRAM footprint from
+ * whisper.cpp drops to ~0. The model reloads lazily (or via the normal
+ * background load path) on the next transcription.
+ *
+ * No-ops (returning false) when the model is not loaded, a load/transcription
+ * is in progress, or the client is being destroyed.
+ *
+ * @param client Pointer to a valid WhisperClient. Must not be NULL.
+ * @return true if the model was unloaded, false if the unload was skipped.
+ *
+ * @thread_safe This function is safe to call from any thread.
+ */
+bool whisper_client_unload(WhisperClient *client);
+
+/**
+ * Unload the model only after it has been idle for a timeout.
+ *
+ * Lock-free pre-checks (loaded, not loading, no in-flight transcriptions,
+ * idle for at least idle_sec seconds) make this cheap enough to call from
+ * a UI timer. When the checks pass, performs whisper_client_unload().
+ *
+ * @param client    Pointer to a valid WhisperClient. Must not be NULL.
+ * @param idle_sec  Idle timeout in seconds. Values <= 0 disable the feature
+ *                  (always returns false).
+ * @return true if the model was unloaded, false otherwise.
+ *
+ * @thread_safe This function is safe to call from any thread.
+ */
+bool whisper_client_unload_if_idle(WhisperClient *client, int idle_sec);
+
 /*---------------------------------------------------------------------------
  * Section 10: GPU Support
  *---------------------------------------------------------------------------

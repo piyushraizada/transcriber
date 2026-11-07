@@ -165,10 +165,20 @@ typedef struct _AppConfig {
                                         ///< Only used when asr_backend is "llama".
                                         ///< @see CFG-ASR-002: llama-server URL
 
-    char llama_model[128];          ///< Model alias as exposed by the llama-server
+    char llama_model[128];           ///< Model alias as exposed by the llama-server
                                         ///< (--alias), e.g. "gemma-4-12b".
                                         ///< Only used when asr_backend is "llama".
                                         ///< @see CFG-ASR-003: llama-server Model
+
+    /* VRAM Management — Whisper Backend */
+    int model_idle_unload_sec;       ///< Seconds of inactivity after which the loaded
+                                        ///< Whisper model is unloaded and its GPU memory
+                                        ///< released; reloads lazily on next use.
+                                        ///< 0 = disabled (model stays resident).
+                                        ///< Range: 0-3600. Default: 0.
+                                        ///< No-ops when no Whisper model is resident
+                                        ///< (e.g. llama-backend sessions).
+                                        ///< @see CFG-VRAM-001: Idle Model Unload
 
 } AppConfig;
 
@@ -684,6 +694,26 @@ bool config_set_llama_model(AppConfig* config, const char* model);
  * @return The model alias string (internal, must NOT be freed or modified).
  */
 const char* config_get_llama_model(const AppConfig* config);
+
+/*---------------------------------------------------------------------------
+ * Section 6b: VRAM Management — Idle Model Unload
+ *---------------------------------------------------------------------------
+ */
+
+/**
+ * Set the idle-unload timeout for the Whisper model.
+ * @param config Pointer to AppConfig. Must not be NULL.
+ * @param sec    Idle seconds before the model is unloaded and its GPU
+ *               memory released; 0 disables the feature. Clamped to 0-3600.
+ */
+void config_set_model_idle_unload_sec(AppConfig* config, int sec);
+
+/**
+ * Get the idle-unload timeout for the Whisper model.
+ * @param config Pointer to AppConfig. May be NULL.
+ * @return Timeout in seconds; 0 = disabled.
+ */
+int config_get_model_idle_unload_sec(const AppConfig* config);
 
 /*---------------------------------------------------------------------------
  * Section 7: Error Handling and Diagnostics

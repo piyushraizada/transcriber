@@ -278,6 +278,7 @@ typedef struct TranscriberApp {
     guint watchdog_source_id;
     guint transcription_watchdog_source_id;
     guint volume_poll_source_id;
+    guint model_idle_unload_source_id;   /* VRAM idle-unload watchdog (0 = off) */
 
     /* WAV path for transcription (protected by wav_path_mutex) */
     char *current_wav_path;
@@ -356,6 +357,8 @@ static void start_transcription_watchdog(TranscriberApp *app);
 static void stop_transcription_watchdog(TranscriberApp *app);
 static void start_volume_poll(TranscriberApp *app);
 static void stop_volume_poll(TranscriberApp *app);
+static void start_model_idle_unload_timer(TranscriberApp *app);
+static void stop_model_idle_unload_timer(TranscriberApp *app);
 static void perform_initial_model_load(TranscriberApp *app);
 static int get_transcription_timeout_seconds(TranscriberApp *app);
 static void on_tray_clear(TranscriberApp *app);
@@ -730,6 +733,91 @@ static void stop_volume_poll(TranscriberApp *app) {
 }
 
 /* ------------------------------------------------------------------ */
+/* VRAM Idle Model Unload                                              */
+/* ------------------------------------------------------------------ */
+
+/* How often the GTK main loop checks whether the Whisper model has been
+ * idle long enough to unload. Unloading is rare (once per idle expiry),
+ * so a coarse 10 s interval is plenty. */
+#define MODEL_IDLE_UNLOAD_CHECK_INTERVAL_MS 10000
+
+/**
+ * Idle-unload watchdog callback.
+ *
+ * If config model_idle_unload_sec > 0 and the Whisper model has been idle
+ * for that long, unload it and release its VRAM (see whisper_client_unload).
+ * The model reloads automatically on the next use — via the existing
+ * lazy-load path (background load + "WAIT" overlay) when the mic is
+ * clicked, or in-place inside whisper_transcribe*() for the llama-backend
+ * fallback path.
+ *
+ * Runs on the GTK main thread. The teardown work (whisper_free +
+ * cudaDeviceReset, typically well under 1 s) runs here rather than on a
+ * worker thread on purpose: it fires only while everything is idle, and
+ * keeping it single-threaded avoids adding another thread that the
+ * shutdown path would have to join before whisper_client_destroy().
+ */
+static gboolean model_idle_unload_callback(gpointer data) {
+    TranscriberApp *app = (TranscriberApp *)data;
+
+    if (app->shutting_down || !app->whisper_client || !app->controller.config) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    const int idle_sec = config_get_model_idle_unload_sec(app->controller.config);
+    if (idle_sec <= 0) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* Never touch the model while the app is in a work cycle:
+     * LISTENING = capture running, TRANSCRIBING = transcription thread
+     * using the client. File uploads run on their own pipeline. */
+    if (app_get_state(&app->controller) != STATE_IDLE ||
+        app_get_file_upload_state(&app->controller) != FILE_UPLOAD_STATE_IDLE) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* Skip while a click-triggered background load is in flight. */
+    if (whisper_client_is_loading(app->whisper_client) ||
+        atomic_load(&app->model_loading_from_toggle)) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    if (whisper_client_unload_if_idle(app->whisper_client, idle_sec)) {
+        g_log("main", G_LOG_LEVEL_INFO,
+              "[vram] Whisper model idle for %d s — unloaded, VRAM released; "
+              "it will reload automatically on next use\n", idle_sec);
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+/**
+ * Start the model idle-unload watchdog (no-op when disabled in config).
+ */
+static void start_model_idle_unload_timer(TranscriberApp *app) {
+    if (app->model_idle_unload_source_id != 0) {
+        return; /* Already running */
+    }
+    if (!app->controller.config ||
+        config_get_model_idle_unload_sec(app->controller.config) <= 0) {
+        return; /* Feature disabled */
+    }
+    app->model_idle_unload_source_id = g_timeout_add(
+        MODEL_IDLE_UNLOAD_CHECK_INTERVAL_MS, model_idle_unload_callback, app);
+}
+
+/**
+ * Stop the model idle-unload watchdog.
+ */
+static void stop_model_idle_unload_timer(TranscriberApp *app) {
+    if (app->model_idle_unload_source_id != 0) {
+        g_source_remove(app->model_idle_unload_source_id);
+        app->model_idle_unload_source_id = 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Config Changes                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -771,6 +859,14 @@ static void on_config_changed(void *user_data) {
     /* Apply debug logging setting change immediately */
     if (app->controller.config) {
         reinstall_stderr_handlers(app->controller.config);
+    }
+
+    /* Apply idle model unload setting immediately: start the watchdog when
+     * enabled, stop it when the user disables the feature mid-session. */
+    if (config_get_model_idle_unload_sec(app->controller.config) > 0) {
+        start_model_idle_unload_timer(app);
+    } else {
+        stop_model_idle_unload_timer(app);
     }
 }
 
@@ -2969,6 +3065,7 @@ static void app_destroy(TranscriberApp *app) {
     /* Stop timers */
     stop_watchdog_timer(app);
     stop_volume_poll(app);
+    stop_model_idle_unload_timer(app);
 
     /* Destroy system tray icon */
     if (app->tray) {
@@ -3199,6 +3296,12 @@ int main(int argc, char *argv[]) {
      * and the connection indicator turns green. This eliminates
      * the lag when the user first clicks the mic to start recording. */
     perform_initial_model_load(app);
+
+    /* Arm the VRAM idle-unload watchdog when the feature is enabled.
+     * The timer itself re-reads the config every cycle, so mid-session
+     * changes take effect without re-arming; on_config_changed only
+     * needs to start/stop it at the enable/disable boundary. */
+    start_model_idle_unload_timer(app);
 
     /* Start the GTK main loop */
     gtk_main();

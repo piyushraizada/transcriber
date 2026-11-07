@@ -15,6 +15,7 @@ Transcriber is a lightweight, offline voice-to-text application for Linux deskto
 ### Technical Highlights
 *   **Tech Stack:** Written in C using GTK3 for the GUI, ALSA (`libasound`) for microphone capture, and FFmpeg for decoding uploaded audio files.
 *   **Performance:** Supports NVIDIA GPU (CUDA) acceleration for faster transcription, with an automatic fallback to CPU. When multiple GPUs are present, you can pick a specific one (or let Transcriber choose the one with the most free VRAM) in the settings dialog.
+*   **Idle VRAM Release:** Optionally unloads the Whisper model after a configurable idle period, freeing its entire GPU allocation (1+ GiB for large models) plus the CUDA context, so the app holds ~0 VRAM between dictation sessions. The model reloads automatically on next use. See [Configuration](#configuration).
 *   **Architecture:** Multi-threaded design (Presentation, Audio, and Transcription threads) to ensure a responsive user interface.
 *   **User Experience:** Features a real-time volume level bar, sine wave animation during recording, and a model availability status indicator.
 
@@ -314,11 +315,13 @@ Configuration is stored in `~/.config/transcriber/config.json`. The location can
 - **GPU mode** — `auto`, `cpu`, or `gpu:N` for specific GPU selection. The settings dialog lists each detected NVIDIA GPU by name, plus "Auto (select best GPU by free memory)" and "CPU Only". In `auto` mode the GPU with the most free VRAM is chosen; if the selected GPU does not have enough free VRAM for the model, Transcriber automatically falls back to CPU and reports which device was used. GPU changes require an application restart.
 - **Flash attention** — when `true`, enables whisper.cpp flash attention to reduce GPU VRAM usage (no effect in CPU-only mode; default: `true`)
 - **Noise suppression** — when `true`, applies RNNoise-based automatic noise reduction to the audio stream during capture for cleaner transcription (default: `false`)
+- **Idle model unload** (`model_idle_unload_sec`) — seconds of inactivity after which the loaded Whisper model is unloaded and its GPU memory fully released (the CUDA device context is torn down too, so the app's VRAM footprint returns to ~0). The model reloads automatically the next time you record — the mic icon briefly shows "WAIT" while it loads (a few seconds). 0 disables the feature and keeps the model resident (default: 0, range: 0–3600). No-ops when the model was never loaded (e.g. a healthy llama-server backend session, which uses no local VRAM). Never unloads while recording, transcribing, or processing an uploaded file. The idle timer checks every 10 s, so unloading happens within 10 s of the timeout expiring. Takes effect immediately — no restart needed (config dialog choice maps to this value).
 
 ### Settings Dialog
 
 The settings dialog is opened via the **gear button** in the main window's status bar (bottom-left corner). The system tray context menu's "Show Window" item brings the main window to the front so you can reach it. In addition to the options above, the dialog provides:
 
+- **GPU mode** — a dropdown to select the compute device; **Flash attention** checkbox; and an **Unload idle model** dropdown (Never / 1 min / 5 min / 15 min / 30 min / 1 hour) that frees the Whisper model's VRAM after the chosen idle period (see `model_idle_unload_sec` above; applies without restart).
 - **Transcription backend** — a dropdown selecting the engine: **Whisper (local, offline)** or **Gemma 4 12B (llama-server HTTP)**. In llama mode the URL and Model alias fields are active, along with a **Test Connection** button that verifies the server's health and, when it advertises exactly one model, fills the alias field with that name automatically (see [LLM ASR Backend](#llm-asr-backend-llama-server)).
 - **Model info** — once a model path is set, the dialog asynchronously loads the model's metadata and displays its name, quantization, and whether it is multilingual or English-only (e.g. `large-v3-turbo - Q8_0 - Multilingual`). An invalid or missing model shows a red "No valid whisper ggml file found" notice.
 - **Audio device** — a dropdown populated from the ALSA device list.

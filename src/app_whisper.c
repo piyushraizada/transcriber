@@ -119,6 +119,7 @@ struct _WhisperClient {
     atomic_uint ctx_refcount;          // reference count for in-flight transcriptions
     atomic_bool destroying;            // true during whisper_client_destroy cleanup
     char gpu_fallback_message[512];    // Human-readable GPU fallback info (empty if no fallback)
+    atomic_llong last_used_usec;       // g_get_monotonic_time() of last model use/operation
 };
 
 /* ===================================================================
@@ -126,6 +127,7 @@ struct _WhisperClient {
  * =================================================================== */
 static void ctx_ref(WhisperClient *client) {
     if (client) {
+        atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
         atomic_fetch_add(&client->ctx_refcount, 1);
     }
 }
@@ -134,6 +136,7 @@ static void ctx_ref(WhisperClient *client) {
  * that is handled by free_current_context() and whisper_client_destroy(). */
 static void ctx_unref(WhisperClient *client) {
     if (client) {
+        atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
         atomic_fetch_sub(&client->ctx_refcount, 1);
     }
 }
@@ -662,6 +665,9 @@ static bool load_model(WhisperClient *client) {
 
     // Clear loading flag
     atomic_store(&client->model_loading, false);
+    if (result) {
+        atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
+    }
 
     return result;
 }
@@ -706,10 +712,94 @@ bool whisper_client_load_model(WhisperClient *client, const char *gpu_mode, bool
     atomic_store(&client->model_loading, true);
     bool result = load_model_internal(client);
     atomic_store(&client->model_loading, false);
+    if (result) {
+        atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
+    }
 
     pthread_mutex_unlock(&client->mutex);
 
     return result;
+}
+
+/* ===================================================================
+ * Public API: whisper_client_unload
+ *
+ * Release the loaded whisper context AND the CUDA primary context of the
+ * active GPU so the process's VRAM footprint drops back to ~0. Safe to
+ * call from any thread. Returns false (no-op) if the model is not loaded,
+ * a load is in progress, the client is being destroyed, or a transcription
+ * is in flight (ctx_refcount != 0).
+ *
+ * The CUDA context cannot be released by whisper_free() alone — ggml-cuda
+ * keeps the per-process primary context alive until cudaDeviceReset().
+ * Reset is only valid when nothing in this process still uses the device:
+ * whisper.cpp (via this client) is the sole CUDA user in-process, and the
+ * refcount/load checks above guarantee no in-flight work.
+ * =================================================================== */
+bool whisper_client_unload(WhisperClient *client) {
+    if (!client) return false;
+
+    pthread_mutex_lock(&client->mutex);
+
+    if (!client->ctx ||
+        atomic_load(&client->ctx_refcount) != 0 ||
+        atomic_load(&client->model_loading) ||
+        atomic_load(&client->destroying)) {
+        pthread_mutex_unlock(&client->mutex);
+        return false;
+    }
+
+#ifdef HAVE_CUDA
+    int saved_gpu = client->active_gpu_device;
+#endif
+
+    /* Bounded unload window: any transcription racing to start here sees
+     * model_loaded=false / ctx=NULL once it takes the mutex. */
+    free_current_context(client);
+    atomic_store(&client->model_loaded, false);
+    client->active_gpu_device = -1;
+
+    pthread_mutex_unlock(&client->mutex);
+
+#ifdef HAVE_CUDA
+    if (saved_gpu >= 0) {
+        cudaSetDevice(saved_gpu);
+        cudaError_t derr = cudaDeviceReset();
+        if (derr != cudaSuccess) {
+            g_log("app-whisper", G_LOG_LEVEL_DEBUG,
+                  "[vram] cudaDeviceReset on GPU %d failed: %s\n",
+                  saved_gpu, cudaGetErrorString(derr));
+        }
+    }
+#endif
+
+    atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
+    return true;
+}
+
+/* ===================================================================
+ * Public API: whisper_client_unload_if_idle
+ *
+ * Unload the model (see whisper_client_unload) only if it has been idle —
+ * unused, loading, and in-flight free — for at least idle_sec seconds.
+ * Cheap lock-free pre-checks make this safe to call from a UI timer.
+ * Returns true if the model was unloaded, false otherwise.
+ * =================================================================== */
+bool whisper_client_unload_if_idle(WhisperClient *client, int idle_sec) {
+    if (!client || idle_sec <= 0) return false;
+
+    if (!atomic_load(&client->model_loaded) ||
+        atomic_load(&client->model_loading) ||
+        atomic_load(&client->destroying) ||
+        atomic_load(&client->ctx_refcount) != 0) {
+        return false;
+    }
+
+    long long last = atomic_load(&client->last_used_usec);
+    long long now = (long long)g_get_monotonic_time();
+    if (now - last < (long long)idle_sec * 1000000LL) return false;
+
+    return whisper_client_unload(client);
 }
 
 /* ===================================================================
@@ -912,6 +1002,7 @@ WhisperClient* whisper_client_create(void) {
     client->gpu_fallback_message[0] = '\0';
     client->error_code = 0;
     atomic_store(&client->cancel_requested, 0);
+    atomic_store(&client->last_used_usec, (long long)g_get_monotonic_time());
 
     if (pthread_mutex_init(&client->mutex, NULL) != 0) {
         g_free(client);
